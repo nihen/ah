@@ -171,20 +171,7 @@ ah completion bash > ~/.local/share/bash-completion/completions/ah
 ah completion fish > ~/.config/fish/completions/ah.fish
 ```
 
-## Usage
-
-| Command | Description |
-|---------|-------------|
-| `ah log` | List sessions (default: current directory) |
-| `ah show` | Show session transcript |
-| `ah resume` | Resume an agent session |
-| `ah project` | List known projects |
-| `ah memory` | List agent memory and instruction files |
-| `ah agent` | Show session summary per agent |
-
-Common options: `-a` (all directories), `-q` (full-text search), `-i` (interactive mode). Not all options apply to every subcommand — run `ah <command> --help` for details.
-
-`ah show` and `ah resume` accept either a session path or a session ID. If omitted, they use the latest session matching stdin, `-q`, and other filters.
+## Tips
 
 ### Interactive mode (-i)
 
@@ -196,23 +183,245 @@ Useful as a shell function — pick a project, browse its sessions, resume:
 ahr() { local d; d="$(ah project -i)" && ah resume -i -d "$d"; }
 ```
 
-### Output formats
+## Command-line options
 
-When piped, output automatically switches to plain TSV (no colors, no pager). Other formats are available:
+### `ah -h`
 
-```bash
-ah log                        # color-coded TSV with pager on TTY, plain TSV when piped
-ah log --table                # aligned table with header row
-ah log --tsv                  # force plain TSV (no header, no color)
-ah log --json                 # JSON Lines
-ah log --ltsv                 # LTSV
-ah log -o agent,project,path  # pick output fields
-ah log -O pid,cwd             # add fields to defaults
-ah log --list-fields           # list available fields
-ah log --no-pager             # disable automatic pager
+```
+Search, inspect, and resume coding-agent sessions from one CLI
+(read-only except resume)
+
+Defaults to the current directory. Use -a to search across all known sessions.
+
+Usage:
+  ah <COMMAND> [OPTIONS]
+
+Commands:
+  log                 List sessions
+  project             List known projects
+  show                Show session transcript
+  resume              Resume an agent session
+  memory              List agent memory and instruction files
+  agent               Show session summary per agent
+
+Help / setup:
+  list-agents         List supported agents
+  completion          Generate shell completion script
+  man                 Generate man page
+
+Global options:
+  -a, --all               Show all sessions (disable default cwd filtering)
+  --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
+  --project <NAME>        Filter by project name
+  -d, --dir <PATH>        Filter by working directory (default: current directory)
+  -q, --query <REGEX>     Full-text search query (regex, case-insensitive)
+  -p, --prompt-only       Search only user prompts (use with -q)
+  -n, --limit N           Max session files to scan (default: 0, no limit)
+  -i, --interactive       Interactive mode via fuzzy finder (fzf/sk)
+  -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
+  --no-preview            Disable preview in interactive mode
+  --running               Show only currently running sessions (Claude only for now)
+  --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --color                 Force colored output (even through pipes)
+  --no-color              Disable colored output
+  --no-pager              Disable automatic pager
+  -h, --help              Show this help
+  -V, --version           Show version
+
+Examples:
+  ah log                      # latest sessions for the current directory
+  ah log -a -q "auth"         # search across all known sessions
+  ah resume                   # resume the latest matching session
+  ah show -q "OAuth"          # show the latest matching session
+  ah resume -i                # browse sessions with fzf/sk and resume
+
+Run `ah <COMMAND> --help` for subcommand-specific options.
 ```
 
-Run `ah <command> --help` for full options.
+### `ah log --help`
+
+```
+List sessions
+
+Usage:
+  ah log [OPTIONS]
+
+Options:
+  -o, --fields <FIELDS>   Select output fields (replaces defaults, see --list-fields)
+                          Default: agent, project, modified_at, title, id
+                          With -q: agent, project, modified_at, title, matched, id
+  -O, --extra-fields <FIELDS>  Add fields to defaults (comma-separated)
+  --table                 Aligned table with header row
+  --tsv                   Tab-separated values (no header, no color)
+  --ltsv                  Labeled Tab-Separated Values (in -i mode: selector display format)
+  --json                  JSON Lines output
+  -S, --sort <FIELD>      Sort by field (default: modified_at)
+  --asc                   Sort ascending
+  --desc                  Sort descending (default)
+  --transcript-limit N    Max characters for transcript field (default: 500)
+  --title-limit N         Max characters for auto-generated title (default: 50, 0 = no limit)
+  -L, --list-fields       List available output fields and exit (use with --json for machine-readable output)
+
+Default output (when no format flag is given):
+  git-log style multi-line with auto-pager on TTY, plain TSV when piped
+
+Interactive mode:
+  -i, --interactive       Browse sessions via fuzzy finder; prints selected path
+  -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
+  --no-preview            Disable transcript preview (enabled by default for fzf, sk)
+
+Global options are also available (see ah -h).
+```
+
+### `ah show --help`
+
+```
+Show session transcript
+
+Usage:
+  ah show [OPTIONS] [SESSION]
+
+If SESSION is omitted, ah shows the latest session matching stdin, -q, and other filters.
+
+Options:
+  --head N                Show first N messages only
+  --pretty                Pretty-print with colors (default)
+  --raw                   Output raw session file content
+  --json                  Output normalized JSON Lines ({"role":"user","text":"..."})
+  --md                    Output as Markdown (## User / ## Assistant headers)
+  -f, --follow            Follow session output in real-time (like tail -f)
+
+Interactive mode:
+  -i, --interactive       Select session via fuzzy finder then show it
+  -o, --fields <FIELDS>   Display fields in interactive mode (default: agent,project,modified_at,title)
+  -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
+  --no-preview            Disable transcript preview
+
+Global options are also available (see ah -h).
+```
+
+### `ah resume --help`
+
+```
+Resume an agent session
+
+Usage:
+  ah resume [OPTIONS] [SESSION] [-- EXTRA_ARGS...]
+
+If SESSION is omitted, ah resumes the latest session matching stdin, -q, and other filters.
+
+Arguments after -- are passed directly to the agent command.
+
+The only command that launches an agent process; other commands are read-only.
+
+Options:
+  --print                 Print the resolved resume command and exit (read-only; does not execute)
+
+Interactive mode:
+  -i, --interactive       Select session via fuzzy finder then resume it
+  -o, --fields <FIELDS>   Display fields in interactive mode (default: agent,project,modified_at,title)
+  -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
+  --ltsv                  Use LTSV format for interactive selector display
+  --no-preview            Disable transcript preview
+
+Examples:
+  ah resume                   # resume latest matching session
+  ah resume --print           # print the resolved resume command
+  ah resume a1b2c3d4          # resume by ID
+  ah resume -i                # interactive selection
+  ah resume -- --dry-run      # pass extra args to agent
+
+Global options are also available (see ah -h).
+```
+
+### `ah project --help`
+
+```
+List known projects
+
+Usage:
+  ah project [OPTIONS]
+
+Options:
+  -o, --fields <FIELDS>   Select output fields (replaces defaults, see --list-fields)
+                          Default: project, session_count, last_modified_at, agents
+                          In -i mode default: cwd, project, session_count, last_modified_at
+  -O, --extra-fields <FIELDS>  Add fields to defaults (comma-separated)
+  --table                 Aligned table with header row
+  --tsv                   Tab-separated values (no header, no color)
+  --ltsv                  Labeled Tab-Separated Values (in -i mode: selector display format)
+  --json                  JSON Lines output
+  -S, --sort <FIELD>      Sort by field (default: last_modified_at)
+  --asc                   Sort ascending
+  --desc                  Sort descending (default)
+  -L, --list-fields       List available output fields and exit (use with --json for machine-readable output)
+
+Default output (when no format flag is given):
+  Aligned table with auto-pager on TTY, plain TSV when piped
+
+Interactive mode:
+  -i, --interactive       Browse projects via fuzzy finder; prints selected cwd
+  -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
+  --no-preview            Disable preview
+
+Global options are also available (see ah -h).
+```
+
+### `ah memory --help`
+
+```
+List agent memory files
+
+Usage:
+  ah memory [OPTIONS]
+
+Options:
+  -o, --fields <FIELDS>   Select output fields (replaces defaults, see --list-fields)
+                          Default: agent, project, type, name, modified_at, description
+  -O, --extra-fields <FIELDS>  Add fields to defaults (comma-separated)
+  -t, --type <TYPE>       Filter by memory type (user/feedback/project/reference/instruction)
+  --table                 Aligned table with header row
+  --tsv                   Tab-separated values (no header, no color)
+  --ltsv                  Labeled Tab-Separated Values
+  --json                  JSON Lines output
+  -S, --sort <FIELD>      Sort by field (default: modified_at)
+  --asc                   Sort ascending
+  --desc                  Sort descending (default)
+  -L, --list-fields       List available output fields and exit (use with --json for machine-readable output)
+
+Default output (when no format flag is given):
+  Aligned table with auto-pager on TTY, plain TSV when piped
+
+Interactive mode:
+  -i, --interactive       Browse memory files via fuzzy finder
+  -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
+  --no-preview            Disable preview
+
+Global options are also available (see ah -h).
+```
+
+### `ah agent --help`
+
+```
+Show session summary per agent
+
+Usage:
+  ah agent [OPTIONS]
+
+Shows how many sessions were found for each agent and the latest modified time.
+
+Options:
+  --table                 Output as aligned table
+  --tsv                   Output as TSV (tab-separated values)
+  --ltsv                  Output as LTSV (Labeled TSV)
+  --json                  Output as JSON Lines
+
+Default output (when no format flag is given):
+  Aligned table with auto-pager on TTY, plain TSV when piped
+
+Global options are also available (see ah -h).
+```
 
 ## Configuration (~/.ahrc)
 
