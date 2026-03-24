@@ -1,0 +1,17 @@
+---
+source: tests/snapshots.rs
+expression: "help_output(&[\"completion\", \"--help\"])"
+---
+Generate shell completion script
+
+Usage:
+  ah completion <SHELL>
+
+Supported shells:
+  bash, zsh, fish, elvish, powershell
+
+Setup:
+  zsh:  mkdir -p ~/.zfunc && ah completion zsh > ~/.zfunc/_ah
+        # Add to .zshrc: fpath=(~/.zfunc $fpath); autoload -Uz compinit && compinit
+  bash: ah completion bash > ~/.local/share/bash-completion/completions/ah
+  fish: ah completion fish > ~/.config/fish/completions/ah.fish

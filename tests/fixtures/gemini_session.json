@@ -1,0 +1,29 @@
+{
+  "sessionId": "gemini-sess-001",
+  "messages": [
+    {
+      "type": "user",
+      "content": [
+        {
+          "text": "review this plan"
+        }
+      ]
+    },
+    {
+      "type": "gemini",
+      "content": "Looks good."
+    },
+    {
+      "type": "user",
+      "content": [
+        {
+          "text": "check the rollout risk"
+        }
+      ]
+    },
+    {
+      "type": "gemini",
+      "content": "The rollout looks safe."
+    }
+  ]
+}

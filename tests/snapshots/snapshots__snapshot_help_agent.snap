@@ -1,0 +1,32 @@
+---
+source: tests/snapshots.rs
+expression: "help_output(&[\"agent\", \"--help\"])"
+---
+Show session summary per agent
+
+Usage:
+  ah agent [OPTIONS]
+
+Shows how many sessions were found for each agent and the latest modified time.
+
+Options:
+  --table                 Output as aligned table
+  --tsv                   Output as TSV (tab-separated values)
+  --ltsv                  Output as LTSV (Labeled TSV)
+  --json                  Output as JSON Lines
+
+Default output (when no format flag is given):
+  Aligned table with auto-pager on TTY, plain TSV when piped
+
+Global options:
+  -a, --all               Show all agents (disable default cwd filtering)
+  --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
+  -n, --limit N           Max session files to scan (default: 0, no limit)
+  --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+
+Display options:
+  --color                 Force colored output (even through pipes)
+  --no-color              Disable colored output
+  --no-pager              Disable automatic pager
+  --debug                 Show debug info (glob expansion, scan counts, timing) on stderr

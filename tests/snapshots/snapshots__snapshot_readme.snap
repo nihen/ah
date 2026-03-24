@@ -1,0 +1,303 @@
+---
+source: tests/snapshots.rs
+expression: readme
+---
+# Agent History (ah)
+
+**A**gent **H**istory — search, inspect, and resume coding-agent sessions from a single CLI.
+
+`ah` discovers session files from [Claude Code](https://claude.ai/), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Cursor](https://cursor.com/), and [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli). It works with zero config, defaults to the current directory, and gives you one place to search, inspect, and resume past work.
+
+Read-only by default. `ah` works directly on agent session files, lets you search and inspect them, and only executes when you explicitly run `resume`.
+
+## Demo
+
+![Demo](demo/demo.svg)
+
+## Quick Look
+
+On a TTY, `ah log` outputs in `git log` style with auto-pager. Defaults to current directory:
+
+```console
+$ ah log
+session a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6
+Agent:    claude
+Project:  my-webapp
+Cwd:      /home/user/src/my-webapp
+Date:     2026-03-23 14:00 - 2026-03-23 18:00
+
+    implement OAuth2 authentication flow
+
+session e5f6a7b8-9c0d-1e2f-3a4b-5c6d7e8f9a0b
+Agent:    cursor
+Project:  my-webapp
+Cwd:      /home/user/src/my-webapp
+Date:     2026-03-23 12:15 - 2026-03-23 14:22
+
+    fix memory leak in worker pool
+```
+
+Pick a session ID from the log and resume it — `ah` launches the original agent's resume command (e.g. `claude --resume`):
+
+```console
+$ ah resume a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6
+```
+
+Want the exact command first without executing anything?
+
+```console
+$ ah resume --print a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6
+cd '/home/user/src/my-webapp' && 'claude' '--resume' 'a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6'
+```
+
+Or browse and filter sessions with `-i` (via [fzf](https://github.com/junegunn/fzf) or compatible finder, with transcript preview):
+
+```console
+$ ah resume -i
+```
+
+Full-text search across all directories (piped output is plain TSV):
+
+```console
+$ ah log -a -q "OAuth" | head -3
+claude  my-webapp    2026-03-23 18:00  implement OAuth2 authentication flow  ...implement OAuth2 auth...          a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6
+cursor  my-webapp    2026-03-23 14:22  fix memory leak in worker pool        ...reviewing the OAuth token...      e5f6a7b8-9c0d-1e2f-3a4b-5c6d7e8f9a0b
+codex   api-server   2026-03-22 11:30  add Redis caching layer              ...cache OAuth tokens with 1h TTL... sess_7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b
+```
+
+Show a session transcript:
+
+```console
+$ ah show a1b2c3d4
+>>> implement OAuth2 authentication flow
+
+I'll implement the OAuth2 flow. Let me start by reading the existing auth module...
+```
+
+Sessions grouped by project:
+
+```console
+$ ah project -a
+PROJECT      SESSION_COUNT  LAST_MODIFIED_AT  AGENTS
+my-webapp    18             2026-03-23 18:00  claude, codex, cursor, gemini
+api-server   14             2026-03-23 09:15  claude, codex, copilot, cursor
+ml-pipeline  11             2026-03-22 08:50  claude, copilot, gemini
+infra         5             2026-03-20 17:40  codex, cursor
+docs          3             2026-03-19 11:25  claude, gemini
+```
+
+List agent memory and instruction files across all agents:
+
+```console
+$ ah memory -a
+AGENT   PROJECT    TYPE         NAME              MODIFIED_AT       DESCRIPTION
+claude  my-webapp  feedback     always-run-tests  2026-03-23 18:00  Run test suite before committing
+claude  my-webapp  instruction  CLAUDE.md         2026-03-22 10:00
+codex   my-webapp  instruction  AGENTS.md         2026-03-21 15:30
+```
+
+Show session summary per agent:
+
+```console
+$ ah agent
+AGENT     SESSIONS  LATEST
+claude          50  2026-03-24 17:55
+codex           42  2026-03-24 16:32
+copilot         18  2026-03-23 19:00
+cursor          12  2026-03-22 13:40
+gemini           5  2026-03-21 10:50
+```
+
+## Support Matrix
+
+| Agent | List | Search | Show | Resume | Running | Memory |
+|-------|------|--------|------|--------|---------|--------|
+| Claude | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Codex | ✓ | ✓ | ✓ | ✓ | | |
+| Gemini | ✓ | ✓ | ✓ | ✓ | | |
+| Copilot | ✓ | ✓ | ✓ | ✓ | | |
+| Cursor | ✓ | ✓ | ✓ | ✓ | | |
+
+## Features
+
+- **Cross-agent** — one tool for 5 agents (see `ah list-agents`)
+- **Zero-config** — scans the standard session locations for each supported CLI
+- **Fast** — parallel file collection with [rayon](https://github.com/rayon-rs/rayon), regex search via [memmap2](https://github.com/RazrFalcon/memmap2-rs), no subprocesses for search/parsing
+- **Resume-friendly** — `ah resume` and `ah show` can target the latest matching session without pasting IDs
+- **Structured output** — `git log`-style multi-line format with auto-pager on TTY, plain TSV when piped, plus `--table`, `--json`, `--ltsv`
+- **Interactive** — `-i` adds fuzzy selection with transcript preview (via [fzf](https://github.com/junegunn/fzf) or compatible finder)
+
+## Installation
+
+### Homebrew
+
+```bash
+brew install nihen/tap/ah
+```
+
+Supported in the tap today:
+- Apple Silicon macOS
+- Linux x86_64
+
+Intel Mac users should use Cargo or a source build.
+
+### Cargo
+
+```bash
+cargo install ah-cli
+```
+
+### From binary
+
+Download a prebuilt binary from [GitHub Releases](https://github.com/nihen/ah/releases).
+
+Available today:
+- macOS arm64
+- Linux x86_64
+
+### From source
+
+```bash
+cargo install --git https://github.com/nihen/ah
+```
+
+### Shell completion
+
+```bash
+# zsh
+mkdir -p ~/.zfunc && ah completion zsh > ~/.zfunc/_ah
+# Add to .zshrc: fpath=(~/.zfunc $fpath); autoload -Uz compinit && compinit
+
+# bash
+ah completion bash > ~/.local/share/bash-completion/completions/ah
+
+# fish
+ah completion fish > ~/.config/fish/completions/ah.fish
+```
+
+## Usage
+
+| Command | Description |
+|---------|-------------|
+| `ah log` | List sessions (default: current directory) |
+| `ah show` | Show session transcript |
+| `ah resume` | Resume an agent session |
+| `ah project` | List known projects |
+| `ah memory` | List agent memory and instruction files |
+| `ah agent` | Show session summary per agent |
+
+Common options: `-a` (all directories), `-q` (full-text search), `-i` (interactive mode). Not all options apply to every subcommand — run `ah <command> --help` for details.
+
+`ah show` and `ah resume` accept either a session path or a session ID. If omitted, they use the latest session matching stdin, `-q`, and other filters.
+
+### Interactive mode (-i)
+
+Most commands support `-i` for fuzzy selection with transcript preview. Requires [`fzf`](https://github.com/junegunn/fzf) or a compatible finder (e.g. [`sk`](https://github.com/lotabout/skim)) in `PATH`. Override with `$AH_SELECTOR`.
+
+Useful as a shell function — pick a project, browse its sessions, resume:
+
+```bash
+ahr() { local d; d="$(ah project -i)" && ah resume -i -d "$d"; }
+```
+
+### Output formats
+
+When piped, output automatically switches to plain TSV (no colors, no pager). Other formats are available:
+
+```bash
+ah log                        # color-coded TSV with pager on TTY, plain TSV when piped
+ah log --table                # aligned table with header row
+ah log --tsv                  # force plain TSV (no header, no color)
+ah log --json                 # JSON Lines
+ah log --ltsv                 # LTSV
+ah log -o agent,project,path  # pick output fields
+ah log -O pid,cwd             # add fields to defaults
+ah log --list-fields           # list available fields
+ah log --no-pager             # disable automatic pager
+```
+
+Run `ah <command> --help` for full options.
+
+## Configuration (~/.ahrc)
+
+`ah` works out of the box with no configuration. Optionally, create `~/.ahrc` (TOML) to customize agent settings.
+
+### Disable an agent
+
+```toml
+[agents.codex]
+disabled = true
+```
+
+### Add extra file patterns to a built-in agent
+
+```toml
+[agents.claude]
+extra_patterns = ["~/claude-archive/projects/*/*.jsonl"]
+```
+
+### Add a custom agent (using an existing plugin's parser)
+
+```toml
+[agents.aider]
+plugin = "claude"
+file_patterns = ["~/.aider/history/*.jsonl"]
+```
+
+Available plugins: `claude`, `codex`, `gemini`, `copilot`, `cursor`. The `plugin` field tells `ah` how to parse the session files.
+
+### Environment variables
+
+Each built-in agent respects its CLI's config directory environment variable:
+
+| Agent   | Session Files | Env Var            | Default     |
+|---------|---------------|--------------------|-------------|
+| Claude  | `projects/*/*.jsonl` | `CLAUDE_CONFIG_DIR`| `~/.claude` |
+| Codex   | `sessions/**/*.jsonl` | `CODEX_HOME`       | `~/.codex`  |
+| Gemini  | `tmp/*/chats/session-*.json` | `GEMINI_CLI_HOME`  | `~/.gemini` |
+| Copilot | `session-state/*/workspace.yaml` | `COPILOT_HOME`     | `~/.copilot`|
+| Cursor  | `projects/*/agent-transcripts/**/*.jsonl` | `CURSOR_CONFIG_DIR`| `~/.cursor` |
+
+Run `ah list-agents` to see the full configuration including glob patterns and capabilities.
+
+Additional environment variables:
+
+| Env Var    | Description |
+|------------|-------------|
+| `AH_PAGER` | Override pager command (default: `less`). Set to empty string to disable |
+| `PAGER`    | Fallback pager command (used if `AH_PAGER` is not set) |
+| `AH_COLOR` | Set to `1` to force colored output (like `--color`) |
+| `NO_COLOR` | Set to disable colored output ([no-color.org](https://no-color.org/)) |
+
+## Examples
+
+### SQL with [trdsql](https://github.com/noborus/trdsql)
+
+```bash
+ah log -a --ltsv | trdsql -iltsv "SELECT * FROM - WHERE agent='claude'"
+ah log -a --ltsv | trdsql -iltsv "SELECT agent, COUNT(*) as cnt FROM - GROUP BY agent"
+```
+
+### JSON with [jq](https://github.com/jqlang/jq)
+
+```bash
+ah log -a --json | jq '.project'
+ah log -a --json -n 1 | jq '.'
+ah project --json | jq '.project'       # list project names
+```
+
+### Piping
+
+```bash
+ah log -q "auth" -o path | head -1 | ah show    # show latest match
+ah log -q "auth" -o path | head -1 | ah resume  # resume latest match
+ah log -a -o project | sort | uniq -c | sort -rn # project ranking
+```
+
+## Roadmap
+
+- **Remote session aggregation** — `ssh` to a remote host running `ah`, aggregate results locally. Like rsync's remote process model: computation happens near the data, only metadata travels over the wire.
+
+## License
+
+[MIT](LICENSE)

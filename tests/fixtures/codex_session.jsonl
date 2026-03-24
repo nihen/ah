@@ -1,0 +1,6 @@
+{"type":"session.start","payload":{"id":"codex-sess-001","cwd":"/Users/test/api-server"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"add redis caching"}]}}
+{"type":"response_item","payload":{"role":"assistant","content":[{"type":"output_text","text":"Adding redis caching..."}]}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"<system>ignore</system>"}]}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"# Header line"}]}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"deploy to production"}]}}

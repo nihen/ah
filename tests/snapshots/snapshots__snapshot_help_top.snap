@@ -1,0 +1,53 @@
+---
+source: tests/snapshots.rs
+expression: "help_output(&[\"--help\"])"
+---
+Search, inspect, and resume coding-agent sessions from one CLI
+(read-only except resume)
+
+Defaults to the current directory. Use -a to search across all known sessions.
+
+Usage:
+  ah <COMMAND> [OPTIONS]
+
+Commands:
+  log                 List sessions
+  project             List known projects
+  show                Show session transcript
+  resume              Resume an agent session
+  memory              List agent memory and instruction files
+  agent               Show session summary per agent
+
+Help / setup:
+  list-agents         List supported agents
+  completion          Generate shell completion script
+  man                 Generate man page
+
+Global options:
+  -a, --all               Show all sessions (disable default cwd filtering)
+  --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
+  --project <NAME>        Filter by project name
+  -d, --dir <PATH>        Filter by working directory (default: current directory)
+  -q, --query <REGEX>     Full-text search query (regex, case-insensitive)
+  -p, --prompt-only       Search only user prompts (use with -q)
+  -n, --limit N           Max session files to scan (default: 0, no limit)
+  -i, --interactive       Interactive mode via fuzzy finder (fzf/sk)
+  -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
+  --no-preview            Disable preview in interactive mode
+  --running               Show only currently running sessions (Claude only for now)
+  --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --color                 Force colored output (even through pipes)
+  --no-color              Disable colored output
+  --no-pager              Disable automatic pager
+  -h, --help              Show this help
+  -V, --version           Show version
+
+Examples:
+  ah log                      # latest sessions for the current directory
+  ah log -a -q "auth"         # search across all known sessions
+  ah resume                   # resume the latest matching session
+  ah show -q "OAuth"          # show the latest matching session
+  ah resume -i                # browse sessions with fzf/sk and resume
+
+Run `ah <COMMAND> --help` for subcommand-specific options.

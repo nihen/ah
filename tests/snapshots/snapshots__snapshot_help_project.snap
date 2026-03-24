@@ -1,0 +1,44 @@
+---
+source: tests/snapshots.rs
+expression: "help_output(&[\"project\", \"--help\"])"
+---
+List known projects
+
+Usage:
+  ah project [OPTIONS]
+
+Options:
+  -o, --fields <FIELDS>   Select output fields (replaces defaults, see --list-fields)
+                          Default: project, session_count, last_modified_at, agents
+                          In -i mode default: cwd, project, session_count, last_modified_at
+  -O, --extra-fields <FIELDS>  Add fields to defaults (comma-separated)
+  --table                 Aligned table with header row
+  --tsv                   Tab-separated values (no header, no color)
+  --ltsv                  Labeled Tab-Separated Values (in -i mode: selector display format)
+  --json                  JSON Lines output
+  -S, --sort <FIELD>      Sort by field (default: last_modified_at)
+  --asc                   Sort ascending
+  --desc                  Sort descending (default)
+  -L, --list-fields       List available output fields and exit (use with --json for machine-readable output)
+
+Default output (when no format flag is given):
+  Aligned table with auto-pager on TTY, plain TSV when piped
+
+Interactive mode:
+  -i, --interactive       Browse projects via fuzzy finder; prints selected cwd
+  -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
+  --no-preview            Disable preview
+
+Global options:
+  -a, --all               Show all projects (default; -a has no effect)
+  --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
+  -d, --dir <PATH>        Filter by working directory
+  -n, --limit N           Max session files to scan (default: 0, no limit)
+  --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+
+Display options:
+  --color                 Force colored output (even through pipes)
+  --no-color              Disable colored output
+  --no-pager              Disable automatic pager
+  --debug                 Show debug info (glob expansion, scan counts, timing) on stderr
