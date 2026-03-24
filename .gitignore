@@ -1,0 +1,13 @@
+/target
+/completions
+/man
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+Makefile.local
+.aider*
+demo/demo-pre.svg
+*.gif
+*.mp4

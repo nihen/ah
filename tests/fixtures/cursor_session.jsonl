@@ -1,0 +1,4 @@
+{"role":"user","message":{"content":[{"type":"text","text":"implement dark mode"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"I'll add dark mode support."}]}}
+{"role":"user","message":{"content":[{"type":"text","text":"<local>system message</local>"}]}}
+{"role":"user","message":{"content":[{"type":"text","text":"also add i18n support"}]}}

@@ -1,0 +1,22 @@
+---
+source: tests/snapshots.rs
+expression: "help_output(&[\"list-agents\", \"--help\"])"
+---
+List supported agents
+
+Usage:
+  ah list-agents [OPTIONS]
+
+Options:
+  --table   Table output (default on TTY)
+  --tsv     Tab-separated values (default when piped)
+  --ltsv    Labeled Tab-Separated Values
+  --json    JSON Lines output
+
+Shows each built-in agent, its file patterns, and supported capabilities.
+
+Examples:
+  ah list-agents
+  ah list-agents --json
+  ah list-agents --json | jq '.id'
+  ah list-agents --tsv | column -t -s$'\t'

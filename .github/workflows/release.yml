@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: ah-linux-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: ah-darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl-tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cp target/${{ matrix.target }}/release/ah ${{ matrix.artifact }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - run: |
+          chmod +x ah-linux-x86_64/ah-linux-x86_64
+          chmod +x ah-darwin-arm64/ah-darwin-arm64
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ah-linux-x86_64/ah-linux-x86_64
+            ah-darwin-arm64/ah-darwin-arm64
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate formula and push to tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE_URL="https://github.com/nihen/ah/releases/download/${GITHUB_REF_NAME}"
+          curl -sL "${BASE_URL}/ah-darwin-arm64" -o ah-darwin-arm64
+          curl -sL "${BASE_URL}/ah-linux-x86_64" -o ah-linux-x86_64
+          SHA_DARWIN=$(sha256sum ah-darwin-arm64 | cut -d' ' -f1)
+          SHA_LINUX=$(sha256sum ah-linux-x86_64 | cut -d' ' -f1)
+
+          export VERSION SHA_DARWIN SHA_LINUX BASE_URL
+          envsubst < .github/formula.rb.tmpl > ah.rb
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/nihen/homebrew-tap.git"
+          mkdir -p homebrew-tap/Formula
+          cp ah.rb homebrew-tap/Formula/ah.rb
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ah.rb
+          git commit -m "ah ${VERSION}"
+          git push

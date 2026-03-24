@@ -1,0 +1,7 @@
+{"type":"system","cwd":"/Users/test/myproject"}
+{"type":"user","message":{"role":"user","content":"fix the auth bug"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll fix that for you."}]}}
+{"type":"user","message":{"role":"user","content":"<command-name>/commit</command-name>"}}
+{"type":"user","message":{"role":"user","content":"now refactor the database layer"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}
+{"type":"custom-title","customTitle":"fix-auth-bug","sessionId":"test-session-001"}

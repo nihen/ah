@@ -1,0 +1,47 @@
+---
+source: tests/snapshots.rs
+expression: "help_output(&[\"resume\", \"--help\"])"
+---
+Resume an agent session
+
+Usage:
+  ah resume [OPTIONS] [SESSION] [-- EXTRA_ARGS...]
+
+If SESSION is omitted, ah resumes the latest session matching stdin, -q, and other filters.
+
+Arguments after -- are passed directly to the agent command.
+
+The only command that launches an agent process; other commands are read-only.
+
+Options:
+  --print                 Print the resolved resume command and exit (read-only; does not execute)
+
+Interactive mode:
+  -i, --interactive       Select session via fuzzy finder then resume it
+  -o, --fields <FIELDS>   Display fields in interactive mode (default: agent,project,modified_at,title)
+  -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
+  --ltsv                  Use LTSV format for interactive selector display
+  --no-preview            Disable transcript preview
+
+Examples:
+  ah resume                   # resume latest matching session
+  ah resume --print           # print the resolved resume command
+  ah resume a1b2c3d4          # resume by ID
+  ah resume -i                # interactive selection
+  ah resume -- --dry-run      # pass extra args to agent
+
+Global options:
+  -a, --all               Show all sessions (disable default cwd filtering)
+  --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
+  --project <NAME>        Filter by project name
+  -d, --dir <PATH>        Filter by working directory (default: current directory)
+  -q, --query <REGEX>     Full-text search query (regex, case-insensitive)
+  -p, --prompt-only       Search only user prompts (use with -q)
+  -n, --limit N           Max session files to scan (default: 0, no limit)
+  --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --running               Show only currently running sessions (Claude only for now)
+  --color                 Force colored output (even through pipes)
+  --no-color              Disable colored output
+  --no-pager              Disable automatic pager
+  --debug                 Show debug info (glob expansion, scan counts, timing) on stderr
