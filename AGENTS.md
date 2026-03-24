@@ -20,15 +20,18 @@ src/
   agents/        -- built-in agent plugins + registry + shared helpers
   session.rs     -- Session struct
   collector.rs   -- glob expansion + rayon parallel stat + BinaryHeap top-N
-  projects.rs    -- project aggregation (shared by `ah project` and `ah fuzzy project`)
+  pipeline.rs    -- unified session pipeline: collect → filter → search → resolve → sort
+  projects.rs    -- project aggregation (shared by `ah project` and `ah project -i`)
   resolver.rs    -- plugin-driven metadata extraction and transcript shaping
   search.rs      -- mmap+regex full-text / plugin prompt-only search
   memory.rs      -- `ah memory` subcommand: memory + instruction file listing
   output.rs      -- TSV/LTSV/JSON output for log, project, and memory listing
   color.rs       -- color mode detection (--color/--no-color/TTY auto)
-  show.rs        -- `ah show` subcommand: pretty-print transcript
+  pager.rs       -- auto-pager (less) setup for TTY output
+  show.rs        -- `ah show` subcommand: pretty-print transcript + --follow
   resume.rs      -- `ah resume` subcommand: exec agent resume command
-  fuzzy.rs       -- `ah fuzzy log` / `ah fuzzy project` / `ah fuzzy memory` interactive browse
+  man.rs         -- `ah man` subcommand: man page generation via clap_mangen
+  fuzzy.rs       -- `-i` interactive browse via fzf/sk for log, project, memory
   subcmd.rs      -- shared session resolver (stdin pipe, session ID/path, query, filters)
 ```
 
@@ -37,7 +40,7 @@ src/
 - No external tools for search/parsing (all indexing and query logic in-process; no rg/jq/sed)
 - Parallel stat + metadata resolution via rayon
 - memmap2 for searching large JSONL files without copying
-- Regex compiled once via LazyLock (no recompilation in hot paths)
+- Plugin-internal regex compiled once via LazyLock; user query regex compiled per invocation
 - Single-pass filter_map for search filtering + metadata resolution
 - Default cwd filtering: all subcommands filter by current directory, `-a` for global
   - Exception: `project` defaults to all (no cwd filter)

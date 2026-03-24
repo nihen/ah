@@ -294,6 +294,14 @@ ah log -q "auth" -o path | head -1 | ah resume  # resume latest match
 ah log -a -o project | sort | uniq -c | sort -rn # project ranking
 ```
 
+## For AI Agents (CLAUDE.md / AGENTS.md)
+
+Add this line to your project or global instructions so your coding agent knows about `ah`:
+
+```
+`ah` — cross-agent session history CLI. Run `ah -h` for usage; key commands: `ah log` (list sessions), `ah show` (view transcript), `ah log -a -q "keyword"` (search all).
+```
+
 ## Roadmap
 
 - **Remote session aggregation** — `ssh` to a remote host running `ah`, aggregate results locally. Like rsync's remote process model: computation happens near the data, only metadata travels over the wire.
