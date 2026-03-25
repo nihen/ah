@@ -288,10 +288,19 @@ pub fn run_project(
 
     if preview {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
-        selector_args.push(format!(
-            "--preview={} log -d \"{{1}}\" -o agent,modified_at,title --color",
-            shell_quote(&exe.to_string_lossy())
-        ));
+        let exe_quoted = shell_quote(&exe.to_string_lossy());
+        if ltsv {
+            // In LTSV mode, {1} is "cwd:'/quoted/path'" — strip prefix via shell
+            selector_args.push(format!(
+                "--preview=p={{1}}; p=${{p#cwd:}}; {} log -d \"$p\" -o agent,modified_at,title --color",
+                exe_quoted
+            ));
+        } else {
+            selector_args.push(format!(
+                "--preview={} log -d {{1}} -o agent,modified_at,title --color",
+                exe_quoted
+            ));
+        }
         selector_args.push("--preview-window=right:60%:wrap".to_string());
     }
 
@@ -670,7 +679,7 @@ pub fn run_memory(
     ];
 
     if preview {
-        selector_args.push("--preview=cat \"{1}\"".to_string());
+        selector_args.push("--preview=cat {1}".to_string());
         selector_args.push("--preview-window=right:60%:wrap".to_string());
     }
 
