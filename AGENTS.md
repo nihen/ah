@@ -84,6 +84,10 @@ time ah -a -q "query" log -n 100 > /dev/null
 
 ## Release
 
-```bash
-make release      # git tag vX.Y.Z && push → GitHub Actions builds binaries
-```
+1. `git switch -c release/vX.Y.Z origin/main`
+2. Bump `version` in `Cargo.toml` and commit
+3. Create a PR and merge
+
+Auto-tag workflow creates tag → Release workflow builds binaries, creates GitHub Release, publishes to crates.io, updates Homebrew tap.
+
+Branch name must start with `release/` for auto-tag to trigger.
