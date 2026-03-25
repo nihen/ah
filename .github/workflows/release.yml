@@ -4,9 +4,17 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name (e.g. v0.1.1)'
+        required: true
 
 permissions:
   contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -22,6 +30,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -46,6 +56,7 @@ jobs:
           chmod +x ah-darwin-arm64/ah-darwin-arm64
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
           generate_release_notes: true
           files: |
             ah-linux-x86_64/ah-linux-x86_64
@@ -56,6 +67,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo publish
         env:
@@ -66,12 +79,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
       - name: Generate formula and push to tap
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          BASE_URL="https://github.com/nihen/ah/releases/download/${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          BASE_URL="https://github.com/nihen/ah/releases/download/${TAG}"
           curl -sL "${BASE_URL}/ah-darwin-arm64" -o ah-darwin-arm64
           curl -sL "${BASE_URL}/ah-linux-x86_64" -o ah-linux-x86_64
           SHA_DARWIN=$(sha256sum ah-darwin-arm64 | cut -d' ' -f1)
