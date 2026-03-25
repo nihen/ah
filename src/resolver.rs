@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use regex::Regex;
+use regex::bytes::Regex as BytesRegex;
 
 use crate::agents::common::{format_mtime, mmap_file};
 use crate::agents::{AgentPlugin, Message, MessageRole};
@@ -125,24 +126,33 @@ fn resolve_matched(
     opts: &ResolveOpts,
     preloaded_mmap: Option<&[u8]>,
 ) -> String {
-    let Some(re) = &opts.query_re else {
-        return String::new();
-    };
     match opts.search_mode {
-        SearchMode::All => resolve_matched_mmap(
-            &plugin.search_path(path),
-            re,
-            preloaded_mmap,
-            opts.literal_needle.as_deref(),
-        ),
-        SearchMode::Prompt => resolve_matched_prompts(path, plugin, re),
+        SearchMode::All => {
+            let Some(bytes_re) = &opts.bytes_query_re else {
+                return String::new();
+            };
+            resolve_matched_mmap(
+                &plugin.search_path(path),
+                bytes_re,
+                preloaded_mmap,
+                opts.literal_needle.as_deref(),
+            )
+        }
+        SearchMode::Prompt => {
+            let Some(re) = &opts.query_re else {
+                return String::new();
+            };
+            resolve_matched_prompts(path, plugin, re)
+        }
     }
 }
 
 /// Fast path: search raw file bytes via mmap.
+/// Uses bytes::Regex to find match position, then converts only the
+/// surrounding ~200 bytes to UTF-8 for context extraction.
 fn resolve_matched_mmap(
     path: &Path,
-    re: &Regex,
+    bytes_re: &BytesRegex,
     preloaded: Option<&[u8]>,
     literal_needle: Option<&[u8]>,
 ) -> String {
@@ -156,19 +166,21 @@ fn resolve_matched_mmap(
             None => return String::new(),
         }
     };
-    let text = match std::str::from_utf8(data) {
-        Ok(t) => t,
-        Err(_) => return String::new(),
-    };
     // Fast literal path: use memchr SIMD instead of regex
     if let Some(needle) = literal_needle {
-        return extract_matches_literal(data, text, needle);
+        return extract_matches_literal_bytes(data, needle);
     }
-    extract_matches(text, re)
+    // Regex path: find match in raw bytes, then extract context from surrounding slice
+    if let Some(mat) = bytes_re.find(data) {
+        extract_context_from_bytes(data, mat.start(), mat.end(), 30)
+    } else {
+        String::new()
+    }
 }
 
 /// Extract match context using fast case-insensitive byte search.
-fn extract_matches_literal(data: &[u8], text: &str, needle_lower: &[u8]) -> String {
+/// Works directly on raw bytes — no full-file UTF-8 conversion needed.
+fn extract_matches_literal_bytes(data: &[u8], needle_lower: &[u8]) -> String {
     if needle_lower.is_empty() {
         return String::new();
     }
@@ -198,10 +210,54 @@ fn extract_matches_literal(data: &[u8], text: &str, needle_lower: &[u8]) -> Stri
             .zip(needle_lower)
             .all(|(h, n)| h.to_ascii_lowercase() == *n)
         {
-            return extract_match_context(text, abs, abs + needle_lower.len(), 30);
+            return extract_context_from_bytes(data, abs, abs + needle_lower.len(), 30);
         }
         start = abs + 1;
     }
+}
+
+/// Extract context snippet from raw bytes around a match position.
+fn extract_context_from_bytes(data: &[u8], start: usize, end: usize, max_context: usize) -> String {
+    // Take a generous byte window around the match (4 bytes per char max in UTF-8)
+    let window = max_context.saturating_mul(4);
+    let mut slice_start = start.saturating_sub(window);
+    let slice_end = end.saturating_add(window).min(data.len());
+
+    // Align slice_start to a UTF-8 char boundary (skip continuation bytes 10xxxxxx)
+    while slice_start < start && data[slice_start] & 0xC0 == 0x80 {
+        slice_start += 1;
+    }
+
+    let slice = &data[slice_start..slice_end];
+    let text = match std::str::from_utf8(slice) {
+        Ok(t) => t,
+        Err(e) => {
+            let valid_end = e.valid_up_to();
+            if valid_end == 0 {
+                return String::new();
+            }
+            match std::str::from_utf8(&slice[..valid_end]) {
+                Ok(t) => t,
+                Err(_) => return String::new(),
+            }
+        }
+    };
+
+    // Adjust match positions relative to the slice, snapping to char boundaries
+    let mut rel_start = start - slice_start;
+    let mut rel_end = end - slice_start;
+    if rel_end > text.len() {
+        return String::new();
+    }
+    // Snap to nearest UTF-8 char boundaries (bytes::Regex may return mid-char offsets)
+    while rel_start > 0 && !text.is_char_boundary(rel_start) {
+        rel_start -= 1;
+    }
+    while rel_end < text.len() && !text.is_char_boundary(rel_end) {
+        rel_end += 1;
+    }
+
+    extract_match_context(text, rel_start, rel_end, max_context)
 }
 
 /// Slow path: search only user prompt messages.
@@ -221,48 +277,44 @@ fn resolve_matched_prompts(path: &Path, plugin: &dyn AgentPlugin, re: &Regex) ->
     result
 }
 
-/// Extract the first match context snippet from text.
-fn extract_matches(text: &str, re: &Regex) -> String {
-    if let Some(mat) = re.find(text) {
-        extract_match_context(text, mat.start(), mat.end(), 30)
-    } else {
-        String::new()
-    }
-}
-
 /// Extract a snippet around a match, keeping total ~max_context chars.
 /// Tries to split context evenly before/after the match.
+/// Only examines bytes near the match position — O(max_context), not O(file_size).
 fn extract_match_context(text: &str, start: usize, end: usize, max_context: usize) -> String {
-    // Build char index → byte offset mapping and locate match boundaries in char space
-    let char_indices: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
-    let total_chars = char_indices.len();
+    // Validate that start/end are within bounds and on UTF-8 char boundaries
+    if start > end
+        || end > text.len()
+        || !text.is_char_boundary(start)
+        || !text.is_char_boundary(end)
+    {
+        return String::new();
+    }
 
-    let start_char = char_indices
-        .iter()
-        .position(|&b| b == start)
-        .unwrap_or(total_chars);
-    let end_char = char_indices
-        .iter()
-        .position(|&b| b == end)
-        .unwrap_or(total_chars);
-
-    let match_len_chars = end_char.saturating_sub(start_char);
+    // Count chars in the match span
+    let match_text = &text[start..end];
+    let match_len_chars = match_text.chars().count();
     let remaining = max_context.saturating_sub(match_len_chars);
-    let half = remaining / 2;
+    let before_chars = remaining / 2;
+    let after_chars = remaining - before_chars;
 
-    let ctx_start_char = start_char.saturating_sub(half);
-    let ctx_end_char = (end_char + remaining - half).min(total_chars);
+    // Walk backward from start to find ctx_start_byte (before_chars chars back)
+    let ctx_start_byte = if before_chars == 0 {
+        start
+    } else {
+        text[..start]
+            .char_indices()
+            .rev()
+            .nth(before_chars - 1)
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    };
 
-    let ctx_start_byte = if ctx_start_char < total_chars {
-        char_indices[ctx_start_char]
-    } else {
-        text.len()
-    };
-    let ctx_end_byte = if ctx_end_char < total_chars {
-        char_indices[ctx_end_char]
-    } else {
-        text.len()
-    };
+    // Walk forward from end to find ctx_end_byte (after_chars chars forward)
+    let ctx_end_byte = text[end..]
+        .char_indices()
+        .nth(after_chars)
+        .map(|(i, _)| end + i)
+        .unwrap_or(text.len());
 
     let mut result = String::new();
     if ctx_start_byte > 0 {
@@ -370,6 +422,7 @@ pub struct ResolveOpts {
     pub transcript_limit: usize,
     pub title_limit: usize,
     pub query_re: Option<Regex>,
+    pub bytes_query_re: Option<BytesRegex>,
     pub search_mode: SearchMode,
     /// Pre-computed lowercase needle for fast literal match context extraction.
     pub literal_needle: Option<Vec<u8>>,
@@ -379,6 +432,11 @@ impl ResolveOpts {
     pub fn new(query: &str, transcript_limit: usize, title_limit: usize) -> Self {
         let query_re = if !query.is_empty() {
             Regex::new(&format!("(?i){}", query)).ok()
+        } else {
+            None
+        };
+        let bytes_query_re = if !query.is_empty() {
+            BytesRegex::new(&format!("(?iu){}", query)).ok()
         } else {
             None
         };
@@ -397,6 +455,7 @@ impl ResolveOpts {
             transcript_limit,
             title_limit,
             query_re,
+            bytes_query_re,
             search_mode: SearchMode::All,
             literal_needle,
         }
@@ -443,6 +502,7 @@ impl Default for ResolveOpts {
             transcript_limit: 0,
             title_limit: 0,
             query_re: None,
+            bytes_query_re: None,
             search_mode: SearchMode::All,
             literal_needle: None,
         }
@@ -970,7 +1030,7 @@ mod tests {
     #[test]
     fn test_resolve_matched_mmap_basic() {
         let path = fixture_path("claude_session.jsonl");
-        let re = Regex::new("(?i)auth").unwrap();
+        let re = BytesRegex::new("(?iu)auth").unwrap();
         let result = resolve_matched_mmap(&path, &re, None, None);
         assert!(!result.is_empty());
         assert!(result.contains("auth"));
@@ -979,20 +1039,20 @@ mod tests {
     #[test]
     fn test_resolve_matched_mmap_no_match() {
         let path = fixture_path("claude_session.jsonl");
-        let re = Regex::new("ZZZZNOTEXIST").unwrap();
+        let re = BytesRegex::new("ZZZZNOTEXIST").unwrap();
         let result = resolve_matched_mmap(&path, &re, None, None);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_resolve_matched_mmap_nonexistent_file() {
-        let re = Regex::new("test").unwrap();
+        let re = BytesRegex::new("test").unwrap();
         let result = resolve_matched_mmap(Path::new("/nonexistent"), &re, None, None);
         assert!(result.is_empty());
     }
 
     #[test]
-    fn test_resolve_matched_mmap_single_excerpt() {
+    fn test_resolve_matched_mmap_returns_first_match_only() {
         let dir = std::env::temp_dir().join(format!("ah-matched-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("many_matches.txt");
@@ -1001,10 +1061,15 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(&path, content).unwrap();
-        let re = Regex::new("hello").unwrap();
+        let re = BytesRegex::new("hello").unwrap();
         let result = resolve_matched_mmap(&path, &re, None, None);
-        let count = result.matches(" | ").count() + 1;
-        assert!(count <= 5, "Expected at most 5 excerpts, got {}", count);
+        // Returns only the first match context (no " | " separator)
+        assert!(result.contains("hello"));
+        assert!(
+            !result.contains(" | "),
+            "Should return single excerpt, got: {}",
+            result
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1026,6 +1091,86 @@ mod tests {
         let result = resolve_matched_prompts(&path, plugin, &re);
         // Should NOT match since it's in assistant text, not user prompt
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_match_context_basic() {
+        let text = "hello world, this is a test string";
+        let start = text.find("test").unwrap();
+        let end = start + "test".len();
+        let result = extract_match_context(text, start, end, 10);
+        assert!(result.contains("test"));
+    }
+
+    #[test]
+    fn test_extract_match_context_no_before_context() {
+        // When match is long enough that before_chars == 0
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        // Match the entire string (match_len_chars >= max_context)
+        let result = extract_match_context(text, 0, text.len(), 5);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_match_context_multibyte() {
+        let text = "こんにちは世界テスト文字列";
+        // Find "テスト" in the string
+        let start = text.find("テスト").unwrap();
+        let end = start + "テスト".len();
+        let result = extract_match_context(text, start, end, 10);
+        assert!(result.contains("テスト"));
+    }
+
+    #[test]
+    fn test_extract_match_context_invalid_boundary() {
+        let text = "café";
+        // 'é' is 2 bytes (0xC3 0xA9); byte offset 3 is the start of 'é' and byte offset 4 is mid-character
+        let result = extract_match_context(text, 4, 5, 10);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_extract_match_context_at_start() {
+        let text = "hello world";
+        let result = extract_match_context(text, 0, 5, 10);
+        assert!(result.starts_with("hello"));
+    }
+
+    #[test]
+    fn test_extract_match_context_at_end() {
+        let text = "hello world";
+        let result = extract_match_context(text, 6, 11, 10);
+        assert!(result.ends_with("world"));
+    }
+
+    #[test]
+    fn test_extract_context_from_bytes_ascii() {
+        let data = b"hello world test string";
+        let start = 12; // "test"
+        let end = 16;
+        let result = extract_context_from_bytes(data, start, end, 10);
+        assert!(result.contains("test"));
+    }
+
+    #[test]
+    fn test_extract_context_from_bytes_multibyte() {
+        let text = "前後のテスト文字列です";
+        let data = text.as_bytes();
+        let start = text.find("テスト").unwrap();
+        let end = start + "テスト".len();
+        let result = extract_context_from_bytes(data, start, end, 10);
+        assert!(result.contains("テスト"));
+    }
+
+    #[test]
+    fn test_extract_context_from_bytes_boundary_snap() {
+        // Simulate bytes::Regex returning mid-char offset
+        let text = "cafébar";
+        let data = text.as_bytes();
+        // 'é' = bytes [4,5], so offset 5 is mid-char in the 'é'
+        // This should snap and still produce output
+        let result = extract_context_from_bytes(data, 4, 6, 10);
+        assert!(!result.is_empty());
     }
 
     #[test]
