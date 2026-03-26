@@ -7,6 +7,28 @@ use crate::color::{self, BOLD, DIM, RESET};
 use crate::output::strip_ansi;
 use crate::subcmd;
 
+/// Compile a case-insensitive highlight regex from user pattern.
+fn compile_highlight(pattern: &str) -> Option<regex::Regex> {
+    if pattern.is_empty() {
+        return None;
+    }
+    regex::RegexBuilder::new(&regex::escape(pattern))
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+
+/// Apply reverse-video highlighting to matching text.
+/// Uses \x1b[7m (reverse) / \x1b[27m (un-reverse) to preserve DIM/BOLD.
+fn highlight_text(text: &str, re: &regex::Regex) -> String {
+    const HL: &str = "\x1b[7m";
+    const HL_END: &str = "\x1b[27m";
+    re.replace_all(text, |caps: &regex::Captures| {
+        format!("{}{}{}", HL, &caps[0], HL_END)
+    })
+    .into_owned()
+}
+
 pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
     let home = canonical_home();
     let format = args.format();
@@ -45,22 +67,23 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
                 return Err(format!("Failed to read: {}", path.display()));
             }
         }
-        ShowFormat::Pretty => run_pretty(&path, args.head),
+        ShowFormat::Pretty => run_pretty(&path, args.head, args.highlight.as_deref()),
         ShowFormat::Json => run_json(&path, args.head),
         ShowFormat::Md => run_md(&path, args.head),
     }
 
     if follow {
-        run_follow(&path, plugin)?;
+        run_follow(&path, plugin, args.highlight.as_deref())?;
     }
 
     Ok(())
 }
 
-fn run_pretty(path: &std::path::Path, head: Option<usize>) {
+fn run_pretty(path: &std::path::Path, head: Option<usize>, highlight: Option<&str>) {
     let plugin = agents::find_plugin_for_path(path);
     let is_tty = color::use_color();
     let limit = head.unwrap_or(0);
+    let hl_re = highlight.and_then(compile_highlight);
 
     let mut count: usize = 0;
     let mut first = true;
@@ -76,6 +99,15 @@ fn run_pretty(path: &std::path::Path, head: Option<usize>) {
         first = false;
 
         let text = strip_ansi(&message.text);
+        let text = if is_tty {
+            if let Some(ref re) = hl_re {
+                highlight_text(&text, re)
+            } else {
+                text
+            }
+        } else {
+            text
+        };
         match message.role {
             MessageRole::User => {
                 if is_tty {
@@ -167,8 +199,13 @@ fn run_md(path: &std::path::Path, head: Option<usize>) {
 
 /// Follow a session file for new messages (like tail -f).
 /// Seeks to end of file and polls for new JSONL lines, printing them as pretty output.
-fn run_follow(path: &std::path::Path, plugin: &dyn agents::AgentPlugin) -> Result<(), String> {
+fn run_follow(
+    path: &std::path::Path,
+    plugin: &dyn agents::AgentPlugin,
+    highlight: Option<&str>,
+) -> Result<(), String> {
     let is_tty = color::use_color();
+    let hl_re = highlight.and_then(compile_highlight);
 
     let mut file =
         std::fs::File::open(path).map_err(|e| format!("Failed to open for follow: {}", e))?;
@@ -250,6 +287,15 @@ fn run_follow(path: &std::path::Path, plugin: &dyn agents::AgentPlugin) -> Resul
                 for message in plugin.messages_from_value(&val) {
                     println!();
                     let text = strip_ansi(&message.text);
+                    let text = if is_tty {
+                        if let Some(ref re) = hl_re {
+                            highlight_text(&text, re)
+                        } else {
+                            text
+                        }
+                    } else {
+                        text
+                    };
                     match message.role {
                         MessageRole::User => {
                             if is_tty {

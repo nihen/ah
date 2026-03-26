@@ -196,6 +196,7 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
             selector_args.push(format!("--preview={} show --color {{1}}", exe_quoted));
         }
         selector_args.push("--preview-window=right:60%:wrap".to_string());
+        push_preview_search_binds(&mut selector_args, &exe_quoted, ltsv, "path", &selector);
     }
 
     let selected = match run_selector(&selector, &selector_args, &input)? {
@@ -409,11 +410,10 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
 
     if preview {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
-        selector_args.push(format!(
-            "--preview={} show --color {{1}}",
-            shell_quote(&exe.to_string_lossy())
-        ));
+        let exe_quoted = shell_quote(&exe.to_string_lossy());
+        selector_args.push(format!("--preview={} show --color {{1}}", exe_quoted));
         selector_args.push("--preview-window=right:60%:wrap".to_string());
+        push_preview_search_binds(&mut selector_args, &exe_quoted, false, "path", &selector);
     }
 
     let selected = match run_selector(&selector, &selector_args, &input)? {
@@ -427,7 +427,7 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
         return Ok(());
     }
 
-    let show_args = ShowArgs::with_session(args.head, Some(path_str));
+    let show_args = ShowArgs::with_session(args.head, Some(path_str), args.highlight.clone());
     crate::show::run(show_args, filter)
 }
 
@@ -556,6 +556,7 @@ pub fn run_resume(
             selector_args.push(format!("--preview={} show --color {{1}}", exe_quoted));
         }
         selector_args.push("--preview-window=right:60%:wrap".to_string());
+        push_preview_search_binds(&mut selector_args, &exe_quoted, ltsv, "path", &selector);
     }
 
     let selected = match run_selector(&selector, &selector_args, &input)? {
@@ -610,6 +611,56 @@ pub fn run_resume(
     }
 
     resume::exec_resume(&full_cmd);
+}
+
+/// Push fzf --bind args for search-in-preview toggle (ctrl-s).
+///
+/// ctrl-s toggles between normal mode and search-in-preview mode.
+/// State is tracked via preview-label ($FZF_PREVIEW_LABEL).
+///
+/// The --preview command itself checks $FZF_PREVIEW_LABEL to decide whether
+/// to add --highlight, keeping {q} and {1} as live fzf placeholders.
+/// This avoids nesting change-preview() inside transform() which breaks
+/// fzf's parenthesis matching.
+fn push_preview_search_binds(
+    selector_args: &mut Vec<String>,
+    exe_quoted: &str,
+    ltsv: bool,
+    path_prefix: &str,
+    selector: &str,
+) {
+    let selector_bin = selector.rsplit('/').next().unwrap_or(selector);
+    if selector_bin != "fzf" {
+        return;
+    }
+    let (prefix, path_ref) = if ltsv {
+        (format!("p={{1}}; p=${{p#{}:}}; ", path_prefix), "\"$p\"")
+    } else {
+        (String::new(), "{1}")
+    };
+
+    // Replace existing --preview with conditional version that checks $FZF_PREVIEW_LABEL
+    if let Some(pos) = selector_args
+        .iter()
+        .position(|a| a.starts_with("--preview="))
+    {
+        selector_args[pos] = format!(
+            "--preview={}if [ -n \"$FZF_PREVIEW_LABEL\" ] && [ -n {{q}} ]; then {} show --color --highlight={{q}} {}; else {} show --color {}; fi",
+            prefix, exe_quoted, path_ref, exe_quoted, path_ref
+        );
+    }
+
+    let scroll_transform = format!(
+        "{}N=`{} show {} | grep -Fni -m1 -- {{q}} | cut -d: -f1`; test -n \"$N\" || N=0; echo \"change-preview-window(+$N)\"",
+        prefix, exe_quoted, path_ref
+    );
+    // ctrl-s toggle: transform checks preview-label state and emits enter/exit actions.
+    // No change-preview needed — the preview command itself handles highlight conditionally.
+    selector_args.push(
+        "--bind=ctrl-s:transform~if [ -n \"$FZF_PREVIEW_LABEL\" ]; then echo 'enable-search+change-preview-label()+unbind(change)+change-preview-window(+0)+refresh-preview'; else echo 'disable-search+change-preview-label([ ctrl-s: reset ])+rebind(change)+refresh-preview'; fi~".to_string()
+    );
+    selector_args.push(format!("--bind=change:transform({})", scroll_transform));
+    selector_args.push("--bind=start:unbind(change)".to_string());
 }
 
 /// Run the selector (fzf/sk/etc) with the given args and input, return selected line.
