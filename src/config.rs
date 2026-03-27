@@ -7,6 +7,7 @@ use serde::Deserialize;
 use crate::agents::{self, AgentPlugin};
 
 static AGENT_REGISTRY: OnceLock<Vec<AgentDef>> = OnceLock::new();
+static REMOTE_REGISTRY: OnceLock<Vec<RemoteDef>> = OnceLock::new();
 
 /// Runtime agent definition (built-in + config merged).
 pub struct AgentDef {
@@ -26,11 +27,20 @@ impl AgentDef {
     }
 }
 
+/// Remote host definition for SSH session aggregation.
+pub struct RemoteDef {
+    pub name: String,
+    pub host: String,
+    pub ah_path: String,
+}
+
 /// TOML deserialization structures.
 #[derive(Deserialize, Default)]
 struct AhrcConfig {
     #[serde(default)]
     agents: HashMap<String, AgentEntry>,
+    #[serde(default)]
+    remotes: HashMap<String, RemoteEntry>,
 }
 
 #[derive(Deserialize, Default)]
@@ -39,6 +49,12 @@ struct AgentEntry {
     file_patterns: Option<Vec<String>>,
     extra_patterns: Option<Vec<String>>,
     disabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct RemoteEntry {
+    host: String,
+    ah_path: Option<String>,
 }
 
 /// Built-in agent definition (env var + default directory prefix).
@@ -159,8 +175,8 @@ fn apply_env_override(patterns: &[&str], home: &Path, info: &BuiltinInfo) -> Vec
     }
 }
 
-/// Load config and build agent registry.
-fn load_config(home: &Path) -> Vec<AgentDef> {
+/// Load config and build agent + remote registries.
+fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
     // 1. Build defaults from built-in plugins
     let mut agents: Vec<AgentDef> = agents::all_plugins()
         .iter()
@@ -218,7 +234,7 @@ fn load_config(home: &Path) -> Vec<AgentDef> {
             }
         }
     } else {
-        return agents;
+        return (agents, Vec::new());
     };
 
     // 3. Apply config overrides
@@ -281,12 +297,41 @@ fn load_config(home: &Path) -> Vec<AgentDef> {
         }
     }
 
-    agents
+    let remotes = load_remotes(&config);
+    (agents, remotes)
 }
 
-/// Initialize the global agent registry. Call once at startup.
+/// Load remote definitions from parsed config.
+fn load_remotes(config: &AhrcConfig) -> Vec<RemoteDef> {
+    let mut remotes = Vec::new();
+    for (name, entry) in &config.remotes {
+        let ah_path = entry.ah_path.clone().unwrap_or_else(|| "ah".to_string());
+        if ah_path.starts_with('~') || (ah_path.contains('/') && !ah_path.starts_with('/')) {
+            eprintln!(
+                "Warning: remote '{}' has ah_path '{}' which is not an absolute path or bare command. \
+                 Use an absolute path (e.g. /usr/local/bin/ah) or a bare command name (e.g. ah). Skipping.",
+                name, ah_path
+            );
+            continue;
+        }
+        remotes.push(RemoteDef {
+            name: name.clone(),
+            host: entry.host.clone(),
+            ah_path,
+        });
+    }
+    remotes.sort_by(|a, b| a.name.cmp(&b.name));
+    remotes
+}
+
+/// Initialize the global agent and remote registries. Call once at startup.
 pub fn init(home: &Path) {
-    AGENT_REGISTRY.get_or_init(|| load_config(home));
+    if AGENT_REGISTRY.get().is_some() && REMOTE_REGISTRY.get().is_some() {
+        return;
+    }
+    let (agents, remotes) = load_config(home);
+    AGENT_REGISTRY.get_or_init(|| agents);
+    REMOTE_REGISTRY.get_or_init(|| remotes);
 }
 
 /// Get all agents (including disabled).
@@ -294,6 +339,18 @@ pub fn agents() -> &'static [AgentDef] {
     AGENT_REGISTRY
         .get()
         .expect("config::init() must be called before config::agents()")
+}
+
+/// Get all configured remotes.
+pub fn remotes() -> &'static [RemoteDef] {
+    REMOTE_REGISTRY
+        .get()
+        .expect("config::init() must be called before config::remotes()")
+}
+
+/// Find a remote by name.
+pub fn find_remote(name: &str) -> Option<&'static RemoteDef> {
+    remotes().iter().find(|r| r.name == name)
 }
 
 /// Get only active (non-disabled) agents.
@@ -385,11 +442,12 @@ mod tests {
     fn test_load_config_no_ahrc() {
         // Without ~/.ahrc, should return built-in defaults
         let home = PathBuf::from("/nonexistent/home");
-        let agents = load_config(&home);
+        let (agents, remotes) = load_config(&home);
         assert_eq!(agents.len(), 5);
         assert_eq!(agents[0].id, "claude");
         assert_eq!(agents[1].id, "codex");
         assert!(!agents[0].disabled);
+        assert!(remotes.is_empty());
     }
 
     #[test]
@@ -418,16 +476,16 @@ extra_patterns = ["~/.claude-dev/projects/*/*.jsonl"]
     #[test]
     fn test_parse_ahrc_custom_agent() {
         let toml_str = r#"
-[agents.aider]
+[agents.mybot]
 plugin = "claude"
-file_patterns = ["~/.aider/history/*.jsonl"]
+file_patterns = ["~/.mybot/sessions/*.jsonl"]
 "#;
         let config: AhrcConfig = toml::from_str(toml_str).unwrap();
-        let aider = &config.agents["aider"];
-        assert_eq!(aider.plugin.as_deref(), Some("claude"));
+        let mybot = &config.agents["mybot"];
+        assert_eq!(mybot.plugin.as_deref(), Some("claude"));
         assert_eq!(
-            aider.file_patterns.as_ref().unwrap()[0],
-            "~/.aider/history/*.jsonl"
+            mybot.file_patterns.as_ref().unwrap()[0],
+            "~/.mybot/sessions/*.jsonl"
         );
     }
 }

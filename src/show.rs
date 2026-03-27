@@ -4,11 +4,30 @@ use crate::agents::common::canonical_home;
 use crate::agents::{self, MessageRole};
 use crate::cli::{FilterArgs, ShowArgs, ShowFormat};
 use crate::color::{self, BOLD, DIM, RESET};
-use crate::output::strip_ansi;
+use crate::output::{strip_ansi, strip_quotes};
+use crate::remote;
 use crate::subcmd;
 
 pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
     let home = canonical_home();
+    let explicit_session = subcmd::read_session_ref(args.session.as_deref());
+
+    if let Some(session) = explicit_session.as_deref() {
+        let unquoted = strip_quotes(session);
+        if let Some((remote_def, remote_path)) = remote::parse_remote_path(unquoted) {
+            remote::exec_remote_show(remote_def, remote_path, &args);
+        }
+        remote::check_unknown_remote(unquoted)?;
+    }
+
+    if !filter.remote.is_empty() {
+        return Err(
+            "Remote session lookup for 'show' requires an explicit REMOTE:REF session.\n\
+             Example: ah show mydev:/home/user/.claude/sessions/<id>"
+                .into(),
+        );
+    }
+
     let format = args.format();
     let follow = args.follow;
 
@@ -18,15 +37,19 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
     }
 
     let filters = filter.to_filters();
-    let path = subcmd::resolve_session(
-        args.session.as_deref(),
-        filter.query.as_deref(),
-        &filters,
-        &home,
-        filter.search_mode(),
-        filter.since_time()?,
-        filter.until_time()?,
-    )?;
+    let path = if let Some(session) = explicit_session.as_deref() {
+        subcmd::resolve_session_ref(session, &home)?
+    } else {
+        subcmd::resolve_session(
+            None,
+            filter.query.as_deref(),
+            &filters,
+            &home,
+            filter.search_mode(),
+            filter.since_time()?,
+            filter.until_time()?,
+        )?
+    };
 
     // Validate --follow against plugin capability before displaying anything
     let plugin = agents::find_plugin_for_path(&path);

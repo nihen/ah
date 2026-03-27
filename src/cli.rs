@@ -423,6 +423,10 @@ pub struct FilterArgs {
     #[arg(short = 'a', long = "all", global = true, conflicts_with = "dir")]
     pub all: bool,
 
+    /// Show all sessions including all configured remotes (-a + all remotes)
+    #[arg(short = 'A', global = true, conflicts_with = "dir")]
+    pub all_remote: bool,
+
     /// Full-text search query (regex)
     #[arg(short = 'q', long = "query", global = true)]
     pub query: Option<String>,
@@ -447,6 +451,10 @@ pub struct FilterArgs {
     #[arg(long = "running", global = true)]
     pub running: bool,
 
+    /// Include sessions from a remote host (repeatable; name must match [remotes.*] in ~/.ahrc)
+    #[arg(long = "remote", global = true, conflicts_with = "dir")]
+    pub remote: Vec<String>,
+
     /// Force colored output (even through pipes)
     #[arg(long = "color", conflicts_with = "no_color", global = true)]
     pub color: bool,
@@ -467,8 +475,8 @@ pub struct FilterArgs {
 impl FilterArgs {
     pub fn to_filters(&self) -> Vec<FieldFilter> {
         let mut filters = FieldFilter::from_options(&self.agent, &self.project);
-        if self.all {
-            // --all: no cwd filter
+        if self.all || self.all_remote {
+            // --all / -A: no cwd filter
         } else if let Some(d) = &self.dir {
             let dir = Self::resolve_dir(d);
             filters.push(FieldFilter {
@@ -1403,6 +1411,7 @@ Help / setup:
 
 Global options:
   -a, --all               Show all sessions (disable default cwd filtering)
+  -A                      Show all sessions including all configured remotes
   --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
   --project <NAME>        Filter by project name
   -d, --dir <PATH>        Filter by working directory (default: current directory)
@@ -1413,6 +1422,7 @@ Global options:
   -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
   --no-preview            Disable preview in interactive mode
   --running               Show only currently running sessions (Claude only for now)
+  --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --color                 Force colored output (even through pipes)
@@ -1424,14 +1434,20 @@ Global options:
 Examples:
   ah log                      # latest sessions for the current directory
   ah log -a -q "auth"         # search across all known sessions
+  ah log -A                   # all sessions including all remotes
   ah resume                   # resume the latest matching session
   ah show -q "OAuth"          # show the latest matching session
   ah resume -i                # browse sessions with fzf/sk and resume
 
-Run `ah <COMMAND> --help` for subcommand-specific options."#;
+Run `ah <COMMAND> --help` for subcommand-specific options.
+
+Configuration:
+  ~/.ahrc (TOML) — optional config file for agent customization and remote hosts.
+  See https://github.com/nihen/ah#configuration-ahrc for details."#;
 
 const GLOBAL_OPTIONS: &str = r#"Global options:
   -a, --all               Show all sessions (disable default cwd filtering)
+  -A                      Show all sessions including all configured remotes
   --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
   --project <NAME>        Filter by project name
   -d, --dir <PATH>        Filter by working directory (default: current directory)
@@ -1441,6 +1457,7 @@ const GLOBAL_OPTIONS: &str = r#"Global options:
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --running               Show only currently running sessions (Claude only for now)
+  --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --color                 Force colored output (even through pipes)
   --no-color              Disable colored output
   --no-pager              Disable automatic pager
@@ -1455,9 +1472,11 @@ const DISPLAY_OPTIONS: &str = r#"Display options:
 const PROJECT_GLOBAL_OPTIONS: &str = concatcp!(
     r#"Global options:
   -a, --all               Show all projects (default; -a has no effect)
+  -A                      Show all projects including all configured remotes
   --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
   -d, --dir <PATH>        Filter by working directory
   -n, --limit N           Max session files to scan (default: 0, no limit)
+  --remote <NAME>         Include projects from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
 
@@ -1468,9 +1487,11 @@ const PROJECT_GLOBAL_OPTIONS: &str = concatcp!(
 const MEMORY_GLOBAL_OPTIONS: &str = concatcp!(
     r#"Global options:
   -a, --all               Show all memory files (disable default cwd filtering)
+  -A                      Show all memory files including all configured remotes
   --agent <NAME>          Filter by agent name (e.g. claude)
   -d, --dir <PATH>        Filter by working directory (default: current directory)
   -q, --query <REGEX>     Search query (regex, case-insensitive)
+  --remote <NAME>         Include memory files from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show files newer than (e.g. "2026-03-20", "3d", "1w")
   --until <SPEC>          Show files older than (e.g. "2026-03-20", "3d", "1w")
 
@@ -1481,8 +1502,10 @@ const MEMORY_GLOBAL_OPTIONS: &str = concatcp!(
 const AGENT_GLOBAL_OPTIONS: &str = concatcp!(
     r#"Global options:
   -a, --all               Show all agents (disable default cwd filtering)
+  -A                      Show all agents including all configured remotes
   --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
   -n, --limit N           Max session files to scan (default: 0, no limit)
+  --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
 
