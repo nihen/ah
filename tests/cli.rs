@@ -231,6 +231,32 @@ fn show_nonexistent_path() {
 }
 
 #[test]
+fn show_highlight_emits_ansi_with_color() {
+    let (_tmp, session_path) = codex_session_copy();
+    ah().args(["show", "--color", "--highlight", "redis", &session_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\x1b[7m"));
+}
+
+#[test]
+fn show_highlight_no_ansi_without_color() {
+    let (_tmp, session_path) = codex_session_copy();
+    ah().args(["show", "--no-color", "--highlight", "redis", &session_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\x1b[7m").not());
+}
+
+#[test]
+fn show_highlight_conflicts_with_json() {
+    let (_tmp, session_path) = codex_session_copy();
+    ah().args(["show", "--json", "--highlight", "redis", &session_path])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn resume_print_outputs_command_without_executing() {
     let (_tmp, session_path) = codex_session_copy();
     ah().args(["resume", "--print", &session_path])

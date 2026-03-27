@@ -22,6 +22,7 @@ Interactive mode:
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
   --ltsv                  Use LTSV format for interactive selector display
   --no-preview            Disable transcript preview
+  ctrl-s (fzf only)       Toggle preview search: highlight + scroll to match / reset
 
 Examples:
   ah resume                   # resume latest matching session
