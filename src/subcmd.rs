@@ -73,31 +73,8 @@ fn resolve_session_inner(
     search_mode: SearchMode,
     opts: ResolveLookupOpts,
 ) -> Result<PathBuf, String> {
-    // 1. Stdin pipe
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        let mut line = String::new();
-        let mut stdin = std::io::stdin().lock();
-        if std::io::BufRead::read_line(&mut stdin, &mut line).is_ok() {
-            let line = line.trim();
-            if !line.is_empty() {
-                // Take only the first TSV field (path may be followed by other fields)
-                let first_field = line.split('\t').next().unwrap_or(line);
-                let p = strip_ltsv_prefix(first_field);
-                let p = crate::output::strip_ansi(p);
-                let p = p.trim();
-                let pb = PathBuf::from(p);
-                if pb.exists() {
-                    return Ok(pb);
-                }
-                // Not a path — try as session ID
-                return resolve_by_id(p, home);
-            }
-        }
-    }
-
-    // 2. Session (ID or path)
-    if let Some(s) = session {
-        return resolve_session_ref(s, home);
+    if let Some(session_ref) = read_session_ref(session) {
+        return resolve_session_ref(&session_ref, home);
     }
 
     // 3. Query / filters → latest via pipeline
@@ -129,8 +106,31 @@ fn resolve_session_inner(
     }
 }
 
+/// Read an explicit session reference from stdin or positional argument.
+/// Stdin takes precedence over the positional argument when present.
+pub fn read_session_ref(session: Option<&str>) -> Option<String> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let mut line = String::new();
+        let mut stdin = std::io::stdin().lock();
+        if std::io::BufRead::read_line(&mut stdin, &mut line).is_ok() {
+            let line = line.trim();
+            if !line.is_empty() {
+                let first_field = line.split('\t').next().unwrap_or(line);
+                let session_ref = normalize_session_ref(first_field);
+                if !session_ref.is_empty() {
+                    return Some(session_ref);
+                }
+            }
+        }
+    }
+
+    session
+        .map(normalize_session_ref)
+        .filter(|session_ref| !session_ref.is_empty())
+}
+
 /// Resolve a session reference: try as file path first, then as session ID.
-fn resolve_session_ref(s: &str, home: &Path) -> Result<PathBuf, String> {
+pub fn resolve_session_ref(s: &str, home: &Path) -> Result<PathBuf, String> {
     let s = strip_ltsv_prefix(s);
 
     // Try as file path
@@ -186,17 +186,35 @@ fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
     Err(format!("No session found for id: {}", id))
 }
 
+fn normalize_session_ref(s: &str) -> String {
+    let s = strip_ltsv_prefix(s);
+    crate::output::strip_ansi(s).trim().to_string()
+}
+
 fn strip_ltsv_prefix(s: &str) -> &str {
-    s.find(':')
-        .and_then(|i| {
-            let after = &s[i + 1..];
-            if after.starts_with('/') {
-                Some(after)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(s)
+    strip_ltsv_prefix_with(s, |candidate| {
+        crate::remote::parse_remote_path(candidate).is_some()
+    })
+}
+
+fn strip_ltsv_prefix_with<F>(s: &str, is_remote_ref: F) -> &str
+where
+    F: Fn(&str) -> bool,
+{
+    if is_remote_ref(s) {
+        return s;
+    }
+
+    let Some(i) = s.find(':') else {
+        return s;
+    };
+    let after = &s[i + 1..];
+
+    if is_remote_ref(after) || after.starts_with('/') {
+        after
+    } else {
+        s
+    }
 }
 
 fn resolve_fields_for_lookup(require_resume_cmd: bool) -> Vec<Field> {
@@ -224,6 +242,23 @@ mod tests {
         assert_eq!(
             resolve_fields_for_lookup(false),
             vec![Field::Path, Field::ModifiedAt]
+        );
+    }
+
+    #[test]
+    fn strip_ltsv_prefix_keeps_remote_refs() {
+        assert_eq!(
+            strip_ltsv_prefix_with("mydev:/tmp/session.jsonl", |s| s.starts_with("mydev:/")),
+            "mydev:/tmp/session.jsonl"
+        );
+    }
+
+    #[test]
+    fn strip_ltsv_prefix_preserves_remote_refs_inside_ltsv_values() {
+        assert_eq!(
+            strip_ltsv_prefix_with("path:mydev:/tmp/session.jsonl", |s| s
+                .starts_with("mydev:/")),
+            "mydev:/tmp/session.jsonl"
         );
     }
 }

@@ -211,6 +211,7 @@ Help / setup:
 
 Global options:
   -a, --all               Show all sessions (disable default cwd filtering)
+  -A                      Show all sessions including all configured remotes
   --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
   --project <NAME>        Filter by project name
   -d, --dir <PATH>        Filter by working directory (default: current directory)
@@ -221,6 +222,7 @@ Global options:
   -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
   --no-preview            Disable preview in interactive mode
   --running               Show only currently running sessions (Claude only for now)
+  --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --color                 Force colored output (even through pipes)
@@ -232,11 +234,16 @@ Global options:
 Examples:
   ah log                      # latest sessions for the current directory
   ah log -a -q "auth"         # search across all known sessions
+  ah log -A                   # all sessions including all remotes
   ah resume                   # resume the latest matching session
   ah show -q "OAuth"          # show the latest matching session
   ah resume -i                # browse sessions with fzf/sk and resume
 
 Run `ah <COMMAND> --help` for subcommand-specific options.
+
+Configuration:
+  ~/.ahrc (TOML) — optional config file for agent customization and remote hosts.
+  See https://github.com/nihen/ah#configuration-ahrc for details.
 ```
 
 ### `ah log --help`
@@ -425,7 +432,47 @@ Global options are also available (see ah -h).
 
 ## Configuration (~/.ahrc)
 
-`ah` works out of the box with no configuration. Optionally, create `~/.ahrc` (TOML) to customize agent settings.
+`ah` works out of the box with no configuration. Optionally, create `~/.ahrc` (TOML) to customize agent settings and remote hosts.
+
+### File format
+
+`~/.ahrc` has two top-level sections: `[agents.*]` for agent configuration and `[remotes.*]` for SSH remote hosts.
+
+```toml
+# ~/.ahrc — ah configuration file (TOML)
+
+# --- Agent configuration ---
+
+# Disable a built-in agent
+[agents.codex]
+disabled = true
+
+# Add extra session file locations to a built-in agent
+[agents.claude]
+extra_patterns = ["~/claude-archive/projects/*/*.jsonl"]
+
+# Define a custom agent using an existing plugin's parser
+[agents.mybot]
+plugin = "claude"
+file_patterns = ["~/.mybot/sessions/*.jsonl"]
+
+# --- Remote hosts for SSH session aggregation ---
+
+[remotes.mydev]
+host = "mydev"                     # SSH host name (as in ~/.ssh/config)
+ah_path = "/usr/local/bin/ah"      # path to ah binary on remote (optional, default: "ah")
+```
+
+### Agent fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `disabled` | No | Set to `true` to hide this agent from all commands |
+| `extra_patterns` | No | Additional glob patterns to scan (built-in agents only) |
+| `plugin` | Yes* | Parser to use: `claude`, `codex`, `gemini`, `copilot`, `cursor` (*required for custom agents) |
+| `file_patterns` | Yes* | Glob patterns for session files (*required for custom agents) |
+
+All glob patterns must start with `~/` or `/` (absolute paths only). `~` is expanded to the home directory.
 
 ### Disable an agent
 
@@ -444,12 +491,38 @@ extra_patterns = ["~/claude-archive/projects/*/*.jsonl"]
 ### Add a custom agent (using an existing plugin's parser)
 
 ```toml
-[agents.aider]
+[agents.mybot]
 plugin = "claude"
-file_patterns = ["~/.aider/history/*.jsonl"]
+file_patterns = ["~/.mybot/sessions/*.jsonl"]
 ```
 
-Available plugins: `claude`, `codex`, `gemini`, `copilot`, `cursor`. The `plugin` field tells `ah` how to parse the session files.
+The `plugin` field tells `ah` how to parse the session files. Available plugins: `claude`, `codex`, `gemini`, `copilot`, `cursor`.
+
+### Remote hosts
+
+Aggregate sessions from remote machines over SSH. The remote host must have `ah` installed.
+
+```toml
+[remotes.mydev]
+host = "mydev"                       # SSH host (must be reachable via `ssh <host>`)
+ah_path = "/usr/local/bin/ah"        # optional, default: "ah"
+
+[remotes.prod-bastion]
+host = "bastion.example.com"
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `host` | Yes | SSH host name (as configured in `~/.ssh/config` or a hostname) |
+| `ah_path` | No | Absolute path to `ah` on the remote host or a bare command name (default: `"ah"`). `~/bin/ah` and other `~/...` paths are not supported |
+
+Use `--remote <name>` to include a specific remote, or `-A` to include all configured remotes:
+
+```bash
+ah log --remote mydev              # include sessions from mydev
+ah log -A                          # include all configured remotes
+ah log -A -q "deploy"              # search across local + all remotes
+```
 
 ### Environment variables
 
@@ -506,10 +579,6 @@ Add this line to your project or global instructions so your coding agent knows 
 ```
 `ah` — cross-agent session history CLI. Run `ah -h` for usage; key commands: `ah log` (list sessions), `ah show` (view transcript), `ah log -a -q "keyword"` (search all).
 ```
-
-## Roadmap
-
-- **Remote session aggregation** — `ssh` to a remote host running `ah`, aggregate results locally. Like rsync's remote process model: computation happens near the data, only metadata travels over the wire.
 
 ## License
 

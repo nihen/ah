@@ -481,8 +481,55 @@ pub fn build_memory_records(
 
 /// Entry point for `ah memory`.
 pub fn run(args: MemoryResolvedArgs, filter: &FilterArgs) -> Result<(), String> {
+    // Validate filter inputs early so invalid args fail fast even when local is empty
+    filter.since_time()?;
+    filter.until_time()?;
+    if let Some(ref q) = filter.query {
+        Regex::new(&format!("(?i){}", q)).map_err(|e| format!("Invalid regex '{}': {}", q, e))?;
+    }
+
     let query = filter.query.clone().unwrap_or_default();
-    let records = build_memory_records(&args, filter)?;
+    let mut records = match build_memory_records(&args, filter) {
+        Ok(r) => r,
+        Err(e) if !filter.remote.is_empty() && crate::is_empty_result_error(&e) => {
+            if crate::color::is_debug() {
+                eprintln!("[debug] local memory: {}", e);
+            }
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Merge remote memory records if --remote is specified
+    if !filter.remote.is_empty() {
+        let remotes = crate::remote::resolve_remotes(&filter.remote)?;
+        let mut remote_fields = args.fields.clone();
+        if !remote_fields.contains(&args.sort_field) {
+            remote_fields.push(args.sort_field);
+        }
+        let remote_records = crate::remote::fetch_remote_memory(
+            &remotes,
+            &remote_fields,
+            filter,
+            args.memory_type.as_deref(),
+        );
+        records.extend(remote_records);
+
+        // Re-sort after merging
+        let sf = args.sort_field;
+        let numeric = sf.is_numeric();
+        match args.sort_order {
+            crate::cli::SortOrder::Desc => records
+                .sort_by(|a, b| output::compare_field_values(b.get(&sf), a.get(&sf), numeric)),
+            crate::cli::SortOrder::Asc => records
+                .sort_by(|a, b| output::compare_field_values(a.get(&sf), b.get(&sf), numeric)),
+        }
+    }
+
+    if records.is_empty() {
+        return Err("No memory files found.".to_string());
+    }
+
     output::output_memory(&records, &args.fields, &args.output_format, &query);
     Ok(())
 }

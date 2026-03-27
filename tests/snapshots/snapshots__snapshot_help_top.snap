@@ -25,6 +25,7 @@ Help / setup:
 
 Global options:
   -a, --all               Show all sessions (disable default cwd filtering)
+  -A                      Show all sessions including all configured remotes
   --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
   --project <NAME>        Filter by project name
   -d, --dir <PATH>        Filter by working directory (default: current directory)
@@ -35,6 +36,7 @@ Global options:
   -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
   --no-preview            Disable preview in interactive mode
   --running               Show only currently running sessions (Claude only for now)
+  --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --color                 Force colored output (even through pipes)
@@ -46,8 +48,13 @@ Global options:
 Examples:
   ah log                      # latest sessions for the current directory
   ah log -a -q "auth"         # search across all known sessions
+  ah log -A                   # all sessions including all remotes
   ah resume                   # resume the latest matching session
   ah show -q "OAuth"          # show the latest matching session
   ah resume -i                # browse sessions with fzf/sk and resume
 
 Run `ah <COMMAND> --help` for subcommand-specific options.
+
+Configuration:
+  ~/.ahrc (TOML) — optional config file for agent customization and remote hosts.
+  See https://github.com/nihen/ah#configuration-ahrc for details.

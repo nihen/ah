@@ -10,6 +10,7 @@ mod output;
 mod pager;
 mod pipeline;
 mod projects;
+mod remote;
 mod resolver;
 mod resume;
 mod search;
@@ -40,7 +41,18 @@ fn main() {
 
     let cli = Cli::parse();
 
-    let filter = cli.filter;
+    let mut filter = cli.filter;
+
+    // -A: expand to -a + all configured remotes (union with any explicit --remote)
+    if filter.all_remote {
+        filter.all = true;
+        let all_names: Vec<String> = config::remotes().iter().map(|r| r.name.clone()).collect();
+        for name in all_names {
+            if !filter.remote.contains(&name) {
+                filter.remote.push(name);
+            }
+        }
+    }
     let ia = cli.ia;
     color::init_color(filter.color, filter.no_color);
     color::init_debug(filter.debug);
@@ -85,7 +97,7 @@ fn main() {
                         process::exit(1);
                     }
                 };
-                if let Err(e) = run_search(args) {
+                if let Err(e) = run_search(args, &filter) {
                     eprintln!("{}", e);
                     process::exit(1);
                 }
@@ -319,7 +331,7 @@ fn print_field_list<'a>(fields: impl Iterator<Item = (&'a str, &'a str, &'a str)
     }
 }
 
-fn run_search(args: Args) -> Result<(), String> {
+fn run_search(args: Args, filter: &cli::FilterArgs) -> Result<(), String> {
     let params = pipeline::PipelineParams {
         resolve_fields: args.fields.clone(),
         resolve_opts: resolver::ResolveOpts::new(
@@ -340,15 +352,47 @@ fn run_search(args: Args) -> Result<(), String> {
         require_resume_cmd: false,
     };
     let result = pipeline::run_pipeline(&params)?;
-    if result.sessions.is_empty() {
+    let mut sessions = result.sessions;
+
+    // Merge remote sessions if --remote is specified
+    if !filter.remote.is_empty() {
+        let remotes = remote::resolve_remotes(&filter.remote)?;
+        let mut remote_fields = args.fields.clone();
+        if !remote_fields.contains(&args.sort_field) {
+            remote_fields.push(args.sort_field);
+        }
+        let remote_sessions = remote::fetch_remote_sessions(&remotes, &remote_fields, filter);
+        sessions.extend(remote_sessions);
+
+        // Re-sort after merging
+        let numeric = args.sort_field.is_numeric();
+        match args.sort_order {
+            cli::SortOrder::Desc => sessions.sort_by(|a, b| {
+                output::compare_field_values(
+                    b.fields.get(&args.sort_field),
+                    a.fields.get(&args.sort_field),
+                    numeric,
+                )
+            }),
+            cli::SortOrder::Asc => sessions.sort_by(|a, b| {
+                output::compare_field_values(
+                    a.fields.get(&args.sort_field),
+                    b.fields.get(&args.sort_field),
+                    numeric,
+                )
+            }),
+        }
+
+        // Re-apply limit after merge
+        if args.limit > 0 && sessions.len() > args.limit {
+            sessions.truncate(args.limit);
+        }
+    }
+
+    if sessions.is_empty() {
         return Err("No sessions found.".to_string());
     }
-    output::output_sessions(
-        &result.sessions,
-        &args.fields,
-        &args.output_format,
-        &args.query,
-    );
+    output::output_sessions(&sessions, &args.fields, &args.output_format, &args.query);
     Ok(())
 }
 
@@ -356,9 +400,50 @@ fn run_list_projects(
     args: ListProjectsResolvedArgs,
     filter: &cli::FilterArgs,
 ) -> Result<(), String> {
-    let records = projects::build_project_records(&args, filter)?;
+    let mut records = match projects::build_project_records(&args, filter) {
+        Ok(r) => r,
+        Err(e) if !filter.remote.is_empty() && is_empty_result_error(&e) => {
+            if color::is_debug() {
+                eprintln!("[debug] local projects: {}", e);
+            }
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Merge remote projects if --remote is specified
+    if !filter.remote.is_empty() {
+        let remotes = remote::resolve_remotes(&filter.remote)?;
+        let mut remote_fields = args.fields.clone();
+        if !remote_fields.contains(&args.sort_field) {
+            remote_fields.push(args.sort_field);
+        }
+        let remote_records = remote::fetch_remote_projects(&remotes, &remote_fields, filter);
+        records.extend(remote_records);
+
+        // Re-sort after merging
+        let sf = args.sort_field;
+        let numeric = sf.is_numeric();
+        match args.sort_order {
+            cli::SortOrder::Desc => records
+                .sort_by(|a, b| output::compare_field_values(b.get(&sf), a.get(&sf), numeric)),
+            cli::SortOrder::Asc => records
+                .sort_by(|a, b| output::compare_field_values(a.get(&sf), b.get(&sf), numeric)),
+        }
+    }
+
+    if records.is_empty() {
+        return Err("No projects found.".to_string());
+    }
+
     output::output_projects(&records, &args.fields, &args.output_format);
     Ok(())
+}
+
+/// Check if an error message indicates an empty result (no data found)
+/// vs a real error (invalid input, parse failure, etc.).
+fn is_empty_result_error(msg: &str) -> bool {
+    msg.starts_with("No ") && msg.ends_with(" found.")
 }
 
 fn run_status(filter: &cli::FilterArgs, output_format: cli::OutputFormat) -> Result<(), String> {
@@ -376,7 +461,7 @@ fn run_status(filter: &cli::FilterArgs, output_format: cli::OutputFormat) -> Res
     let until = filter.until_time()?;
 
     let files = collector::collect_files(filter.limit);
-    if files.is_empty() {
+    if files.is_empty() && filter.remote.is_empty() {
         return Err("No session files found.".to_string());
     }
 
@@ -446,22 +531,42 @@ fn run_status(filter: &cli::FilterArgs, output_format: cli::OutputFormat) -> Res
     }
 
     // Collect rows: (agent, count, latest)
-    let rows: Vec<(&str, usize, String)> = if filter.all {
+    let mut rows: Vec<(String, usize, String)> = if filter.all {
         stats
             .iter()
-            .map(|(agent, s)| (*agent, s.total, format_mtime(s.latest)))
+            .map(|(agent, s)| (agent.to_string(), s.total, format_mtime(s.latest)))
             .collect()
     } else {
         let cwd_rows: Vec<_> = stats
             .iter()
             .filter(|(_, s)| s.cwd_count > 0)
-            .map(|(agent, s)| (*agent, s.cwd_count, format_mtime(s.cwd_latest.unwrap())))
+            .map(|(agent, s)| {
+                (
+                    agent.to_string(),
+                    s.cwd_count,
+                    format_mtime(s.cwd_latest.unwrap()),
+                )
+            })
             .collect();
-        if cwd_rows.is_empty() {
+        if cwd_rows.is_empty() && filter.remote.is_empty() {
             return Err("No sessions in current directory.".to_string());
         }
         cwd_rows
     };
+
+    // Merge remote agent stats if --remote is specified
+    if !filter.remote.is_empty() {
+        let remotes = remote::resolve_remotes(&filter.remote)?;
+        let remote_stats = remote::fetch_remote_agent_stats(&remotes, filter);
+        for (remote_name, rs) in remote_stats {
+            let label = format!("{} ({})", rs.agent, remote_name);
+            rows.push((label, rs.sessions, rs.latest));
+        }
+    }
+
+    if rows.is_empty() {
+        return Err("No sessions found.".to_string());
+    }
 
     match output_format {
         cli::OutputFormat::Json => {

@@ -31,6 +31,7 @@ src/
   show.rs        -- `ah show` subcommand: pretty-print transcript + --follow
   resume.rs      -- `ah resume` subcommand: exec agent resume command
   man.rs         -- `ah man` subcommand: man page generation via clap_mangen
+  remote.rs      -- `--remote` SSH aggregation: fetch from remote hosts, parse JSON, merge
   fuzzy.rs       -- `-i` interactive browse via fzf/sk for log, project, memory
   subcmd.rs      -- shared session resolver (stdin pipe, session ID/path, query, filters)
 ```
@@ -38,6 +39,7 @@ src/
 ## Key Design Decisions
 
 - No external tools for search/parsing (all indexing and query logic in-process; no rg/jq/sed)
+  - Exception: `--remote` uses SSH to run `ah` on remote hosts (computation near data)
 - Parallel stat + metadata resolution via rayon
 - memmap2 for searching large JSONL files without copying
 - Plugin-internal regex compiled once via LazyLock; user query regex compiled per invocation
@@ -56,6 +58,9 @@ src/
 - `config.rs` separates "plugins" (parse logic, static) from "agents" (config, runtime)
 - `OnceLock<Vec<AgentDef>>` global registry, initialized once at startup
 - Environment variables (CLAUDE_CONFIG_DIR etc.) override base directories
+- `[remotes.*]` defines SSH remote hosts for `--remote` aggregation
+  - `host` (required): SSH host name
+  - `ah_path` (optional, default `"ah"`): path or command for `ah` on remote (absolute path or bare command; `~/` not supported)
 
 ## Adding a New Agent
 
