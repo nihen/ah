@@ -5,12 +5,14 @@ use crate::agents::{self, MessageRole};
 use crate::cli::{FilterArgs, ShowArgs, ShowFormat};
 use crate::color::{self, BOLD, DIM, RESET};
 use crate::output::strip_ansi;
+use crate::resolver;
 use crate::subcmd;
 
 pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
     let home = canonical_home();
     let format = args.format();
     let follow = args.follow;
+    let meta_fields = args.meta_fields()?;
 
     // Validate --follow early before any I/O or session resolution
     if follow && !matches!(format, ShowFormat::Pretty) {
@@ -27,6 +29,10 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
         filter.since_time()?,
         filter.until_time()?,
     )?;
+
+    if let Some(fields) = meta_fields {
+        return run_meta(&path, &home, &fields);
+    }
 
     // Validate --follow against plugin capability before displaying anything
     let plugin = agents::find_plugin_for_path(&path);
@@ -48,12 +54,32 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
         ShowFormat::Pretty => run_pretty(&path, args.head),
         ShowFormat::Json => run_json(&path, args.head),
         ShowFormat::Md => run_md(&path, args.head),
+        ShowFormat::Tsv => unreachable!("handled by meta_fields above"),
     }
 
     if follow {
         run_follow(&path, plugin)?;
     }
 
+    Ok(())
+}
+
+/// Output session metadata fields as TSV.
+fn run_meta(
+    path: &std::path::Path,
+    home: &std::path::Path,
+    fields: &[crate::cli::Field],
+) -> Result<(), String> {
+    let plugin = agents::find_plugin_for_path(path);
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let resolved = resolver::resolve_fields(path, plugin, mtime, home, fields, &Default::default());
+    let values: Vec<&str> = fields
+        .iter()
+        .map(|f| resolved.get(f).map(|v| v.as_str()).unwrap_or(""))
+        .collect();
+    println!("{}", values.join("\t"));
     Ok(())
 }
 

@@ -28,6 +28,8 @@ Default output (when no format flag is given):
 
 Interactive mode:
   -i, --interactive       Browse sessions via fuzzy finder; prints selected path
+                          With -o: prints selected fields as TSV instead of path
+  --interactive-display <FIELDS>  Override display columns in fuzzy finder
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
   --no-preview            Disable transcript preview (enabled by default for fzf, sk)
 
