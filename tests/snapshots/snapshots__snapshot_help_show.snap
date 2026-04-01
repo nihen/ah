@@ -9,7 +9,7 @@ Usage:
 
 If SESSION is omitted, ah shows the latest session matching stdin, -q, and other filters.
 
-Options:
+Transcript output:
   --head N                Show first N messages only
   --pretty                Pretty-print with colors (default)
   --raw                   Output raw session file content
@@ -17,11 +17,21 @@ Options:
   --md                    Output as Markdown (## User / ## Assistant headers)
   -f, --follow            Follow session output in real-time (like tail -f)
 
+Metadata output:
+  -o, --fields <FIELDS>   Output session metadata as TSV instead of transcript
+  --tsv                   Metadata mode without -o (default field: title)
+
 Interactive mode:
   -i, --interactive       Select session via fuzzy finder then show it
-  -o, --fields <FIELDS>   Display fields in interactive mode (default: agent,project,modified_at,title)
+  --interactive-display <FIELDS>  Override display columns in fuzzy finder
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
   --no-preview            Disable transcript preview
+
+Examples:
+  ah show                            # show latest session transcript
+  ah show -o title                    # output title of latest session
+  ah show -o agent,title             # output agent and title as TSV
+  ah show -i -o title                # select session, output title
 
 Global options:
   -a, --all               Show all sessions (disable default cwd filtering)

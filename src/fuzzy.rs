@@ -11,8 +11,26 @@ use crate::output::{self, compute_column_widths, format_columns, sanitize_for_di
 use crate::pipeline;
 use crate::projects;
 use crate::resolver::{self, shell_quote};
+use crate::session::Session;
 
 const PREVIEW_SELECTORS: &[&str] = &["fzf", "sk"];
+
+/// Print selected session fields as TSV. Returns true if a matching session was found.
+fn print_session_fields(sessions: &[Session], path: &str, fields: &[Field]) -> bool {
+    if let Some(session) = sessions
+        .iter()
+        .find(|s| s.fields.get(&Field::Path).map(|v| v.as_str()).unwrap_or("") == path)
+    {
+        let values: Vec<&str> = fields
+            .iter()
+            .map(|f| session.fields.get(f).map(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        println!("{}", values.join("\t"));
+        true
+    } else {
+        false
+    }
+}
 
 /// Reverse shell_quote: strip surrounding single quotes and unescape.
 fn strip_shell_quote(s: &str) -> String {
@@ -60,20 +78,34 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
     let selector = resolve_selector(ia);
     let preview = use_preview(ia, &selector);
 
-    let display_fields = args.common.parse_fields()?.unwrap_or_else(|| {
+    let default_display = || {
         vec![
             Field::Agent,
             Field::Project,
             Field::ModifiedAt,
             Field::Title,
         ]
-    });
+    };
+
+    let output_fields = args.common.parse_fields()?;
+
+    let display_fields = ia
+        .parse_display_fields()?
+        .or_else(|| output_fields.clone())
+        .unwrap_or_else(default_display);
 
     let sort_field = args.sort_field()?;
     let mut resolve_fields = vec![Field::Path, Field::Id];
     for f in &display_fields {
         if *f != Field::Path && *f != Field::Id {
             resolve_fields.push(*f);
+        }
+    }
+    if let Some(ref fields) = output_fields {
+        for f in fields {
+            if !resolve_fields.contains(f) {
+                resolve_fields.push(*f);
+            }
         }
     }
     if !resolve_fields.contains(&sort_field) {
@@ -210,7 +242,14 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
         return Ok(());
     }
 
-    println!("{}", path);
+    match &output_fields {
+        Some(fields) => {
+            print_session_fields(&sessions, &path, fields);
+        }
+        None => {
+            println!("{}", path);
+        }
+    }
     Ok(())
 }
 
@@ -323,18 +362,30 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
     let selector = resolve_selector(ia);
     let preview = use_preview(ia, &selector);
 
-    let display_fields = args.common.parse_fields()?.unwrap_or_else(|| {
+    let meta_fields = args.meta_fields()?;
+
+    let default_display = || {
         vec![
             Field::Agent,
             Field::Project,
             Field::ModifiedAt,
             Field::Title,
         ]
-    });
+    };
+
+    let display_fields = ia.parse_display_fields()?.unwrap_or_else(default_display);
+
     let mut resolve_fields = vec![Field::Path, Field::Id];
     for f in &display_fields {
         if !resolve_fields.contains(f) {
             resolve_fields.push(*f);
+        }
+    }
+    if let Some(ref mf) = meta_fields {
+        for f in mf {
+            if !resolve_fields.contains(f) {
+                resolve_fields.push(*f);
+            }
         }
     }
 
@@ -424,6 +475,11 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
     let first = selected.split('\t').next().unwrap_or("");
     let path_str = strip_shell_quote(first);
     if path_str.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(ref fields) = meta_fields {
+        print_session_fields(&sessions, &path_str, fields);
         return Ok(());
     }
 

@@ -622,6 +622,7 @@ pub enum ShowFormat {
     Raw,
     Json,
     Md,
+    Tsv,
 }
 
 #[derive(Parser, Debug)]
@@ -634,20 +635,24 @@ pub struct ShowArgs {
     pub head: Option<usize>,
 
     /// Pretty-print with colors (default)
-    #[arg(long = "pretty", conflicts_with_all = ["raw", "json", "md"])]
+    #[arg(long = "pretty", conflicts_with_all = ["raw", "json", "md", "tsv"])]
     pretty: bool,
 
     /// Output raw session file content
-    #[arg(long = "raw", conflicts_with_all = ["pretty", "json", "md"])]
+    #[arg(long = "raw", conflicts_with_all = ["pretty", "json", "md", "tsv"])]
     raw: bool,
 
     /// Output normalized JSON Lines ({"role":"user","text":"..."})
-    #[arg(long = "json", conflicts_with_all = ["pretty", "raw", "md"])]
+    #[arg(long = "json", conflicts_with_all = ["pretty", "raw", "md", "tsv"])]
     json: bool,
 
     /// Output as Markdown (## User / ## Assistant headers)
-    #[arg(long = "md", conflicts_with_all = ["pretty", "raw", "json"])]
+    #[arg(long = "md", conflicts_with_all = ["pretty", "raw", "json", "tsv"])]
     md: bool,
+
+    /// Output session metadata fields as TSV (use with -o; default field: title)
+    #[arg(long = "tsv", conflicts_with_all = ["pretty", "raw", "json", "md"])]
+    pub tsv: bool,
 
     /// Follow session output in real-time (like tail -f)
     #[arg(short = 'f', long = "follow")]
@@ -667,6 +672,7 @@ impl ShowArgs {
             raw: false,
             json: false,
             md: false,
+            tsv: false,
             follow: false,
             session,
         }
@@ -679,6 +685,8 @@ impl ShowArgs {
             ShowFormat::Json
         } else if self.md {
             ShowFormat::Md
+        } else if self.tsv {
+            ShowFormat::Tsv
         } else {
             ShowFormat::Pretty
         }
@@ -687,6 +695,16 @@ impl ShowArgs {
     /// Whether this command should use the pager.
     pub fn wants_pager(&self) -> bool {
         !self.follow && matches!(self.format(), ShowFormat::Pretty | ShowFormat::Md)
+    }
+
+    /// Parse -o fields for metadata output mode.
+    /// -o implies metadata mode (TSV output). --tsv without -o defaults to title.
+    pub fn meta_fields(&self) -> Result<Option<Vec<Field>>, String> {
+        match self.common.parse_fields()? {
+            Some(fields) => Ok(Some(fields)),
+            None if self.tsv => Ok(Some(vec![Field::Title])),
+            None => Ok(None),
+        }
     }
 }
 
@@ -783,6 +801,19 @@ pub struct InteractiveArgs {
     /// Disable preview in interactive mode
     #[arg(long = "no-preview", global = true, requires = "interactive")]
     pub no_preview: bool,
+
+    /// Override display columns in interactive selector (comma-separated field names)
+    #[arg(long = "interactive-display", global = true, requires = "interactive")]
+    pub interactive_display: Option<String>,
+}
+
+impl InteractiveArgs {
+    pub fn parse_display_fields(&self) -> Result<Option<Vec<Field>>, String> {
+        self.interactive_display
+            .as_ref()
+            .map(|f| parse_field_list(f))
+            .transpose()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1517,6 +1548,8 @@ Default output (when no format flag is given):
 
 Interactive mode:
   -i, --interactive       Browse sessions via fuzzy finder; prints selected path
+                          With -o: prints selected fields as TSV instead of path
+  --interactive-display <FIELDS>  Override display columns in fuzzy finder
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
   --no-preview            Disable transcript preview (enabled by default for fzf, sk)
 
@@ -1532,7 +1565,7 @@ Usage:
 
 If SESSION is omitted, ah shows the latest session matching stdin, -q, and other filters.
 
-Options:
+Transcript output:
   --head N                Show first N messages only
   --pretty                Pretty-print with colors (default)
   --raw                   Output raw session file content
@@ -1540,11 +1573,21 @@ Options:
   --md                    Output as Markdown (## User / ## Assistant headers)
   -f, --follow            Follow session output in real-time (like tail -f)
 
+Metadata output:
+  -o, --fields <FIELDS>   Output session metadata as TSV instead of transcript
+  --tsv                   Metadata mode without -o (default field: title)
+
 Interactive mode:
   -i, --interactive       Select session via fuzzy finder then show it
-  -o, --fields <FIELDS>   Display fields in interactive mode (default: agent,project,modified_at,title)
+  --interactive-display <FIELDS>  Override display columns in fuzzy finder
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
   --no-preview            Disable transcript preview
+
+Examples:
+  ah show                            # show latest session transcript
+  ah show -o title                    # output title of latest session
+  ah show -o agent,title             # output agent and title as TSV
+  ah show -i -o title                # select session, output title
 
 ",
     GLOBAL_OPTIONS
