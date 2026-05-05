@@ -32,6 +32,7 @@ Examples:
 
 Global options:
   -a, --all               Show all sessions (disable default cwd filtering)
+  -A                      Show all sessions including all configured remotes
   --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
   --project <NAME>        Filter by project name
   -d, --dir <PATH>        Filter by working directory (default: current directory)
@@ -41,6 +42,7 @@ Global options:
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --running               Show only currently running sessions (Claude only for now)
+  --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --color                 Force colored output (even through pipes)
   --no-color              Disable colored output
   --no-pager              Disable automatic pager

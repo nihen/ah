@@ -31,9 +31,11 @@ Interactive mode:
 
 Global options:
   -a, --all               Show all memory files (disable default cwd filtering)
+  -A                      Show all memory files including all configured remotes
   --agent <NAME>          Filter by agent name (e.g. claude)
   -d, --dir <PATH>        Filter by working directory (default: current directory)
   -q, --query <REGEX>     Search query (regex, case-insensitive)
+  --remote <NAME>         Include memory files from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show files newer than (e.g. "2026-03-20", "3d", "1w")
   --until <SPEC>          Show files older than (e.g. "2026-03-20", "3d", "1w")
 

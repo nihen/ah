@@ -63,7 +63,7 @@ pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
     // No limit: sort and return all
     if limit == 0 || limit >= entries.len() {
         let mut sorted = entries;
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|e| std::cmp::Reverse(e.1));
         return sorted;
     }
 
@@ -101,6 +101,6 @@ pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
     }
 
     let mut result: Vec<_> = heap.into_iter().map(|e| (e.path, e.mtime)).collect();
-    result.sort_by(|a, b| b.1.cmp(&a.1));
+    result.sort_by_key(|e| std::cmp::Reverse(e.1));
     result
 }
