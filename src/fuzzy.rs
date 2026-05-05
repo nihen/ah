@@ -15,6 +15,34 @@ use crate::resolver::{self, shell_quote};
 
 const PREVIEW_SELECTORS: &[&str] = &["fzf", "sk"];
 
+/// Print selected session fields as TSV. Delegates to
+/// `show::emit_session_meta_tsv` so the post-selection output stays
+/// byte-identical to `ah show -o ...` (no truncation, query/search-mode
+/// threading, running/pid enrichment, TSV escaping). Validates `-q` early
+/// when `matched` is requested so a malformed regex surfaces an error
+/// instead of silently producing an empty `matched` column — matches the
+/// non-interactive `show.rs::run` behaviour.
+fn print_session_fields(
+    path: &str,
+    fields: &[Field],
+    query: &str,
+    search_mode: crate::cli::SearchMode,
+) -> Result<(), String> {
+    if !query.is_empty() && fields.contains(&Field::Matched) {
+        match search_mode {
+            crate::cli::SearchMode::All => regex::bytes::Regex::new(&format!("(?iu){}", query))
+                .map(drop)
+                .map_err(|e| format!("Invalid regex '{}': {}", query, e))?,
+            crate::cli::SearchMode::Prompt => regex::Regex::new(&format!("(?i){}", query))
+                .map(drop)
+                .map_err(|e| format!("Invalid regex '{}': {}", query, e))?,
+        }
+    }
+    let pb = std::path::PathBuf::from(path);
+    let home = canonical_home();
+    crate::show::emit_session_meta_tsv(&pb, &home, fields, query, search_mode)
+}
+
 /// Reverse shell_quote: strip surrounding single quotes and unescape.
 fn strip_shell_quote(s: &str) -> String {
     if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
@@ -67,20 +95,30 @@ fn fzf_supports_preview_search(selector: &str) -> bool {
     major > 0 || minor >= 62
 }
 
-/// Build LTSV-format input for selector (legacy mode).
-fn build_ltsv_input<F: Fn(&str) -> String>(
+/// Build LTSV-format input for selector (legacy mode). The hidden key
+/// (column 1) is round-tripped through `unescape_tsv` after fzf selection,
+/// so it gets the **lossless** encoder; visible display values are never
+/// decoded again, so they get the **simple** encoder so backslashes appear
+/// verbatim in the picker (a project field like `C:\Users\foo` shows
+/// without doubled backslashes).
+fn build_ltsv_input<KeyEsc, ValEsc>(
     key_label: &str,
     keys: &[String],
     rows: &[Vec<String>],
     field_names: &[String],
-    escape: F,
-) -> String {
+    key_escape: KeyEsc,
+    val_escape: ValEsc,
+) -> String
+where
+    KeyEsc: Fn(&str) -> String,
+    ValEsc: Fn(&str) -> String,
+{
     let mut input = String::new();
     for (i, key) in keys.iter().enumerate() {
-        input.push_str(&format!("{}:{}", key_label, escape(key)));
+        input.push_str(&format!("{}:{}", key_label, key_escape(key)));
         for (j, val) in rows[i].iter().enumerate() {
             input.push('\t');
-            input.push_str(&format!("{}:{}", field_names[j], escape(val)));
+            input.push_str(&format!("{}:{}", field_names[j], val_escape(val)));
         }
         input.push('\n');
     }
@@ -92,14 +130,38 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
     let selector = resolve_selector(ia);
     let preview = use_preview(ia, &selector);
 
-    let display_fields = args.common.parse_fields()?.unwrap_or_else(|| {
+    let default_display = || {
         vec![
             Field::Agent,
             Field::Project,
             Field::ModifiedAt,
             Field::Title,
         ]
-    });
+    };
+
+    let output_fields = match args.common.parse_fields()? {
+        Some(fields) if fields.is_empty() => {
+            return Err(
+                "-o/--fields requires at least one field name (got empty list)".to_string(),
+            );
+        }
+        Some(fields) => Some(crate::cli::hoist_path_first(fields)),
+        None => None,
+    };
+
+    // Display columns come from --interactive-display only. We deliberately
+    // do NOT fall back to `-o` here: doing so would force the candidate
+    // pipeline to resolve heavy fields (`transcript`, `messages`, `matched`,
+    // …) for every session before fzf even opens, and `matched` in particular
+    // would be silently empty (the picker pipeline uses
+    // `default_with_title_limit(30)` rather than the query-aware opts), which
+    // drops every candidate. Keep the picker showing the cheap default
+    // columns and let the user opt in via --interactive-display.
+    // log -i picker uses default_with_title_limit(30) (not query-aware), so
+    // matched would always be empty — disallow.
+    let display_fields = ia
+        .parse_display_fields(false)?
+        .unwrap_or_else(default_display);
 
     let sort_field = args.sort_field()?;
     let mut resolve_fields = vec![Field::Path, Field::Id];
@@ -108,6 +170,11 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
             resolve_fields.push(*f);
         }
     }
+    // Don't pre-resolve `output_fields` here: doing so would force every
+    // candidate session to be parsed for heavy fields like `transcript` /
+    // `messages` / `responses` *before* fzf even opens. The selected session
+    // is re-resolved with the full output field set in print_session_fields.
+    let _ = &output_fields;
     if !resolve_fields.contains(&sort_field) {
         resolve_fields.push(sort_field);
     }
@@ -167,7 +234,10 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
             .collect();
         let mut inp = String::new();
         for (i, key) in keys.iter().enumerate() {
-            inp.push_str(&format!("path:{}", output::escape_tsv(key)));
+            // The `path:` value is round-tripped through `unescape_tsv` after
+            // fzf selection, so encode losslessly. Display values use the
+            // simple escape since they're never decoded.
+            inp.push_str(&format!("path:{}", output::escape_tsv_lossless(key)));
             inp.push('\t');
             let marker = if sessions[i]
                 .fields
@@ -228,7 +298,7 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
         if ltsv {
             // The key column is already shell-quoted, so use fzf raw mode.
             selector_args.push(format!(
-                "--preview=p={{r1}}; p=${{p#path:}}; {} show --color \"$p\"",
+                "--preview=p={{r1}}; p=${{p#path:}}; p=$(printf '%b' \"$p\"); {} show --color \"$p\"",
                 exe_quoted
             ));
         } else {
@@ -245,12 +315,36 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
 
     let first = selected.split('\t').next().unwrap_or("");
     let quoted = first.strip_prefix("path:").unwrap_or(first);
-    let path = strip_shell_quote(quoted);
+    // In LTSV mode the `path:` value was `escape_tsv`d before being fed to
+    // the selector (paths with literal tabs/newlines could otherwise break
+    // the row); decode it back here so the recovered path matches what
+    // exists on disk.
+    let path = if ltsv {
+        strip_shell_quote(&output::unescape_tsv(quoted))
+    } else {
+        strip_shell_quote(quoted)
+    };
     if path.is_empty() {
         return Ok(());
     }
 
-    println!("{}", path);
+    match &output_fields {
+        Some(fields) => {
+            // Remote picks (tagged `name:/path` by `merge_into_sessions`) are
+            // not local files; forward via SSH and re-tag the path column.
+            if let Some((remote_def, remote_path)) = remote::parse_remote_path(&path) {
+                remote::run_remote_show_meta(remote_def, remote_path, fields, filter)?;
+            } else {
+                print_session_fields(
+                    &path,
+                    fields,
+                    &filter.query.clone().unwrap_or_default(),
+                    filter.search_mode(),
+                )?;
+            }
+        }
+        None => println!("{}", path),
+    }
     Ok(())
 }
 
@@ -302,7 +396,18 @@ pub fn run_project(
 
     let (input, with_nth) = if ltsv {
         let field_names: Vec<String> = display_tail.iter().map(|f| f.name().to_string()).collect();
-        let inp = build_ltsv_input("cwd", &keys, &rows, &field_names, output::escape_tsv);
+        // The hidden `cwd:` key is round-tripped through `unescape_tsv`
+        // after selection, so use the lossless encoder. Display values are
+        // never decoded; encode them with the simple `escape_tsv` so
+        // backslashes appear verbatim in the picker.
+        let inp = build_ltsv_input(
+            "cwd",
+            &keys,
+            &rows,
+            &field_names,
+            output::escape_tsv_lossless,
+            output::escape_tsv,
+        );
         let count = display_tail.len();
         let wn = if count == 0 {
             "--with-nth=1".to_string()
@@ -339,7 +444,7 @@ pub fn run_project(
         if ltsv {
             // In LTSV mode, {1} is "cwd:'/quoted/path'" — strip prefix via shell
             selector_args.push(format!(
-                "--preview=p={{1}}; p=${{p#cwd:}}; {} log -d \"$p\" -o agent,modified_at,title --color",
+                "--preview=p={{1}}; p=${{p#cwd:}}; p=$(printf '%b' \"$p\"); {} log -d \"$p\" -o agent,modified_at,title --color",
                 exe_quoted
             ));
         } else {
@@ -357,7 +462,13 @@ pub fn run_project(
     };
 
     let first = selected.split('\t').next().unwrap_or("");
-    let cwd = first.strip_prefix("cwd:").unwrap_or(first);
+    let cwd_raw = first.strip_prefix("cwd:").unwrap_or(first);
+    // Symmetric to escape_tsv applied when building the LTSV input.
+    let cwd = if ltsv {
+        output::unescape_tsv(cwd_raw)
+    } else {
+        cwd_raw.to_string()
+    };
     if cwd.is_empty() {
         return Ok(());
     }
@@ -370,28 +481,44 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
     let selector = resolve_selector(ia);
     let preview = use_preview(ia, &selector);
 
-    let display_fields = args.common.parse_fields()?.unwrap_or_else(|| {
+    let meta_fields = args.meta_fields()?;
+
+    let default_display = || {
         vec![
             Field::Agent,
             Field::Project,
             Field::ModifiedAt,
             Field::Title,
         ]
-    });
+    };
+
+    // show -i pipeline uses query-aware ResolveOpts below, so matched
+    // populates correctly here — allow it in --interactive-display.
+    let display_fields = ia
+        .parse_display_fields(true)?
+        .unwrap_or_else(default_display);
+
     let mut resolve_fields = vec![Field::Path, Field::Id, Field::ModifiedAt];
     for f in &display_fields {
         if !resolve_fields.contains(f) {
             resolve_fields.push(*f);
         }
     }
+    // Don't pre-resolve `meta_fields` for the selector pass — heavy fields
+    // would slow down `ah show -i -o transcript` significantly. The selected
+    // session is re-resolved in print_session_fields.
+    let _ = &meta_fields;
 
+    let query = filter.query.clone().unwrap_or_default();
+    let resolve_opts =
+        resolver::ResolveOpts::new(&query, 500, 30).with_search_mode(filter.search_mode());
     let result = pipeline::run_pipeline(&pipeline::PipelineParams {
         resolve_fields: resolve_fields.clone(),
-        resolve_opts: resolver::ResolveOpts::default_with_title_limit(30),
+        resolve_opts,
         filters: filter.to_filters(),
         since: filter.since_time()?,
         until: filter.until_time()?,
-        query: filter.query.clone().unwrap_or_default(),
+        query,
         search_mode: filter.search_mode(),
         sort_field: Field::ModifiedAt,
         sort_order: SortOrder::Desc,
@@ -478,6 +605,16 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
     let path_str = strip_shell_quote(first);
     if path_str.is_empty() {
         return Ok(());
+    }
+
+    if let Some(ref fields) = meta_fields {
+        // Remote picks (tagged `remote:path` by `merge_into_sessions`) need
+        // SSH forwarding; the local resolver can't read remote files.
+        if let Some((remote_def, remote_path)) = remote::parse_remote_path(&path_str) {
+            return remote::run_remote_show_meta(remote_def, remote_path, fields, filter);
+        }
+        let query = filter.query.clone().unwrap_or_default();
+        return print_session_fields(&path_str, fields, &query, filter.search_mode());
     }
 
     let show_args = ShowArgs::with_session(args.head, Some(path_str), args.highlight.clone());
@@ -570,7 +707,18 @@ pub fn run_resume(
             .iter()
             .map(|f| f.name().to_string())
             .collect();
-        let inp = build_ltsv_input("path", &keys, &rows, &field_names, output::escape_tsv);
+        // Lossless encoder for the round-tripped `path:` key; simple
+        // encoder for visible columns (otherwise fields like `title`
+        // containing `C:\foo` would render with doubled backslashes in
+        // the picker).
+        let inp = build_ltsv_input(
+            "path",
+            &keys,
+            &rows,
+            &field_names,
+            output::escape_tsv_lossless,
+            output::escape_tsv,
+        );
         let count = visible_fields.len();
         (inp, format!("--with-nth=2..{}", count + 1))
     } else {
@@ -611,7 +759,7 @@ pub fn run_resume(
         let exe_quoted = shell_quote(&exe.to_string_lossy());
         if ltsv {
             selector_args.push(format!(
-                "--preview=p={{r1}}; p=${{p#path:}}; {} show --color \"$p\"",
+                "--preview=p={{r1}}; p=${{p#path:}}; p=$(printf '%b' \"$p\"); {} show --color \"$p\"",
                 exe_quoted
             ));
         } else {
@@ -628,7 +776,12 @@ pub fn run_resume(
 
     let first = selected.split('\t').next().unwrap_or("");
     let quoted = first.strip_prefix("path:").unwrap_or(first);
-    let path_str = strip_shell_quote(quoted);
+    // Symmetric to escape_tsv applied when building LTSV input above.
+    let path_str = if ltsv {
+        strip_shell_quote(&output::unescape_tsv(quoted))
+    } else {
+        strip_shell_quote(quoted)
+    };
     if path_str.is_empty() {
         return Ok(());
     }
@@ -718,7 +871,17 @@ fn push_preview_search_binds(
         return;
     }
     let (prefix, path_ref) = if ltsv {
-        (format!("p={{r1}}; p=${{p#{}:}}; ", path_prefix), "\"$p\"")
+        // `printf '%b'` decodes the LTSV value's escape_tsv-style escapes
+        // (`\\` / `\t` / `\n` / `\r`) so the preview/scroll commands receive
+        // the actual path even for Windows-style cwds (`C:\...`) or paths
+        // with embedded tabs/newlines.
+        (
+            format!(
+                "p={{r1}}; p=${{p#{}:}}; p=$(printf '%b' \"$p\"); ",
+                path_prefix
+            ),
+            "\"$p\"",
+        )
     } else {
         (String::new(), "{r1}")
     };

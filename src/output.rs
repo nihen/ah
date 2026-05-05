@@ -506,11 +506,61 @@ fn output_tsv(sessions: &[Session], fields: &[Field], query: &str) {
     }
 }
 
-/// Escape newlines and tabs for TSV/LTSV output.
+/// Escape characters that would break TSV row/column boundaries. Backslashes
+/// pass through unchanged so non-path fields (`title`, `transcript`,
+/// `matched`, …) appear verbatim to external tools. The path round-trip via
+/// pipes is handled by `subcmd::resolve_session_ref`'s raw-first /
+/// `unescape_tsv` fallback ordering — paths with literal `\t` / `\n` / `\r`
+/// in the filename (extremely rare) win the literal pass before the decode
+/// fallback runs.
+///
+/// Not symmetric with `unescape_tsv`: it cannot disambiguate a literal
+/// `\t`/`\n`/`\r` source from a real TAB/LF/CR after round-trip. Use
+/// [`escape_tsv_lossless`] when the same value will be unconditionally
+/// `unescape_tsv`'d (e.g. fzf LTSV interactive selection in `fuzzy.rs`).
 pub fn escape_tsv(s: &str) -> String {
     s.replace('\t', "\\t")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+}
+
+/// Symmetric escape: also doubles backslashes so `unescape_tsv(escape_tsv_lossless(s)) == s`
+/// for any `s`. Used by interactive LTSV input/output in `fuzzy.rs` where a
+/// captured value is unconditionally decoded again after fzf selection — a
+/// non-symmetric encoder would corrupt paths containing literal `\t`/`\n`/
+/// `\r` sequences (e.g. filenames whose name happens to contain backslash+t).
+pub fn escape_tsv_lossless(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+/// Decodes `\\` / `\t` / `\n` / `\r` back to `\` / TAB / LF / CR.
+/// True inverse of [`escape_tsv_lossless`]; for [`escape_tsv`] it is a
+/// best-effort decoder used as a fallback in `subcmd::resolve_session_ref`
+/// (literal-path attempt first, then unescape).
+pub fn unescape_tsv(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// LTSV output (Labeled Tab-Separated Values).
@@ -887,8 +937,48 @@ mod tests {
         assert_eq!(escape_tsv("a\tb"), "a\\tb");
         assert_eq!(escape_tsv("a\nb"), "a\\nb");
         assert_eq!(escape_tsv("a\r\nb"), "a\\r\\nb");
-        assert_eq!(escape_tsv("a\\b"), "a\\b");
+        // Backslashes pass through unchanged so non-path fields (title,
+        // transcript, …) appear verbatim to external consumers.
+        assert_eq!(escape_tsv("C:\\Users\\foo"), "C:\\Users\\foo");
         assert_eq!(escape_tsv("line1\nline2\tcol"), "line1\\nline2\\tcol");
+    }
+
+    #[test]
+    fn test_escape_tsv_lossless_round_trip() {
+        // The lossless variant must be a true inverse of unescape_tsv for
+        // every input — including paths that look like escape sequences in
+        // their literal form (e.g. `/tmp/ah\tcase` where `\t` is two chars).
+        for s in [
+            "hello",
+            "a\tb",   // real TAB
+            "a\nb",   // real LF
+            "a\r\nb", // real CRLF
+            "a\\b",   // single backslash
+            "C:\\Users\\foo",
+            "/tmp/ah\\tcase/x", // literal `\t` in filename
+            "/path\\with\nmix\tof\\\\stuff",
+        ] {
+            let encoded = escape_tsv_lossless(s);
+            let decoded = unescape_tsv(&encoded);
+            assert_eq!(
+                decoded, s,
+                "round-trip failed: {:?} -> {:?} -> {:?}",
+                s, encoded, decoded
+            );
+        }
+    }
+
+    #[test]
+    fn test_unescape_tsv_basic() {
+        assert_eq!(unescape_tsv("hello"), "hello");
+        assert_eq!(unescape_tsv("a\\tb"), "a\tb");
+        assert_eq!(unescape_tsv("a\\nb"), "a\nb");
+        assert_eq!(unescape_tsv("a\\r\\nb"), "a\r\nb");
+        assert_eq!(unescape_tsv("a\\\\b"), "a\\b");
+        // Unknown escape sequence: backslash kept verbatim.
+        assert_eq!(unescape_tsv("a\\xb"), "a\\xb");
+        // Trailing lone backslash: kept.
+        assert_eq!(unescape_tsv("a\\"), "a\\");
     }
 
     #[test]

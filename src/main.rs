@@ -63,6 +63,31 @@ fn main() {
     color::init_color(filter.color, filter.no_color);
     color::init_debug(filter.debug);
 
+    // --interactive-display only applies to `log -i` and `show -i`. Reject
+    // it on commands that ignore it so users find out about the typo
+    // immediately instead of silently getting default columns.
+    if ia.interactive_display.is_some()
+        && !matches!(&cli.command, Commands::Log(_) | Commands::Show(_))
+    {
+        eprintln!(
+            "Error: --interactive-display is only supported for `ah log -i` and `ah show -i`."
+        );
+        process::exit(1);
+    }
+    // Validate the display field list up front so even short-circuit paths
+    // like `ah log -i --list-fields` surface invalid field names instead of
+    // silently ignoring them.
+    // Up-front sanity check (catches typos / empty / `path` / etc. before
+    // short-circuit paths like `--list-fields`). Pick the same
+    // `allow_matched` setting the dispatched command would use, so the early
+    // path doesn't silently accept invalid combinations: log = false (its
+    // picker uses display-only resolve opts), show = true (query-aware).
+    let allow_matched_here = matches!(&cli.command, Commands::Show(_));
+    if let Err(e) = ia.parse_display_fields(allow_matched_here) {
+        eprintln!("{}", e);
+        process::exit(1);
+    }
+
     // Set up pager before command dispatch (must be after color init).
     // The _pager guard keeps the pager child alive; it's waited on drop.
     let _pager = if !filter.no_pager && !ia.interactive {

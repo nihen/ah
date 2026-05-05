@@ -108,6 +108,11 @@ fn resolve_session_inner(
 
 /// Read an explicit session reference from stdin or positional argument.
 /// Stdin takes precedence over the positional argument when present.
+/// The returned value is intentionally left raw — TSV escape decoding is
+/// done lazily by `resolve_session_ref` (literal-first, then unescaped
+/// fallback) and by remote dispatch sites, so raw paths piped from
+/// non-`ah` producers (e.g. `echo C:\\temp\\sess.jsonl | ah show`) still
+/// resolve correctly.
 pub fn read_session_ref(session: Option<&str>) -> Option<String> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         let mut line = String::new();
@@ -130,6 +135,11 @@ pub fn read_session_ref(session: Option<&str>) -> Option<String> {
 }
 
 /// Resolve a session reference: try as file path first, then as session ID.
+/// Raw-first ordering: literal paths (Windows `C:\foo`, Unix paths with
+/// embedded `\t` chars piped from non-`ah` producers) win over the decoded
+/// form so they resolve correctly. TSV-decoded fallback only kicks in when
+/// the raw value isn't a real file or session ID — that's the
+/// `ah ... -o path | ah show` round-trip path.
 pub fn resolve_session_ref(s: &str, home: &Path) -> Result<PathBuf, String> {
     let s = strip_ltsv_prefix(s);
 
@@ -145,6 +155,21 @@ pub fn resolve_session_ref(s: &str, home: &Path) -> Result<PathBuf, String> {
         let pb = PathBuf::from(unquoted);
         if pb.exists() {
             return Ok(pb);
+        }
+    }
+
+    // TSV-decoded fallback (`\\` / `\t` / `\n` / `\r` → literal). Only
+    // attempted after the raw value has failed both the file-path check
+    // and the surrounding-quote strip, so raw paths from non-`ah` producers
+    // round-trip without corruption.
+    let unescaped = crate::output::unescape_tsv(unquoted);
+    if unescaped != unquoted {
+        let pb = PathBuf::from(&unescaped);
+        if pb.exists() {
+            return Ok(pb);
+        }
+        if let Ok(p) = resolve_by_id(&unescaped, home) {
+            return Ok(p);
         }
     }
 
@@ -259,6 +284,33 @@ mod tests {
             strip_ltsv_prefix_with("mydev:/tmp/session.jsonl", |s| s.starts_with("mydev:/")),
             "mydev:/tmp/session.jsonl"
         );
+    }
+
+    #[test]
+    fn resolve_session_ref_prefers_literal_path_over_decoded() {
+        // Raw paths from non-`ah` producers (e.g. `echo /tmp/foo\\tbar |
+        // ah show` where the literal `\t` is part of the file name) must
+        // resolve before the TSV-decoded fallback runs, so a real on-disk
+        // `\t` filename is found rather than a phantom `<TAB>` path.
+        let tmp = tempfile::tempdir().unwrap();
+        let raw_path = tmp.path().join("raw\\tfile.jsonl");
+        std::fs::write(&raw_path, "").unwrap();
+        let resolved =
+            resolve_session_ref(raw_path.to_str().unwrap(), tmp.path()).expect("literal path");
+        assert_eq!(resolved, raw_path);
+    }
+
+    #[test]
+    fn resolve_session_ref_decodes_tsv_when_literal_missing() {
+        // The matching round-trip case: `escape_tsv` emitted `\\t` for a
+        // file whose actual on-disk name has a TAB; piping that back must
+        // hit the unescape fallback and resolve the TAB-named file.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_path = tmp.path().join("real\ttab.jsonl"); // literal TAB
+        std::fs::write(&real_path, "").unwrap();
+        let escaped = format!("{}/real\\ttab.jsonl", tmp.path().display());
+        let resolved = resolve_session_ref(&escaped, tmp.path()).expect("decoded fallback");
+        assert_eq!(resolved, real_path);
     }
 
     #[test]
