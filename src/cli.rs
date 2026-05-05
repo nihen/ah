@@ -661,13 +661,21 @@ pub struct ShowArgs {
     #[arg(short = 'f', long = "follow")]
     pub follow: bool,
 
+    /// Highlight matching text in pretty output (case-insensitive)
+    #[arg(long = "highlight", value_name = "PATTERN", conflicts_with_all = ["raw", "json", "md"])]
+    pub highlight: Option<String>,
+
     /// Session ID or path
     pub session: Option<String>,
 }
 
 impl ShowArgs {
     /// Build a ShowArgs for internal use (e.g. from fuzzy selection).
-    pub fn with_session(head: Option<usize>, session: Option<String>) -> Self {
+    pub fn with_session(
+        head: Option<usize>,
+        session: Option<String>,
+        highlight: Option<String>,
+    ) -> Self {
         ShowArgs {
             common: CommonArgs { fields: None },
             head,
@@ -676,6 +684,7 @@ impl ShowArgs {
             json: false,
             md: false,
             follow: false,
+            highlight,
             session,
         }
     }
@@ -1542,6 +1551,7 @@ Interactive mode:
   -i, --interactive       Browse sessions via fuzzy finder; prints selected path
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
   --no-preview            Disable transcript preview (enabled by default for fzf, sk)
+  ctrl-s (fzf only)       Toggle preview search: highlight + scroll to match / reset
 
 ",
     GLOBAL_OPTIONS
@@ -1562,12 +1572,14 @@ Options:
   --json                  Output normalized JSON Lines ({\"role\":\"user\",\"text\":\"...\"})
   --md                    Output as Markdown (## User / ## Assistant headers)
   -f, --follow            Follow session output in real-time (like tail -f)
+  --highlight <PATTERN>   Highlight matching text in pretty output (case-insensitive; requires color)
 
 Interactive mode:
   -i, --interactive       Select session via fuzzy finder then show it
   -o, --fields <FIELDS>   Display fields in interactive mode (default: agent,project,modified_at,title)
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
   --no-preview            Disable transcript preview
+  ctrl-s (fzf only)       Toggle preview search: highlight + scroll to match / reset
 
 ",
     GLOBAL_OPTIONS
@@ -1594,6 +1606,7 @@ Interactive mode:
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
   --ltsv                  Use LTSV format for interactive selector display
   --no-preview            Disable transcript preview
+  ctrl-s (fzf only)       Toggle preview search: highlight + scroll to match / reset
 
 Examples:
   ah resume                   # resume latest matching session

@@ -8,6 +8,34 @@ use crate::output::{strip_ansi, strip_quotes};
 use crate::remote;
 use crate::subcmd;
 
+/// Compile a case-insensitive matcher for the user pattern. The pattern is
+/// `regex::escape`d before compilation, so it matches literal text — regex
+/// metacharacters like `.` and `*` have no special meaning. Empty pattern
+/// returns `Ok(None)`. Compilation failures (e.g. exceeding the regex size
+/// limit) are surfaced as `Err` so `--highlight` doesn't silently no-op.
+fn compile_highlight(pattern: &str) -> Result<Option<regex::Regex>, String> {
+    if pattern.is_empty() {
+        return Ok(None);
+    }
+    regex::RegexBuilder::new(&regex::escape(pattern))
+        .case_insensitive(true)
+        .build()
+        .map(Some)
+        .map_err(|e| format!("invalid --highlight pattern: {}", e))
+}
+
+/// Apply yellow-background highlighting to matching text.
+/// Sets black fg + bright-yellow bg, and resets only fg/bg on exit
+/// (\x1b[39;49m) so any surrounding DIM/BOLD attributes are preserved.
+fn highlight_text(text: &str, re: &regex::Regex) -> String {
+    const HL: &str = "\x1b[30;103m";
+    const HL_END: &str = "\x1b[39;49m";
+    re.replace_all(text, |caps: &regex::Captures| {
+        format!("{}{}{}", HL, &caps[0], HL_END)
+    })
+    .into_owned()
+}
+
 pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
     let home = canonical_home();
     let explicit_session = subcmd::read_session_ref(args.session.as_deref());
@@ -71,19 +99,29 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
                 return Err(format!("Failed to read: {}", path.display()));
             }
         }
-        ShowFormat::Pretty => run_pretty(&path, args.head),
+        ShowFormat::Pretty => {
+            let hl_re = match args.highlight.as_deref() {
+                Some(p) => compile_highlight(p)?,
+                None => None,
+            };
+            run_pretty(&path, args.head, hl_re.as_ref());
+        }
         ShowFormat::Json => run_json(&path, args.head),
         ShowFormat::Md => run_md(&path, args.head),
     }
 
     if follow {
-        run_follow(&path, plugin)?;
+        let hl_re = match args.highlight.as_deref() {
+            Some(p) => compile_highlight(p)?,
+            None => None,
+        };
+        run_follow(&path, plugin, hl_re.as_ref())?;
     }
 
     Ok(())
 }
 
-fn run_pretty(path: &std::path::Path, head: Option<usize>) {
+fn run_pretty(path: &std::path::Path, head: Option<usize>, hl_re: Option<&regex::Regex>) {
     let plugin = agents::find_plugin_for_path(path);
     let is_tty = color::use_color();
     let limit = head.unwrap_or(0);
@@ -102,6 +140,15 @@ fn run_pretty(path: &std::path::Path, head: Option<usize>) {
         first = false;
 
         let text = strip_ansi(&message.text);
+        let text = if is_tty {
+            if let Some(re) = hl_re {
+                highlight_text(&text, re)
+            } else {
+                text
+            }
+        } else {
+            text
+        };
         match message.role {
             MessageRole::User => {
                 if is_tty {
@@ -193,7 +240,11 @@ fn run_md(path: &std::path::Path, head: Option<usize>) {
 
 /// Follow a session file for new messages (like tail -f).
 /// Seeks to end of file and polls for new JSONL lines, printing them as pretty output.
-fn run_follow(path: &std::path::Path, plugin: &dyn agents::AgentPlugin) -> Result<(), String> {
+fn run_follow(
+    path: &std::path::Path,
+    plugin: &dyn agents::AgentPlugin,
+    hl_re: Option<&regex::Regex>,
+) -> Result<(), String> {
     let is_tty = color::use_color();
 
     let mut file =
@@ -276,6 +327,15 @@ fn run_follow(path: &std::path::Path, plugin: &dyn agents::AgentPlugin) -> Resul
                 for message in plugin.messages_from_value(&val) {
                     println!();
                     let text = strip_ansi(&message.text);
+                    let text = if is_tty {
+                        if let Some(re) = hl_re {
+                            highlight_text(&text, re)
+                        } else {
+                            text
+                        }
+                    } else {
+                        text
+                    };
                     match message.role {
                         MessageRole::User => {
                             if is_tty {

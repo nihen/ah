@@ -36,6 +36,37 @@ fn use_preview(ia: &InteractiveArgs, selector: &str) -> bool {
     !ia.no_preview && PREVIEW_SELECTORS.contains(&selector_bin)
 }
 
+/// Detect whether the configured fzf binary supports the actions and
+/// environment variables the preview-search bind needs. The ctrl-s toggle
+/// reads `$FZF_INPUT_STATE` to decide which branch to take, and that env
+/// var was added in fzf 0.62. On older fzf the variable is always unset,
+/// so the toggle would get stuck always taking the "enabled" branch and
+/// could not flip state back. Gate on 0.62 so the bind is silently
+/// skipped on older fzf and interactive mode still opens cleanly.
+///
+/// Stock fzf prints `MAJOR.MINOR.PATCH (build info)` to stdout, but
+/// distro/packaged builds may prepend `fzf ` or include other prefixes.
+/// Scan the entire output for the first `MAJOR.MINOR` numeric substring
+/// rather than relying on the first whitespace token, so we don't silently
+/// disable the feature on supported fzf with non-standard version banners.
+fn fzf_supports_preview_search(selector: &str) -> bool {
+    let output = std::process::Command::new(selector)
+        .arg("--version")
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    static VERSION_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(\d+)\.(\d+)").unwrap());
+    let Some(caps) = VERSION_RE.captures(&stdout) else {
+        return false;
+    };
+    let major: u32 = caps[1].parse().unwrap_or(0);
+    let minor: u32 = caps[2].parse().unwrap_or(0);
+    major > 0 || minor >= 62
+}
+
 /// Build LTSV-format input for selector (legacy mode).
 fn build_ltsv_input<F: Fn(&str) -> String>(
     key_label: &str,
@@ -204,6 +235,7 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
             selector_args.push(format!("--preview={} show --color {{r1}}", exe_quoted));
         }
         selector_args.push("--preview-window=right:60%:wrap".to_string());
+        push_preview_search_binds(&mut selector_args, &exe_quoted, ltsv, "path", &selector);
     }
 
     let selected = match run_selector(&selector, &selector_args, &input)? {
@@ -431,11 +463,10 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
 
     if preview {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
-        selector_args.push(format!(
-            "--preview={} show --color {{r1}}",
-            shell_quote(&exe.to_string_lossy())
-        ));
+        let exe_quoted = shell_quote(&exe.to_string_lossy());
+        selector_args.push(format!("--preview={} show --color {{r1}}", exe_quoted));
         selector_args.push("--preview-window=right:60%:wrap".to_string());
+        push_preview_search_binds(&mut selector_args, &exe_quoted, false, "path", &selector);
     }
 
     let selected = match run_selector(&selector, &selector_args, &input)? {
@@ -449,7 +480,7 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
         return Ok(());
     }
 
-    let show_args = ShowArgs::with_session(args.head, Some(path_str));
+    let show_args = ShowArgs::with_session(args.head, Some(path_str), args.highlight.clone());
     crate::show::run(show_args, filter)
 }
 
@@ -587,6 +618,7 @@ pub fn run_resume(
             selector_args.push(format!("--preview={} show --color {{r1}}", exe_quoted));
         }
         selector_args.push("--preview-window=right:60%:wrap".to_string());
+        push_preview_search_binds(&mut selector_args, &exe_quoted, ltsv, "path", &selector);
     }
 
     let selected = match run_selector(&selector, &selector_args, &input)? {
@@ -652,6 +684,84 @@ pub fn run_resume(
     }
 
     resume::exec_resume(&full_cmd);
+}
+
+/// Push fzf --bind args for live preview highlight + ctrl-s toggle.
+///
+/// The preview command always passes `--highlight=$FZF_QUERY` to `ah show`,
+/// so whatever the user has typed is highlighted in the preview pane.
+/// `ah show` ignores --highlight when the pattern is empty.
+///
+/// On every query change we `refresh-preview` (so the highlight tracks the
+/// current query even when the candidate doesn't change) and scroll the
+/// preview to the first match.
+///
+/// ctrl-s toggles fzf's candidate-list filtering on/off via
+/// `disable-search`/`enable-search`. Off lets the user keep typing to refine
+/// highlight/scroll without the candidate list collapsing under them. The
+/// state is read back via the `$FZF_INPUT_STATE` env var fzf exports.
+fn push_preview_search_binds(
+    selector_args: &mut Vec<String>,
+    exe_quoted: &str,
+    ltsv: bool,
+    path_prefix: &str,
+    selector: &str,
+) {
+    let selector_bin = selector.rsplit('/').next().unwrap_or(selector);
+    if selector_bin != "fzf" {
+        return;
+    }
+    // ctrl-s toggle reads $FZF_INPUT_STATE which was added in fzf 0.62.
+    // On older fzf, silently skip these binds so interactive mode still
+    // opens cleanly without a half-broken toggle.
+    if !fzf_supports_preview_search(selector) {
+        return;
+    }
+    let (prefix, path_ref) = if ltsv {
+        (format!("p={{r1}}; p=${{p#{}:}}; ", path_prefix), "\"$p\"")
+    } else {
+        (String::new(), "{r1}")
+    };
+
+    // Always highlight $FZF_QUERY in the preview. Empty query → ah show
+    // ignores --highlight, so this is safe at startup too.
+    if let Some(pos) = selector_args
+        .iter()
+        .position(|a| a.starts_with("--preview="))
+    {
+        selector_args[pos] = format!(
+            "--preview={}{} show --color --highlight=\"$FZF_QUERY\" {}",
+            prefix, exe_quoted, path_ref
+        );
+    }
+
+    // Empty $FZF_QUERY is short-circuited to N=0: `grep -F ""` matches every
+    // line, which would scroll to line 1 instead of resetting to the top
+    // when the user clears the query.
+    let scroll_transform = format!(
+        "{}if [ -z \"$FZF_QUERY\" ]; then N=0; else N=`{} show {} | grep -Fni -m1 -- \"$FZF_QUERY\" | cut -d: -f1`; test -n \"$N\" || N=0; fi; echo \"change-preview-window(+$N)\"",
+        prefix, exe_quoted, path_ref
+    );
+    // change: re-render preview (so highlight follows the query even when
+    // the top candidate doesn't change) and scroll to the first match.
+    // bg-transform runs the offset calculation in the background so typing
+    // stays responsive even when `ah show | grep` is slow on large
+    // transcripts (transform would block the UI synchronously).
+    selector_args.push(format!(
+        "--bind=change:refresh-preview+bg-transform({})",
+        scroll_transform
+    ));
+
+    // ctrl-s toggles candidate-list filtering. Off = user can keep typing
+    // to refine the preview highlight/scroll without the list collapsing.
+    // While filtering is off we append a yellow marker line to the
+    // existing `$FZF_HEADER`; on re-enable we strip our marker line
+    // (matched literally with `grep -Fv`) so any user-configured header
+    // (e.g. via `FZF_DEFAULT_OPTS=--header=...`) is preserved instead of
+    // being clobbered by `change-header`.
+    selector_args.push(
+        "--bind=ctrl-s:transform~if [ \"$FZF_INPUT_STATE\" = disabled ]; then echo 'enable-search+change-preview-window(+0)+transform-header(printf %s \"$FZF_HEADER\" | grep -Fv \"search off — ctrl-s to filter\")'; else echo 'disable-search+transform-header(if [ -n \"$FZF_HEADER\" ]; then printf %s\\n \"$FZF_HEADER\"; fi; printf \"\\033[33m[search off — ctrl-s to filter]\\033[0m\")'; fi~".to_string()
+    );
 }
 
 /// Run the selector (fzf/sk/etc) with the given args and input, return selected line.
