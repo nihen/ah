@@ -10,6 +10,7 @@ mod output;
 mod pager;
 mod pipeline;
 mod projects;
+mod remote;
 mod resolver;
 mod resume;
 mod search;
@@ -40,7 +41,24 @@ fn main() {
 
     let cli = Cli::parse();
 
-    let filter = cli.filter;
+    let mut filter = cli.filter;
+
+    // -A: expand to -a + all configured remotes (union with any explicit --remote)
+    if filter.all_remote {
+        filter.all = true;
+        let all_names: Vec<String> = config::remotes().iter().map(|r| r.name.clone()).collect();
+        if all_names.is_empty() && filter.remote.is_empty() {
+            eprintln!(
+                "Warning: -A specified but no remotes are configured in ~/.ahrc. \
+                 Add a [remotes.<name>] section to enable remote aggregation."
+            );
+        }
+        for name in all_names {
+            if !filter.remote.contains(&name) {
+                filter.remote.push(name);
+            }
+        }
+    }
     let ia = cli.ia;
     color::init_color(filter.color, filter.no_color);
     color::init_debug(filter.debug);
@@ -85,7 +103,7 @@ fn main() {
                         process::exit(1);
                     }
                 };
-                if let Err(e) = run_search(args) {
+                if let Err(e) = run_search(args, &filter) {
                     eprintln!("{}", e);
                     process::exit(1);
                 }
@@ -319,7 +337,7 @@ fn print_field_list<'a>(fields: impl Iterator<Item = (&'a str, &'a str, &'a str)
     }
 }
 
-fn run_search(args: Args) -> Result<(), String> {
+fn run_search(args: Args, filter: &cli::FilterArgs) -> Result<(), String> {
     let params = pipeline::PipelineParams {
         resolve_fields: args.fields.clone(),
         resolve_opts: resolver::ResolveOpts::new(
@@ -340,15 +358,24 @@ fn run_search(args: Args) -> Result<(), String> {
         require_resume_cmd: false,
     };
     let result = pipeline::run_pipeline(&params)?;
-    if result.sessions.is_empty() {
+    let mut sessions = result.sessions;
+
+    let mut remote_fields = args.fields.clone();
+    if !remote_fields.contains(&args.sort_field) {
+        remote_fields.push(args.sort_field);
+    }
+    remote::merge_into_sessions(
+        &mut sessions,
+        filter,
+        &remote_fields,
+        args.sort_field,
+        args.sort_order.clone(),
+    )?;
+
+    if sessions.is_empty() {
         return Err("No sessions found.".to_string());
     }
-    output::output_sessions(
-        &result.sessions,
-        &args.fields,
-        &args.output_format,
-        &args.query,
-    );
+    output::output_sessions(&sessions, &args.fields, &args.output_format, &args.query);
     Ok(())
 }
 
@@ -356,9 +383,50 @@ fn run_list_projects(
     args: ListProjectsResolvedArgs,
     filter: &cli::FilterArgs,
 ) -> Result<(), String> {
-    let records = projects::build_project_records(&args, filter)?;
+    let mut records = match projects::build_project_records(&args, filter) {
+        Ok(r) => r,
+        Err(e) if !filter.remote.is_empty() && is_empty_result_error(&e) => {
+            if color::is_debug() {
+                eprintln!("[debug] local projects: {}", e);
+            }
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Merge remote projects if --remote is specified
+    if !filter.remote.is_empty() {
+        let remotes = remote::resolve_remotes(&filter.remote)?;
+        let mut remote_fields = args.fields.clone();
+        if !remote_fields.contains(&args.sort_field) {
+            remote_fields.push(args.sort_field);
+        }
+        let remote_records = remote::fetch_remote_projects(&remotes, &remote_fields, filter);
+        records.extend(remote_records);
+
+        // Re-sort after merging
+        let sf = args.sort_field;
+        let numeric = sf.is_numeric();
+        match args.sort_order {
+            cli::SortOrder::Desc => records
+                .sort_by(|a, b| output::compare_field_values(b.get(&sf), a.get(&sf), numeric)),
+            cli::SortOrder::Asc => records
+                .sort_by(|a, b| output::compare_field_values(a.get(&sf), b.get(&sf), numeric)),
+        }
+    }
+
+    if records.is_empty() {
+        return Err("No projects found.".to_string());
+    }
+
     output::output_projects(&records, &args.fields, &args.output_format);
     Ok(())
+}
+
+/// Check if an error message indicates an empty result (no data found)
+/// vs a real error (invalid input, parse failure, etc.).
+fn is_empty_result_error(msg: &str) -> bool {
+    msg.starts_with("No ") && msg.ends_with(" found.")
 }
 
 fn run_status(filter: &cli::FilterArgs, output_format: cli::OutputFormat) -> Result<(), String> {
@@ -376,7 +444,7 @@ fn run_status(filter: &cli::FilterArgs, output_format: cli::OutputFormat) -> Res
     let until = filter.until_time()?;
 
     let files = collector::collect_files(filter.limit);
-    if files.is_empty() {
+    if files.is_empty() && filter.remote.is_empty() {
         return Err("No session files found.".to_string());
     }
 
@@ -445,38 +513,95 @@ fn run_status(filter: &cli::FilterArgs, output_format: cli::OutputFormat) -> Res
         }
     }
 
-    // Collect rows: (agent, count, latest)
-    let rows: Vec<(&str, usize, String)> = if filter.all {
+    // Rows are (agent, remote_name, count, latest). `remote_name` is empty
+    // for local rows; structured output puts it in its own column / field so
+    // consumers don't have to parse "agent (remote)" labels.
+    let mut rows: Vec<(String, String, usize, String)> = if filter.all {
         stats
             .iter()
-            .map(|(agent, s)| (*agent, s.total, format_mtime(s.latest)))
+            .map(|(agent, s)| {
+                (
+                    agent.to_string(),
+                    String::new(),
+                    s.total,
+                    format_mtime(s.latest),
+                )
+            })
             .collect()
     } else {
         let cwd_rows: Vec<_> = stats
             .iter()
             .filter(|(_, s)| s.cwd_count > 0)
-            .map(|(agent, s)| (*agent, s.cwd_count, format_mtime(s.cwd_latest.unwrap())))
+            .map(|(agent, s)| {
+                (
+                    agent.to_string(),
+                    String::new(),
+                    s.cwd_count,
+                    format_mtime(s.cwd_latest.unwrap()),
+                )
+            })
             .collect();
-        if cwd_rows.is_empty() {
+        if cwd_rows.is_empty() && filter.remote.is_empty() {
             return Err("No sessions in current directory.".to_string());
         }
         cwd_rows
     };
 
+    if !filter.remote.is_empty() {
+        let remotes = remote::resolve_remotes(&filter.remote)?;
+        let remote_stats = remote::fetch_remote_agent_stats(&remotes, filter);
+        for (remote_name, rs) in remote_stats {
+            rows.push((rs.agent, remote_name, rs.sessions, rs.latest));
+        }
+    }
+
+    if rows.is_empty() {
+        return Err("No sessions found.".to_string());
+    }
+
+    let display_label = |agent: &str, remote: &str| -> String {
+        if remote.is_empty() {
+            agent.to_string()
+        } else {
+            format!("{} ({})", agent, remote)
+        }
+    };
+
     match output_format {
         cli::OutputFormat::Json => {
-            for (agent, count, latest) in &rows {
-                let obj = serde_json::json!({
-                    "agent": agent,
-                    "sessions": count,
-                    "latest": latest,
-                });
-                println!("{}", obj);
+            for (agent, remote_name, count, latest) in &rows {
+                let mut obj = serde_json::Map::new();
+                obj.insert(
+                    "agent".to_string(),
+                    serde_json::Value::String(agent.clone()),
+                );
+                if !remote_name.is_empty() {
+                    obj.insert(
+                        "remote".to_string(),
+                        serde_json::Value::String(remote_name.clone()),
+                    );
+                }
+                obj.insert(
+                    "sessions".to_string(),
+                    serde_json::Value::Number((*count).into()),
+                );
+                obj.insert(
+                    "latest".to_string(),
+                    serde_json::Value::String(latest.clone()),
+                );
+                println!("{}", serde_json::Value::Object(obj));
             }
         }
         cli::OutputFormat::Ltsv => {
-            for (agent, count, latest) in &rows {
-                println!("agent:{}\tsessions:{}\tlatest:{}", agent, count, latest);
+            for (agent, remote_name, count, latest) in &rows {
+                if remote_name.is_empty() {
+                    println!("agent:{}\tsessions:{}\tlatest:{}", agent, count, latest);
+                } else {
+                    println!(
+                        "agent:{}\tremote:{}\tsessions:{}\tlatest:{}",
+                        agent, remote_name, count, latest
+                    );
+                }
             }
         }
         cli::OutputFormat::Log | cli::OutputFormat::Table => {
@@ -486,34 +611,38 @@ fn run_status(filter: &cli::FilterArgs, output_format: cli::OutputFormat) -> Res
             } else {
                 ("", "", "")
             };
-            // Compute column widths
-            let agent_w = rows
+            let labels: Vec<String> = rows
                 .iter()
-                .map(|(a, _, _)| a.len())
-                .max()
-                .unwrap_or(5)
-                .max(5);
+                .map(|(a, rn, _, _)| display_label(a, rn))
+                .collect();
+            let agent_w = labels.iter().map(|l| l.len()).max().unwrap_or(5).max(5);
             let count_w = rows
                 .iter()
-                .map(|(_, c, _)| c.to_string().len())
+                .map(|(_, _, c, _)| c.to_string().len())
                 .max()
                 .unwrap_or(8)
                 .max(8);
-            // Header
             println!(
                 "{d}{:<agent_w$}  {:>count_w$}  LATEST{r}",
                 "AGENT", "SESSIONS"
             );
-            for (agent, count, latest) in &rows {
+            for (label, (_, _, count, latest)) in labels.iter().zip(rows.iter()) {
                 println!(
                     "{b}{:<agent_w$}{r}  {:>count_w$}  {d}{}{r}",
-                    agent, count, latest
+                    label, count, latest
                 );
             }
         }
         cli::OutputFormat::Tsv => {
-            for (agent, count, latest) in &rows {
-                println!("{}\t{}\t{}", agent, count, latest);
+            // Only emit the `remote` column when at least one row has it, so
+            // local-only invocations keep the legacy 3-column shape.
+            let has_remote = rows.iter().any(|(_, rn, _, _)| !rn.is_empty());
+            for (agent, remote_name, count, latest) in &rows {
+                if has_remote {
+                    println!("{}\t{}\t{}\t{}", agent, remote_name, count, latest);
+                } else {
+                    println!("{}\t{}\t{}", agent, count, latest);
+                }
             }
         }
     }

@@ -20,8 +20,10 @@ Default output (when no format flag is given):
 
 Global options:
   -a, --all               Show all agents (disable default cwd filtering)
+  -A                      Show all agents including all configured remotes
   --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
   -n, --limit N           Max session files to scan (default: 0, no limit)
+  --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
 

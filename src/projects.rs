@@ -22,13 +22,13 @@ pub fn build_project_records(
 ) -> Result<Vec<BTreeMap<ProjectField, String>>, String> {
     let home = canonical_home();
 
+    let since = filter.since_time()?;
+    let until = filter.until_time()?;
+
     let files = collector::collect_files(filter.limit);
     if files.is_empty() {
         return Err("No session files found.".to_string());
     }
-
-    let since = filter.since_time()?;
-    let until = filter.until_time()?;
     let field_filters = FieldFilter::from_options(&filter.agent, &None);
 
     let needs_cwd = args.fields.contains(&ProjectField::Cwd) || filter.dir.is_some();

@@ -10,6 +10,7 @@ use crate::memory;
 use crate::output::{self, compute_column_widths, format_columns, sanitize_for_display};
 use crate::pipeline;
 use crate::projects;
+use crate::remote;
 use crate::resolver::{self, shell_quote};
 
 const PREVIEW_SELECTORS: &[&str] = &["fzf", "sk"];
@@ -82,7 +83,7 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
 
     let query = filter.query.clone().unwrap_or_default();
     let result = pipeline::run_pipeline(&pipeline::PipelineParams {
-        resolve_fields,
+        resolve_fields: resolve_fields.clone(),
         resolve_opts: resolver::ResolveOpts::default_with_title_limit(30),
         filters: filter.to_filters(),
         since: filter.since_time()?,
@@ -95,8 +96,15 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
         running: filter.running,
         require_resume_cmd: false,
     })?;
-    let sessions = result.sessions;
-    let _ = result.pid_map;
+    let mut sessions = result.sessions;
+
+    remote::merge_into_sessions(
+        &mut sessions,
+        filter,
+        &resolve_fields,
+        sort_field,
+        SortOrder::Desc,
+    )?;
 
     if sessions.is_empty() {
         return Err("No sessions found.".to_string());
@@ -187,13 +195,13 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
         let exe_quoted = shell_quote(&exe.to_string_lossy());
         if ltsv {
-            // In LTSV mode, {1} is "path:'/quoted/path'" — strip prefix via shell
+            // The key column is already shell-quoted, so use fzf raw mode.
             selector_args.push(format!(
-                "--preview=p={{1}}; p=${{p#path:}}; {} show --color \"$p\"",
+                "--preview=p={{r1}}; p=${{p#path:}}; {} show --color \"$p\"",
                 exe_quoted
             ));
         } else {
-            selector_args.push(format!("--preview={} show --color {{1}}", exe_quoted));
+            selector_args.push(format!("--preview={} show --color {{r1}}", exe_quoted));
         }
         selector_args.push("--preview-window=right:60%:wrap".to_string());
     }
@@ -224,6 +232,13 @@ pub fn run_project(
     let preview = use_preview(ia, &selector);
 
     let resolved = ListProjectsResolvedArgs::from_interactive(args)?;
+
+    // Remote projects not supported in interactive mode (cwd is not a local path)
+    if !filter.remote.is_empty() {
+        eprintln!(
+            "Warning: --remote is ignored in interactive project mode (use non-interactive listing)"
+        );
+    }
 
     let records = projects::build_project_records(&resolved, filter)?;
 
@@ -331,7 +346,7 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
             Field::Title,
         ]
     });
-    let mut resolve_fields = vec![Field::Path, Field::Id];
+    let mut resolve_fields = vec![Field::Path, Field::Id, Field::ModifiedAt];
     for f in &display_fields {
         if !resolve_fields.contains(f) {
             resolve_fields.push(*f);
@@ -339,7 +354,7 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
     }
 
     let result = pipeline::run_pipeline(&pipeline::PipelineParams {
-        resolve_fields,
+        resolve_fields: resolve_fields.clone(),
         resolve_opts: resolver::ResolveOpts::default_with_title_limit(30),
         filters: filter.to_filters(),
         since: filter.since_time()?,
@@ -352,8 +367,15 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
         running: filter.running,
         require_resume_cmd: false,
     })?;
-    let sessions = result.sessions;
-    let _ = result.pid_map;
+    let mut sessions = result.sessions;
+
+    remote::merge_into_sessions(
+        &mut sessions,
+        filter,
+        &resolve_fields,
+        Field::ModifiedAt,
+        SortOrder::Desc,
+    )?;
 
     if sessions.is_empty() {
         return Err("No sessions found.".to_string());
@@ -410,7 +432,7 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
     if preview {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
         selector_args.push(format!(
-            "--preview={} show --color {{1}}",
+            "--preview={} show --color {{r1}}",
             shell_quote(&exe.to_string_lossy())
         ));
         selector_args.push("--preview-window=right:60%:wrap".to_string());
@@ -455,7 +477,7 @@ pub fn run_resume(
             Field::Title,
         ]
     });
-    let mut resolve_fields = vec![Field::Path, Field::Id, Field::ResumeCmd];
+    let mut resolve_fields = vec![Field::Path, Field::Id, Field::ResumeCmd, Field::ModifiedAt];
     for f in &display_fields {
         if !resolve_fields.contains(f) {
             resolve_fields.push(*f);
@@ -463,7 +485,7 @@ pub fn run_resume(
     }
 
     let result = pipeline::run_pipeline(&pipeline::PipelineParams {
-        resolve_fields,
+        resolve_fields: resolve_fields.clone(),
         resolve_opts: resolver::ResolveOpts::default_with_title_limit(30),
         filters: filter.to_filters(),
         since: filter.since_time()?,
@@ -476,8 +498,17 @@ pub fn run_resume(
         running: filter.running,
         require_resume_cmd: true,
     })?;
-    let sessions = result.sessions;
-    let _ = result.pid_map;
+    let mut sessions = result.sessions;
+
+    // Remote sessions get resume_cmd from remote ah, so require_resume_cmd
+    // filtering is already done on the remote side.
+    remote::merge_into_sessions(
+        &mut sessions,
+        filter,
+        &resolve_fields,
+        Field::ModifiedAt,
+        SortOrder::Desc,
+    )?;
 
     if sessions.is_empty() {
         return Err("No resumable sessions found.".to_string());
@@ -549,11 +580,11 @@ pub fn run_resume(
         let exe_quoted = shell_quote(&exe.to_string_lossy());
         if ltsv {
             selector_args.push(format!(
-                "--preview=p={{1}}; p=${{p#path:}}; {} show --color \"$p\"",
+                "--preview=p={{r1}}; p=${{p#path:}}; {} show --color \"$p\"",
                 exe_quoted
             ));
         } else {
-            selector_args.push(format!("--preview={} show --color {{1}}", exe_quoted));
+            selector_args.push(format!("--preview={} show --color {{r1}}", exe_quoted));
         }
         selector_args.push("--preview-window=right:60%:wrap".to_string());
     }
@@ -568,6 +599,17 @@ pub fn run_resume(
     let path_str = strip_shell_quote(quoted);
     if path_str.is_empty() {
         return Ok(());
+    }
+
+    if let Some((remote_def, remote_ref)) = remote::parse_remote_path(&path_str) {
+        if args.print {
+            println!(
+                "{}",
+                remote::format_remote_resume_command(remote_def, remote_ref, &args.extra_args,)
+            );
+            return Ok(());
+        }
+        remote::exec_remote_resume(remote_def, remote_ref, args);
     }
 
     let path = PathBuf::from(&path_str);
@@ -623,6 +665,13 @@ pub fn run_memory(
 
     // Build resolved args with Path always included for key
     let resolved = MemoryResolvedArgs::from_args_interactive(args)?;
+
+    // Remote memory not supported in interactive mode (path is not a local file)
+    if !filter.remote.is_empty() {
+        eprintln!(
+            "Warning: --remote is ignored in interactive memory mode (use non-interactive listing)"
+        );
+    }
 
     let records = memory::build_memory_records(&resolved, filter)?;
 

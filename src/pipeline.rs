@@ -32,7 +32,6 @@ pub struct PipelineParams {
 /// Result of the pipeline execution.
 pub struct PipelineResult {
     pub sessions: Vec<Session>,
-    pub pid_map: std::collections::HashMap<String, u32>,
 }
 
 /// Unified session pipeline: collect → filter → resolve → sort.
@@ -337,7 +336,7 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
         );
     }
 
-    Ok(PipelineResult { sessions, pid_map })
+    Ok(PipelineResult { sessions })
 }
 
 /// Fast case-insensitive byte search for ASCII patterns using SIMD-accelerated memchr.
