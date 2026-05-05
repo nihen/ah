@@ -225,6 +225,7 @@ Global options:
   -i, --interactive       Interactive mode via fuzzy finder (fzf/sk)
   -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
   --no-preview            Disable preview in interactive mode
+  --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
   --running               Show only currently running sessions (Claude only for now)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
@@ -279,6 +280,8 @@ Default output (when no format flag is given):
 
 Interactive mode:
   -i, --interactive       Browse sessions via fuzzy finder; prints selected path
+                          With -o: prints selected fields as TSV instead of path
+  --interactive-display <FIELDS>  Override display columns in fuzzy finder
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
   --no-preview            Disable transcript preview (enabled by default for fzf, sk)
 
@@ -295,7 +298,7 @@ Usage:
 
 If SESSION is omitted, ah shows the latest session matching stdin, -q, and other filters.
 
-Options:
+Transcript output:
   --head N                Show first N messages only
   --pretty                Pretty-print with colors (default)
   --raw                   Output raw session file content
@@ -304,12 +307,22 @@ Options:
   -f, --follow            Follow session output in real-time (like tail -f)
   --highlight <PATTERN>   Highlight matching text in pretty output (case-insensitive; requires color)
 
+Metadata output:
+  -o, --fields <FIELDS>   Output session metadata as TSV instead of transcript
+  --tsv                   Metadata mode without -o (default field: title)
+
 Interactive mode:
   -i, --interactive       Select session via fuzzy finder then show it
-  -o, --fields <FIELDS>   Display fields in interactive mode (default: agent,project,modified_at,title)
+  --interactive-display <FIELDS>  Override display columns in fuzzy finder
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
   --no-preview            Disable transcript preview
   ctrl-s (fzf only)       Toggle preview search: highlight + scroll to match / reset
+
+Examples:
+  ah show                            # show latest session transcript
+  ah show -o title                    # output title of latest session
+  ah show -o agent,title             # output agent and title as TSV
+  ah show -i -o title                # select session, output title
 
 Global options are also available (see ah -h).
 ```

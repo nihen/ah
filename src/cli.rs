@@ -6,7 +6,25 @@ use chrono::{Local, NaiveDate, NaiveDateTime, TimeDelta};
 use clap::{Parser, Subcommand};
 use const_format::concatcp;
 
-/// Parse a comma-separated list of field names into typed field values.
+/// Move the *first* `Field::Path` occurrence to position 0 of an
+/// already-parsed field list (preserving the order — and any duplicates —
+/// of the other fields). Used by `ah show -o` / `ah log -i -o` so piping
+/// output back into another `ah` invocation finds the path in the first
+/// column regardless of where the user wrote it (`-o title,path`
+/// round-trips the same as `-o path,title`). Duplicate `path` entries are
+/// preserved so `-o title,path,path` still emits the requested column count.
+pub fn hoist_path_first(mut fields: Vec<Field>) -> Vec<Field> {
+    let Some(idx) = fields.iter().position(|f| *f == Field::Path) else {
+        return fields;
+    };
+    if idx == 0 {
+        return fields;
+    }
+    let path = fields.remove(idx);
+    fields.insert(0, path);
+    fields
+}
+
 fn parse_field_list<F: FromStr<Err = String>>(s: &str) -> Result<Vec<F>, String> {
     let mut fields = Vec::new();
     for name in s.split(',') {
@@ -630,6 +648,7 @@ pub enum ShowFormat {
     Raw,
     Json,
     Md,
+    Tsv,
 }
 
 #[derive(Parser, Debug)]
@@ -642,20 +661,24 @@ pub struct ShowArgs {
     pub head: Option<usize>,
 
     /// Pretty-print with colors (default)
-    #[arg(long = "pretty", conflicts_with_all = ["raw", "json", "md"])]
+    #[arg(long = "pretty", conflicts_with_all = ["raw", "json", "md", "tsv"])]
     pretty: bool,
 
     /// Output raw session file content
-    #[arg(long = "raw", conflicts_with_all = ["pretty", "json", "md"])]
+    #[arg(long = "raw", conflicts_with_all = ["pretty", "json", "md", "tsv"])]
     raw: bool,
 
     /// Output normalized JSON Lines ({"role":"user","text":"..."})
-    #[arg(long = "json", conflicts_with_all = ["pretty", "raw", "md"])]
+    #[arg(long = "json", conflicts_with_all = ["pretty", "raw", "md", "tsv"])]
     json: bool,
 
     /// Output as Markdown (## User / ## Assistant headers)
-    #[arg(long = "md", conflicts_with_all = ["pretty", "raw", "json"])]
+    #[arg(long = "md", conflicts_with_all = ["pretty", "raw", "json", "tsv"])]
     md: bool,
+
+    /// Output session metadata fields as TSV (use with -o; default field: title)
+    #[arg(long = "tsv", conflicts_with_all = ["pretty", "raw", "json", "md"])]
+    pub tsv: bool,
 
     /// Follow session output in real-time (like tail -f)
     #[arg(short = 'f', long = "follow")]
@@ -683,6 +706,7 @@ impl ShowArgs {
             raw: false,
             json: false,
             md: false,
+            tsv: false,
             follow: false,
             highlight,
             session,
@@ -696,6 +720,8 @@ impl ShowArgs {
             ShowFormat::Json
         } else if self.md {
             ShowFormat::Md
+        } else if self.tsv {
+            ShowFormat::Tsv
         } else {
             ShowFormat::Pretty
         }
@@ -703,7 +729,68 @@ impl ShowArgs {
 
     /// Whether this command should use the pager.
     pub fn wants_pager(&self) -> bool {
-        !self.follow && matches!(self.format(), ShowFormat::Pretty | ShowFormat::Md)
+        if self.follow {
+            return false;
+        }
+        // Metadata mode (-o or --tsv) emits a single short TSV line — never page.
+        if self.common.fields.is_some() || self.tsv {
+            return false;
+        }
+        matches!(self.format(), ShowFormat::Pretty | ShowFormat::Md)
+    }
+
+    /// Parse -o fields for metadata output mode.
+    /// -o implies metadata mode (TSV output). --tsv without -o defaults to title.
+    /// Returns an error when -o is combined with transcript-only flags
+    /// (--raw/--json/--md/--follow); those would otherwise be silently ignored.
+    /// `Field::Path` is hoisted to the first column when present so the output
+    /// can be piped back into `ah show`/`ah resume` (which read the first
+    /// TSV field as the session reference).
+    pub fn meta_fields(&self) -> Result<Option<Vec<Field>>, String> {
+        let explicit = self.common.fields.is_some();
+        let fields = match self.common.parse_fields()? {
+            Some(fields) if fields.is_empty() => {
+                return Err("-o/--fields requires at least one field name (got empty list)".into());
+            }
+            Some(fields) => Some(hoist_path_first(fields)),
+            None if self.tsv => Some(vec![Field::Title]),
+            None => None,
+        };
+        if fields.is_some() {
+            // --tsv already conflicts with raw/json/md at the clap level; the
+            // remaining gap is `-o` without `--tsv`, plus `--head` / `--pretty`
+            // which only apply to transcript output. Reject explicitly so
+            // mistakes in scripts don't get silently swallowed.
+            if explicit && (self.raw || self.json || self.md || self.pretty) {
+                return Err(
+                    "-o/--fields cannot be combined with --raw/--json/--md/--pretty \
+                     (these flags select transcript output; metadata mode is implied by -o)"
+                        .into(),
+                );
+            }
+            if self.follow {
+                return Err(
+                    "-o/--fields and --tsv cannot be combined with --follow \
+                     (metadata mode emits a single line; --follow only applies to pretty transcript)"
+                        .into(),
+                );
+            }
+            if self.head.is_some() {
+                return Err(
+                    "-o/--fields and --tsv cannot be combined with --head \
+                     (metadata mode emits one line per session; --head only limits transcript messages)"
+                        .into(),
+                );
+            }
+            if self.highlight.is_some() {
+                return Err(
+                    "-o/--fields and --tsv cannot be combined with --highlight \
+                     (metadata mode emits TSV without ANSI; --highlight only applies to pretty transcript)"
+                        .into(),
+                );
+            }
+        }
+        Ok(fields)
     }
 }
 
@@ -800,6 +887,49 @@ pub struct InteractiveArgs {
     /// Disable preview in interactive mode
     #[arg(long = "no-preview", global = true, requires = "interactive")]
     pub no_preview: bool,
+
+    /// Override display columns in interactive selector (comma-separated field names)
+    #[arg(long = "interactive-display", global = true, requires = "interactive")]
+    pub interactive_display: Option<String>,
+}
+
+impl InteractiveArgs {
+    /// Parse `--interactive-display` for the picker.
+    ///
+    /// `allow_matched` controls whether `Field::Matched` may appear. `ah show
+    /// -i` runs the picker through query-aware ResolveOpts so `matched`
+    /// populates correctly there. `ah log -i` still uses the cheap
+    /// `default_with_title_limit(30)` opts for the picker pass, so `matched`
+    /// would always be empty and `pipeline.rs` would drop every candidate;
+    /// reject it there.
+    pub fn parse_display_fields(&self, allow_matched: bool) -> Result<Option<Vec<Field>>, String> {
+        let Some(spec) = self.interactive_display.as_ref() else {
+            return Ok(None);
+        };
+        let fields = parse_field_list::<Field>(spec)?;
+        if fields.is_empty() {
+            return Err(
+                "--interactive-display requires at least one field name (got empty list)".into(),
+            );
+        }
+        if fields.contains(&Field::Path) {
+            return Err(
+                "--interactive-display cannot include `path` (it is used as the hidden \
+                 selection key, not a display column). Use a different field set."
+                    .into(),
+            );
+        }
+        if !allow_matched && fields.contains(&Field::Matched) {
+            return Err(
+                "--interactive-display cannot include `matched` for `ah log -i` \
+                 (the log picker uses display-only resolve opts that don't populate \
+                 this field). Use `-o matched` for post-selection output, or use \
+                 `ah show -i --interactive-display matched` which has query-aware opts."
+                    .into(),
+            );
+        }
+        Ok(Some(fields))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1430,6 +1560,7 @@ Global options:
   -i, --interactive       Interactive mode via fuzzy finder (fzf/sk)
   -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
   --no-preview            Disable preview in interactive mode
+  --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
   --running               Show only currently running sessions (Claude only for now)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
@@ -1549,6 +1680,8 @@ Default output (when no format flag is given):
 
 Interactive mode:
   -i, --interactive       Browse sessions via fuzzy finder; prints selected path
+                          With -o: prints selected fields as TSV instead of path
+  --interactive-display <FIELDS>  Override display columns in fuzzy finder
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
   --no-preview            Disable transcript preview (enabled by default for fzf, sk)
   ctrl-s (fzf only)       Toggle preview search: highlight + scroll to match / reset
@@ -1565,7 +1698,7 @@ Usage:
 
 If SESSION is omitted, ah shows the latest session matching stdin, -q, and other filters.
 
-Options:
+Transcript output:
   --head N                Show first N messages only
   --pretty                Pretty-print with colors (default)
   --raw                   Output raw session file content
@@ -1574,12 +1707,22 @@ Options:
   -f, --follow            Follow session output in real-time (like tail -f)
   --highlight <PATTERN>   Highlight matching text in pretty output (case-insensitive; requires color)
 
+Metadata output:
+  -o, --fields <FIELDS>   Output session metadata as TSV instead of transcript
+  --tsv                   Metadata mode without -o (default field: title)
+
 Interactive mode:
   -i, --interactive       Select session via fuzzy finder then show it
-  -o, --fields <FIELDS>   Display fields in interactive mode (default: agent,project,modified_at,title)
+  --interactive-display <FIELDS>  Override display columns in fuzzy finder
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
   --no-preview            Disable transcript preview
   ctrl-s (fzf only)       Toggle preview search: highlight + scroll to match / reset
+
+Examples:
+  ah show                            # show latest session transcript
+  ah show -o title                    # output title of latest session
+  ah show -o agent,title             # output agent and title as TSV
+  ah show -i -o title                # select session, output title
 
 ",
     GLOBAL_OPTIONS

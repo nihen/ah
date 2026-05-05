@@ -302,7 +302,41 @@ fn looks_like_windows_drive(name: &str, path: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Exec `ssh host ah show <path> [flags]` — replaces current process.
-pub fn exec_remote_show(remote: &RemoteDef, remote_path: &str, args: &crate::cli::ShowArgs) -> ! {
+/// Metadata mode (`-o` / `--tsv`) is captured and re-tagged locally so the
+/// `path` field comes back as `<remote>:/<abs>` instead of the remote-side
+/// raw local path; otherwise the call falls through to a bare `exec_ssh`.
+pub fn exec_remote_show(
+    remote: &RemoteDef,
+    remote_path: &str,
+    args: &crate::cli::ShowArgs,
+    filter: &crate::cli::FilterArgs,
+) -> ! {
+    // The remote path is forwarded verbatim. The remote side's
+    // `resolve_session_ref` does raw-first / TSV-decoded-fallback, so
+    // `mydev:C:\foo` (raw typed) and `mydev:C:\\foo` (TSV-escaped pipe
+    // output) both resolve correctly without any local decoding here —
+    // local decoding would corrupt raw refs that legitimately contain
+    // `\t` / `\n` / `\r` sequences in the remote path.
+    let metadata_mode = args.common.fields.is_some() || args.tsv;
+    if metadata_mode {
+        // `meta_fields()` is guaranteed `Some(_)` here because metadata_mode
+        // is true (either `-o` was set, or `--tsv` defaults to `[Title]`).
+        match args.meta_fields() {
+            Ok(Some(fields)) => match run_remote_show_meta(remote, remote_path, &fields, filter) {
+                Ok(()) => process::exit(0),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                }
+            },
+            Ok(None) => unreachable!("metadata_mode is true => meta_fields() is Some"),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
     let format = args.format();
     let mut ah_args = vec![remote.ah_path.clone(), "show".to_string()];
 
@@ -310,7 +344,17 @@ pub fn exec_remote_show(remote: &RemoteDef, remote_path: &str, args: &crate::cli
         crate::cli::ShowFormat::Raw => ah_args.push("--raw".to_string()),
         crate::cli::ShowFormat::Json => ah_args.push("--json".to_string()),
         crate::cli::ShowFormat::Md => ah_args.push("--md".to_string()),
+        crate::cli::ShowFormat::Tsv => ah_args.push("--tsv".to_string()),
         crate::cli::ShowFormat::Pretty => {}
+    }
+    // Forward query/search-mode so query-dependent fields like `matched`
+    // resolve on the remote against the same query the user supplied.
+    if let Some(q) = filter.query.as_deref() {
+        ah_args.push("-q".to_string());
+        ah_args.push(q.to_string());
+    }
+    if filter.prompt_only {
+        ah_args.push("--prompt-only".to_string());
     }
     if let Some(n) = args.head {
         ah_args.push("--head".to_string());
@@ -332,11 +376,166 @@ pub fn exec_remote_show(remote: &RemoteDef, remote_path: &str, args: &crate::cli
 
     ah_args.push(remote_path.to_string());
 
-    // Only allocate a pty for pretty/follow modes. Non-tty formats (raw/json/md)
-    // would otherwise get LF→CRLF translation and a "Pseudo-terminal will not be
-    // allocated" warning when stdout/stdin is piped.
+    // Only allocate a pty for pretty/follow modes. Non-tty formats
+    // (raw/json/md) would otherwise get LF→CRLF translation and a
+    // "Pseudo-terminal will not be allocated" warning when stdout/stdin
+    // is piped.
     let want_tty = matches!(format, crate::cli::ShowFormat::Pretty) || args.follow;
     exec_ssh(&remote.host, &ah_args, want_tty)
+}
+
+/// Run `ssh host ah show <path> -o <fields> ...` and stream the captured
+/// TSV with the `path` column re-tagged as `<remote>:<remote_path>` and
+/// `resume_cmd` wrapped with `ssh -t -- <host> ...` so the local consumer
+/// can run it directly. Streaming line-by-line keeps memory flat for
+/// unbounded fields like `transcript` / `messages` / `responses`.
+pub fn run_remote_show_meta(
+    remote: &RemoteDef,
+    remote_path: &str,
+    fields: &[Field],
+    filter: &crate::cli::FilterArgs,
+) -> Result<(), String> {
+    let field_names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
+    let mut ah_args = vec![
+        remote.ah_path.clone(),
+        "show".to_string(),
+        "-o".to_string(),
+        field_names.join(","),
+    ];
+    if let Some(q) = filter.query.as_deref() {
+        ah_args.push("-q".to_string());
+        ah_args.push(q.to_string());
+    }
+    if filter.prompt_only {
+        ah_args.push("--prompt-only".to_string());
+    }
+    ah_args.push("--no-color".to_string());
+    ah_args.push("--no-pager".to_string());
+    ah_args.push(remote_path.to_string());
+
+    let path_idxs: Vec<usize> = fields
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| (*f == Field::Path).then_some(i))
+        .collect();
+    let resume_idxs: Vec<usize> = fields
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| (*f == Field::ResumeCmd).then_some(i))
+        .collect();
+    run_ssh_streaming(remote, &ah_args, |line| {
+        let out = retag_remote_show_meta_line(line, &path_idxs, &resume_idxs, remote);
+        println!("{}", out);
+    })
+}
+
+/// Re-tag the `path` and `resume_cmd` columns of a single remote
+/// `ah show -o ...` TSV line. `path` becomes `<remote_name>:<remote_path>`;
+/// `resume_cmd` is wrapped in `ssh -t -- <host> <quoted command>`. Both are
+/// decoded via `unescape_tsv` before transformation and re-escaped via
+/// `escape_tsv` afterwards so embedded tabs/newlines stay TSV-safe. All
+/// duplicate `path` / `resume_cmd` columns are rewritten — taking only
+/// the first would silently leak an untagged remote path / unwrapped
+/// resume command in the later column(s).
+pub(crate) fn retag_remote_show_meta_line(
+    line: &str,
+    path_idxs: &[usize],
+    resume_idxs: &[usize],
+    remote: &RemoteDef,
+) -> String {
+    if path_idxs.is_empty() && resume_idxs.is_empty() {
+        return line.to_string();
+    }
+    let mut cols: Vec<String> = line.split('\t').map(str::to_string).collect();
+    for &idx in path_idxs {
+        if let Some(col) = cols.get_mut(idx) {
+            let decoded = crate::output::unescape_tsv(col);
+            *col = crate::output::escape_tsv(&format!("{}:{}", remote.name, decoded));
+        }
+    }
+    for &idx in resume_idxs {
+        if let Some(col) = cols.get_mut(idx) {
+            let decoded = crate::output::unescape_tsv(col);
+            let wrapped = format!(
+                "ssh -t -- {} {}",
+                shell_quote(&remote.host),
+                shell_quote(&decoded)
+            );
+            *col = crate::output::escape_tsv(&wrapped);
+        }
+    }
+    cols.join("\t")
+}
+
+/// Spawn `ssh -o BatchMode=yes -o ConnectTimeout=10 -- <host> <cmd>` and
+/// invoke `on_line` for each newline-terminated stdout chunk. Streaming
+/// avoids buffering large `transcript`/`messages` payloads in memory.
+/// Stderr is drained concurrently in a background thread so a verbose
+/// remote can't fill its stderr pipe and block stdout progress.
+fn run_ssh_streaming<F: FnMut(&str)>(
+    remote: &RemoteDef,
+    args: &[String],
+    mut on_line: F,
+) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Read};
+    let remote_cmd = quote_remote_command(args);
+    let debug = color::is_debug();
+    if debug {
+        eprintln!(
+            "[debug] remote '{}': ssh {} {}",
+            remote.name, remote.host, remote_cmd
+        );
+    }
+    let mut child = process::Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("--")
+        .arg(&remote.host)
+        .arg(&remote_cmd)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("SSH to remote '{}' ({}): {}", remote.name, remote.host, e))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("SSH '{}': stdout unavailable", remote.name))?;
+    // Drain stderr concurrently so a verbose remote can't deadlock us by
+    // filling the stderr pipe before we finish reading stdout.
+    let stderr_handle = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = stderr.read_to_string(&mut buf);
+            buf
+        })
+    });
+    for line in BufReader::new(stdout).lines() {
+        let line = line.map_err(|e| format!("SSH '{}': stdout read: {}", remote.name, e))?;
+        on_line(&line);
+    }
+    let stderr_buf = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let status = child
+        .wait()
+        .map_err(|e| format!("SSH '{}': wait: {}", remote.name, e))?;
+    if !status.success() {
+        let trimmed = stderr_buf.trim();
+        if trimmed.contains("No sessions found")
+            || trimmed.contains("No projects found")
+            || trimmed.contains("No memory files found")
+            || trimmed.contains("No session files found")
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "Remote '{}' ({}): {}",
+            remote.name, remote.host, trimmed
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +548,8 @@ pub fn exec_remote_resume(
     remote_ref: &str,
     args: &crate::cli::ResumeArgs,
 ) -> ! {
+    // Forward the remote ref verbatim — see `exec_remote_show` for the
+    // raw-first/decoded-fallback rationale (handled remote-side).
     let mut ah_args = vec![remote.ah_path.clone(), "resume".to_string()];
 
     if args.print {
@@ -773,6 +974,76 @@ fn exec_ssh(_host: &str, _args: &[String], _want_tty: bool) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_remote() -> RemoteDef {
+        RemoteDef {
+            name: "mydev".to_string(),
+            host: "mydev.example.com".to_string(),
+            ah_path: "ah".to_string(),
+        }
+    }
+
+    #[test]
+    fn retag_show_meta_prefixes_path_column() {
+        let remote = fake_remote();
+        let line = "/srv/sessions/abc.jsonl\tcodex-001";
+        let out = retag_remote_show_meta_line(line, &[0], &[], &remote);
+        assert_eq!(out, "mydev:/srv/sessions/abc.jsonl\tcodex-001");
+    }
+
+    #[test]
+    fn retag_show_meta_no_path_or_resume_passes_through() {
+        // Neither index set: the line is forwarded verbatim.
+        let remote = fake_remote();
+        let line = "codex\tadd redis caching";
+        assert_eq!(
+            retag_remote_show_meta_line(line, &[], &[], &remote),
+            "codex\tadd redis caching"
+        );
+    }
+
+    #[test]
+    fn retag_show_meta_decodes_then_re_encodes_path() {
+        // Remote emits a path with a literal tab, `escape_tsv`'d to `\t`.
+        // Re-tagging must decode, prefix, and re-encode so the row stays
+        // well-formed and the path column reads as `<remote>:<original>`.
+        let remote = fake_remote();
+        let line = "/srv/odd\\ttab.jsonl\tcodex-001";
+        let out = retag_remote_show_meta_line(line, &[0], &[], &remote);
+        assert_eq!(out, "mydev:/srv/odd\\ttab.jsonl\tcodex-001");
+    }
+
+    #[test]
+    fn retag_show_meta_wraps_resume_cmd_with_ssh() {
+        // Remote-side resume_cmd is a shell command. Wrapping with
+        // `ssh -t -- <host> <quoted command>` makes it executable from the
+        // local machine via `sh`.
+        let remote = fake_remote();
+        let line = "abc-001\tcd '/srv/repo' && 'codex' 'resume' 'abc-001'";
+        let out = retag_remote_show_meta_line(line, &[], &[1], &remote);
+        // Column 0 (id) is unchanged; column 1 is wrapped.
+        let cols: Vec<&str> = out.split('\t').collect();
+        assert_eq!(cols[0], "abc-001");
+        assert!(
+            cols[1].starts_with("ssh -t -- 'mydev.example.com' "),
+            "expected SSH wrap, got: {:?}",
+            cols[1]
+        );
+        assert!(
+            cols[1].contains("codex"),
+            "wrapped resume_cmd should still contain the agent name: {:?}",
+            cols[1]
+        );
+    }
+
+    #[test]
+    fn retag_show_meta_handles_duplicate_path_columns() {
+        // `-o path,id,path` has two `path` columns; both must be re-tagged.
+        let remote = fake_remote();
+        let line = "/srv/a.jsonl\tcodex-001\t/srv/a.jsonl";
+        let out = retag_remote_show_meta_line(line, &[0, 2], &[], &remote);
+        assert_eq!(out, "mydev:/srv/a.jsonl\tcodex-001\tmydev:/srv/a.jsonl");
+    }
 
     #[test]
     fn test_build_remote_args_minimal() {
