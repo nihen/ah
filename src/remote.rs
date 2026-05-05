@@ -319,6 +319,9 @@ pub fn exec_remote_show(remote: &RemoteDef, remote_path: &str, args: &crate::cli
     if args.follow {
         ah_args.push("--follow".to_string());
     }
+    if let Some(pattern) = args.highlight.as_deref() {
+        ah_args.push(format!("--highlight={}", pattern));
+    }
     if crate::color::use_color() {
         ah_args.push("--color".to_string());
     } else {

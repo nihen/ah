@@ -30,6 +30,7 @@ Interactive mode:
   -i, --interactive       Browse sessions via fuzzy finder; prints selected path
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
   --no-preview            Disable transcript preview (enabled by default for fzf, sk)
+  ctrl-s (fzf only)       Toggle preview search: highlight + scroll to match / reset
 
 Global options:
   -a, --all               Show all sessions (disable default cwd filtering)
