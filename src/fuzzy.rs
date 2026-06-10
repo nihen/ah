@@ -64,35 +64,27 @@ fn use_preview(ia: &InteractiveArgs, selector: &str) -> bool {
     !ia.no_preview && PREVIEW_SELECTORS.contains(&selector_bin)
 }
 
-/// Detect whether the configured fzf binary supports the actions and
-/// environment variables the preview-search bind needs. The ctrl-s toggle
-/// reads `$FZF_INPUT_STATE` to decide which branch to take, and that env
-/// var was added in fzf 0.62. On older fzf the variable is always unset,
-/// so the toggle would get stuck always taking the "enabled" branch and
-/// could not flip state back. Gate on 0.62 so the bind is silently
-/// skipped on older fzf and interactive mode still opens cleanly.
+/// Detect the fzf version so the preview-search binds can be gated on the
+/// features they need (see `push_preview_search_binds`).
 ///
 /// Stock fzf prints `MAJOR.MINOR.PATCH (build info)` to stdout, but
 /// distro/packaged builds may prepend `fzf ` or include other prefixes.
 /// Scan the entire output for the first `MAJOR.MINOR` numeric substring
 /// rather than relying on the first whitespace token, so we don't silently
 /// disable the feature on supported fzf with non-standard version banners.
-fn fzf_supports_preview_search(selector: &str) -> bool {
+fn fzf_version(selector: &str) -> Option<(u32, u32)> {
     let output = std::process::Command::new(selector)
         .arg("--version")
-        .output();
-    let Ok(output) = output else {
-        return false;
-    };
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     static VERSION_RE: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"(\d+)\.(\d+)").unwrap());
-    let Some(caps) = VERSION_RE.captures(&stdout) else {
-        return false;
-    };
-    let major: u32 = caps[1].parse().unwrap_or(0);
-    let minor: u32 = caps[2].parse().unwrap_or(0);
-    major > 0 || minor >= 62
+    let caps = VERSION_RE.captures(&stdout)?;
+    Some((caps[1].parse().unwrap_or(0), caps[2].parse().unwrap_or(0)))
 }
 
 /// Build LTSV-format input for selector (legacy mode). The hidden key
@@ -865,9 +857,14 @@ fn push_preview_search_binds(
         return;
     }
     // ctrl-s toggle reads $FZF_INPUT_STATE which was added in fzf 0.62.
-    // On older fzf, silently skip these binds so interactive mode still
-    // opens cleanly without a half-broken toggle.
-    if !fzf_supports_preview_search(selector) {
+    // On older fzf the variable is always unset, so the toggle would get
+    // stuck always taking the "enabled" branch and could not flip state
+    // back. Silently skip these binds so interactive mode still opens
+    // cleanly without a half-broken toggle.
+    let Some(version) = fzf_version(selector) else {
+        return;
+    };
+    if version < (0, 62) {
         return;
     }
     let (prefix, path_ref) = if ltsv {
@@ -909,10 +906,17 @@ fn push_preview_search_binds(
     // the top candidate doesn't change) and scroll to the first match.
     // bg-transform runs the offset calculation in the background so typing
     // stays responsive even when `ah show | grep` is slow on large
-    // transcripts (transform would block the UI synchronously).
+    // transcripts, but it only exists since fzf 0.63 — on 0.62 fall back
+    // to the synchronous transform (older fzf rejects unknown actions and
+    // exits with status 2 instead of opening at all).
+    let transform_action = if version >= (0, 63) {
+        "bg-transform"
+    } else {
+        "transform"
+    };
     selector_args.push(format!(
-        "--bind=change:refresh-preview+bg-transform({})",
-        scroll_transform
+        "--bind=change:refresh-preview+{}({})",
+        transform_action, scroll_transform
     ));
 
     // ctrl-s toggles candidate-list filtering. Off = user can keep typing
@@ -1057,4 +1061,104 @@ fn run_selector(selector: &str, args: &[String], input: &str) -> Result<Option<S
     }
 
     Ok(Some(line))
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Write a fake `fzf` that only answers `--version` with the given
+    /// banner, so the version-dependent bind selection can be exercised
+    /// without a real fzf install.
+    fn fake_fzf(dir: &std::path::Path, banner: &str, exit_code: i32) -> String {
+        let path = dir.join("fzf");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "#!/bin/sh\necho '{}'\nexit {}", banner, exit_code).unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // On Linux, a child forked by a concurrent test between create and
+        // close above inherits the write fd until its own exec, so exec'ing
+        // this script can transiently fail with ETXTBSY (checked per inode,
+        // so writing elsewhere and renaming would not help). Retry until one
+        // exec succeeds: success proves no write fd remains, and nothing
+        // reopens the file for writing afterwards, so the spawns under test
+        // cannot hit the race.
+        let mut last_err = None;
+        for _ in 0..100 {
+            match std::process::Command::new(&path).arg("--version").output() {
+                Ok(_) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            panic!("fake fzf never became executable: {e}");
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    fn binds_for(banner: &str) -> Vec<String> {
+        binds_for_exit(banner, 0)
+    }
+
+    fn binds_for_exit(banner: &str, exit_code: i32) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let selector = fake_fzf(dir.path(), banner, exit_code);
+        let mut args = vec!["--preview='ah' show --color {r1}".to_string()];
+        push_preview_search_binds(&mut args, "'ah'", false, "path", &selector);
+        args
+    }
+
+    fn change_bind(args: &[String]) -> &String {
+        args.iter()
+            .find(|a| a.starts_with("--bind=change:"))
+            .unwrap_or_else(|| panic!("no change bind in {args:?}"))
+    }
+
+    #[test]
+    fn preview_search_uses_bg_transform_on_fzf_063_and_later() {
+        let args = binds_for("0.63.0 (test)");
+        assert!(
+            change_bind(&args).contains("refresh-preview+bg-transform("),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn preview_search_falls_back_to_transform_on_fzf_062() {
+        let args = binds_for("0.62.0 (test)");
+        let bind = change_bind(&args);
+        assert!(bind.contains("refresh-preview+transform("), "{bind}");
+        assert!(!bind.contains("bg-transform"), "{bind}");
+    }
+
+    #[test]
+    fn preview_search_skipped_on_fzf_before_062() {
+        let args = binds_for("0.61.3 (test)");
+        assert!(!args.iter().any(|a| a.starts_with("--bind=")), "{args:?}");
+    }
+
+    #[test]
+    fn preview_search_skipped_when_version_check_fails() {
+        let args = binds_for_exit("0.70.0 (test)", 1);
+        assert!(!args.iter().any(|a| a.starts_with("--bind=")), "{args:?}");
+    }
+
+    #[test]
+    fn preview_search_parses_prefixed_version_banner() {
+        let args = binds_for("fzf 0.64.0 (debian)");
+        assert!(
+            change_bind(&args).contains("refresh-preview+bg-transform("),
+            "{args:?}"
+        );
+    }
 }
