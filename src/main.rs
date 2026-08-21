@@ -675,7 +675,7 @@ fn run_status(filter: &cli::FilterArgs, output_format: cli::OutputFormat) -> Res
 }
 
 /// Build a map of sessionId → PID for currently running sessions.
-/// Currently Claude only (reads ~/.claude/sessions/<pid>.json).
+/// Claude (~/.claude/sessions/<pid>.json) and Grok (~/.grok/active_sessions.json).
 pub fn build_pid_map() -> std::collections::HashMap<String, u32> {
     let mut map = std::collections::HashMap::new();
 
@@ -689,13 +689,38 @@ pub fn build_pid_map() -> std::collections::HashMap<String, u32> {
             if path.extension().is_some_and(|e| e == "json") {
                 if let Ok(content) = fs::read_to_string(&path) {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                        let pid = val.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        let pid = val
+                            .get("pid")
+                            .and_then(|v| v.as_u64())
+                            .and_then(|v| u32::try_from(v).ok())
+                            .unwrap_or(0);
                         let session_id =
                             val.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
                         if pid > 0 && is_pid_alive(pid) && !session_id.is_empty() {
                             map.insert(session_id.to_string(), pid);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // Grok: ~/.grok/active_sessions.json = [{"session_id": "...", "pid": N, "cwd": "..."}]
+    let grok_base = config::resolve_agent_base("grok").unwrap_or_else(|| home.join(".grok"));
+    if let Ok(content) = fs::read_to_string(grok_base.join("active_sessions.json")) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            for entry in val.as_array().into_iter().flatten() {
+                let pid = entry
+                    .get("pid")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or(0);
+                let session_id = entry
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if pid > 0 && is_pid_alive(pid) && !session_id.is_empty() {
+                    map.insert(session_id.to_string(), pid);
                 }
             }
         }

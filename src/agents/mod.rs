@@ -1,9 +1,11 @@
+mod agy;
 pub(crate) mod claude;
 mod codex;
 pub(crate) mod common;
 mod copilot;
 mod cursor;
 mod gemini;
+mod grok;
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -160,12 +162,14 @@ impl AgentPlugin for UnknownPlugin {
 }
 
 static UNKNOWN_PLUGIN: UnknownPlugin = UnknownPlugin;
-static PLUGINS: [&'static dyn AgentPlugin; 5] = [
+static PLUGINS: [&'static dyn AgentPlugin; 7] = [
     &claude::PLUGIN,
     &codex::PLUGIN,
     &gemini::PLUGIN,
     &copilot::PLUGIN,
     &cursor::PLUGIN,
+    &agy::PLUGIN,
+    &grok::PLUGIN,
 ];
 
 pub fn all_plugins() -> &'static [&'static dyn AgentPlugin] {
@@ -203,6 +207,8 @@ mod tests {
         assert_eq!(find_plugin("gemini").unwrap().id(), "gemini");
         assert_eq!(find_plugin("copilot").unwrap().id(), "copilot");
         assert_eq!(find_plugin("cursor").unwrap().id(), "cursor");
+        assert_eq!(find_plugin("agy").unwrap().id(), "agy");
+        assert_eq!(find_plugin("grok").unwrap().id(), "grok");
         assert!(find_plugin("foobar").is_none());
     }
 
@@ -237,6 +243,20 @@ mod tests {
             ))
             .id(),
             "cursor"
+        );
+        assert_eq!(
+            find_plugin_for_path(Path::new(
+                "/home/user/.gemini/antigravity-cli/brain/uuid/.system_generated/logs/transcript.jsonl"
+            ))
+            .id(),
+            "agy"
+        );
+        assert_eq!(
+            find_plugin_for_path(Path::new(
+                "/home/user/.grok/sessions/%2Fhome%2Fuser%2Fproj/uuid/chat_history.jsonl"
+            ))
+            .id(),
+            "grok"
         );
         assert_eq!(
             find_plugin_for_path(Path::new("/tmp/random.txt")).id(),

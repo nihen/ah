@@ -8,6 +8,7 @@ use super::AgentPlugin;
 use super::Message;
 use super::common::first_text_part;
 use super::common::for_each_jsonl_value;
+use super::common::tagged_user_body;
 
 static RE_CURSOR_PROJECTS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r".*/projects/([^/]+)/.*").unwrap());
@@ -94,20 +95,7 @@ pub struct CursorPlugin;
 
 /// Cursor transcripts wrap real user text in `<user_query>…</user_query>`; strip for title / prompts.
 fn cursor_user_body(raw: &str) -> Option<&str> {
-    let t = raw.trim();
-    if let (Some(i), Some(j)) = (t.find("<user_query>"), t.rfind("</user_query>")) {
-        let start = i + "<user_query>".len();
-        if j >= start {
-            let inner = t[start..j].trim();
-            if !inner.is_empty() {
-                return Some(inner);
-            }
-        }
-    }
-    if !t.starts_with('<') {
-        return Some(t);
-    }
-    None
+    tagged_user_body(raw, "user_query")
 }
 
 impl AgentPlugin for CursorPlugin {

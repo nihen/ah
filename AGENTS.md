@@ -54,7 +54,7 @@ src/
 ## Configuration
 
 - `~/.ahrc` (TOML) — optional, merge with built-in defaults
-- No config = all 5 built-in agents active
+- No config = all 7 built-in agents active
 - `config.rs` separates "plugins" (parse logic, static) from "agents" (config, runtime)
 - `OnceLock<Vec<AgentDef>>` global registry, initialized once at startup
 - Environment variables (CLAUDE_CONFIG_DIR etc.) override base directories
