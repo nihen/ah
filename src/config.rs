@@ -88,6 +88,12 @@ fn builtin_env_info(agent_id: &str) -> Option<BuiltinInfo> {
             env_var: "CURSOR_CONFIG_DIR",
             default_prefix: ".cursor",
         }),
+        "grok" => Some(BuiltinInfo {
+            env_var: "GROK_HOME",
+            default_prefix: ".grok",
+        }),
+        // "agy": Antigravity CLI has no documented env var for its data dir
+        // (~/.gemini/antigravity-cli); patterns are always home-relative.
         _ => None,
     }
 }
@@ -379,18 +385,31 @@ pub fn active_agents() -> impl Iterator<Item = &'static AgentDef> {
 
 /// Find the best matching active agent for a path.
 /// Prefers the agent with the longest matching path_marker (most specific match).
+/// The longest match is chosen across *all* agents (including disabled ones) so
+/// that disabling a specific agent (e.g. `agy` under `.gemini/antigravity-cli/`)
+/// does not make its files fall through to a less specific agent (`gemini`).
 pub fn find_agent_for_path(path: &Path) -> Option<&'static AgentDef> {
+    best_agent_for_path(agents(), path)
+}
+
+fn best_agent_for_path<'a>(candidates: &'a [AgentDef], path: &Path) -> Option<&'a AgentDef> {
     let path_str = path.to_string_lossy();
-    active_agents()
+    candidates
+        .iter()
         .filter(|a| a.matches_path(path))
         .max_by_key(|a| {
-            a.path_markers
+            let longest = a
+                .path_markers
                 .iter()
                 .filter(|m| path_str.contains(m.as_str()))
                 .map(|m| m.len())
                 .max()
-                .unwrap_or(0)
+                .unwrap_or(0);
+            // On equal marker length prefer an active agent over a disabled one
+            // (deterministic regardless of registry order).
+            (longest, !a.disabled)
         })
+        .filter(|a| !a.disabled)
 }
 
 /// Find an active agent's plugin by path.
@@ -462,11 +481,36 @@ mod tests {
         // Without ~/.ahrc, should return built-in defaults
         let home = PathBuf::from("/nonexistent/home");
         let (agents, remotes) = load_config(&home);
-        assert_eq!(agents.len(), 5);
+        assert_eq!(agents.len(), 7);
         assert_eq!(agents[0].id, "claude");
         assert_eq!(agents[1].id, "codex");
         assert!(!agents[0].disabled);
         assert!(remotes.is_empty());
+    }
+
+    #[test]
+    fn test_disabled_agent_does_not_fall_through_to_shorter_marker() {
+        // agy (marker /.gemini/antigravity-cli/) disabled must NOT make its files
+        // match gemini (marker /.gemini/).
+        let home = test_home();
+        let (mut agents, _) = load_config(&home);
+        agents.iter_mut().find(|a| a.id == "agy").unwrap().disabled = true;
+        let agy_path = Path::new(
+            "/Users/test/.gemini/antigravity-cli/brain/uuid/.system_generated/logs/transcript.jsonl",
+        );
+        assert!(best_agent_for_path(&agents, agy_path).is_none());
+        // gemini's own files still resolve to gemini
+        let gemini_path = Path::new("/Users/test/.gemini/tmp/proj/chats/session-1.json");
+        assert_eq!(
+            best_agent_for_path(&agents, gemini_path).map(|a| a.id.as_str()),
+            Some("gemini")
+        );
+        // and with agy enabled, the longer marker wins
+        agents.iter_mut().find(|a| a.id == "agy").unwrap().disabled = false;
+        assert_eq!(
+            best_agent_for_path(&agents, agy_path).map(|a| a.id.as_str()),
+            Some("agy")
+        );
     }
 
     #[test]

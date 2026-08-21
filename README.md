@@ -2,7 +2,7 @@
 
 **A**gent **H**istory — search, inspect, and resume coding-agent sessions from a single CLI.
 
-`ah` discovers session files from [Claude Code](https://claude.ai/), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Cursor](https://cursor.com/), and [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli). It works with zero config, defaults to the current directory, and gives you one place to search, inspect, and resume past work.
+`ah` discovers session files from [Claude Code](https://claude.ai/), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Cursor](https://cursor.com/), [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli), [Antigravity CLI](https://antigravity.google/) (`agy`), and [Grok CLI](https://x.ai/) (`grok`). It works with zero config, defaults to the current directory, and gives you one place to search, inspect, and resume past work.
 
 Read-only by default. `ah` works directly on agent session files, lets you search and inspect them, and only executes when you explicitly run `resume`.
 
@@ -113,10 +113,12 @@ gemini           5  2026-03-21 10:50
 | Gemini | ✓ | ✓ | ✓ | ✓ | | |
 | Copilot | ✓ | ✓ | ✓ | ✓ | | |
 | Cursor | ✓ | ✓ | ✓ | ✓ | | |
+| Antigravity (agy) | ✓ | ✓ | ✓ | ✓ | | |
+| Grok | ✓ | ✓ | ✓ | ✓ | ✓ | |
 
 ## Features
 
-- **Cross-agent** — one tool for 5 agents (see `ah list-agents`)
+- **Cross-agent** — one tool for 7 agents (see `ah list-agents`)
 - **Zero-config** — scans the standard session locations for each supported CLI
 - **Fast** — parallel file collection with [rayon](https://github.com/rayon-rs/rayon), regex search via [memmap2](https://github.com/RazrFalcon/memmap2-rs), no subprocesses for search/parsing
 - **Resume-friendly** — `ah resume` and `ah show` can target the latest matching session without pasting IDs
@@ -222,7 +224,7 @@ Global options:
   -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
   --no-preview            Disable preview in interactive mode
   --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
-  --running               Show only currently running sessions (Claude only for now)
+  --running               Show only currently running sessions (Claude, Grok)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
@@ -484,7 +486,7 @@ ah_path = "/usr/local/bin/ah"      # path to ah binary on remote (optional, defa
 |-------|----------|-------------|
 | `disabled` | No | Set to `true` to hide this agent from all commands |
 | `extra_patterns` | No | Additional glob patterns to scan (built-in agents only) |
-| `plugin` | Yes* | Parser to use: `claude`, `codex`, `gemini`, `copilot`, `cursor` (*required for custom agents) |
+| `plugin` | Yes* | Parser to use: `claude`, `codex`, `gemini`, `copilot`, `cursor`, `agy`, `grok` (*required for custom agents) |
 | `file_patterns` | Yes* | Glob patterns for session files (*required for custom agents) |
 
 All glob patterns must start with `~/` or `/` (absolute paths only). `~` is expanded to the home directory.
@@ -511,7 +513,7 @@ plugin = "claude"
 file_patterns = ["~/.mybot/sessions/*.jsonl"]
 ```
 
-The `plugin` field tells `ah` how to parse the session files. Available plugins: `claude`, `codex`, `gemini`, `copilot`, `cursor`.
+The `plugin` field tells `ah` how to parse the session files. Available plugins: `claude`, `codex`, `gemini`, `copilot`, `cursor`, `agy`, `grok`.
 
 ### Remote hosts
 
@@ -550,6 +552,8 @@ Each built-in agent respects its CLI's config directory environment variable:
 | Gemini  | `tmp/*/chats/session-*.json` | `GEMINI_CLI_HOME`  | `~/.gemini` |
 | Copilot | `session-state/*/workspace.yaml` | `COPILOT_HOME`     | `~/.copilot`|
 | Cursor  | `projects/*/agent-transcripts/**/*.jsonl` | `CURSOR_CONFIG_DIR`| `~/.cursor` |
+| Antigravity (agy) | `antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl` | — | `~/.gemini` |
+| Grok    | `sessions/*/*/chat_history.jsonl` | `GROK_HOME`        | `~/.grok`   |
 
 Run `ah list-agents` to see the full configuration including glob patterns and capabilities.
 

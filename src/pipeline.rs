@@ -250,7 +250,7 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
         );
     }
 
-    // PID map + running field (Claude only for now)
+    // PID map + running field (Claude + Grok)
     let pid_map = crate::build_pid_map();
     for session in &mut sessions {
         let session_id = session.fields.get(&Field::Id).cloned().unwrap_or_default();
