@@ -1,0 +1,69 @@
+{
+  "fps": 30,
+  "crossfade": 0.3,
+  "narration_lead": 0.2,
+  "scenes": [
+    {
+      "id": "hook",
+      "kind": "terminal",
+      "duration": 4
+    },
+    {
+      "id": "title",
+      "kind": "card",
+      "duration": 4.5
+    },
+    {
+      "id": "log",
+      "kind": "terminal",
+      "duration": 5.5
+    },
+    {
+      "id": "search",
+      "kind": "terminal",
+      "duration": 6
+    },
+    {
+      "id": "resume",
+      "kind": "terminal",
+      "duration": 6
+    },
+    {
+      "id": "cta",
+      "kind": "card",
+      "duration": 4
+    }
+  ],
+  "aspects": {
+    "16x9": {
+      "w": 1920,
+      "h": 1080,
+      "term": {
+        "x": 160,
+        "y": 48,
+        "w": 1600,
+        "h": 870,
+        "font": 23
+      },
+      "sub": {
+        "size": 52,
+        "margin_v": 64
+      }
+    },
+    "9x16": {
+      "w": 1080,
+      "h": 1920,
+      "term": {
+        "x": 40,
+        "y": 300,
+        "w": 1000,
+        "h": 1180,
+        "font": 25
+      },
+      "sub": {
+        "size": 48,
+        "margin_v": 250
+      }
+    }
+  }
+}

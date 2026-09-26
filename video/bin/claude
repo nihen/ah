@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Stand-in for the real agent CLI during recording: shows the exact resume
+# command `ah resume` launched, without needing an authenticated agent.
+agent="$(basename "$0")"
+printf '\n\e[2m$ %s %s\e[0m\n\n' "$agent" "$*"
+printf '\e[38;2;255;184;108m●\e[0m \e[1m%s\e[0m resumed in \e[38;2;189;147;249m%s\e[0m\n\n' "$agent" "${PWD/#$HOME/~}"
+printf '\e[2m>>> implement OAuth2 authentication flow\e[0m\n'
+printf 'Picking up where we left off: the token refresh handler is next.\n\n'
+printf '\e[38;2;255;121;198m>\e[0m '
+sleep 30

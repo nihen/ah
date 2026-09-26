@@ -7,7 +7,7 @@ datadir := $(prefix)/share
 mandir := $(datadir)/man/man1
 exe_name := ah
 
-.PHONY: build install test lint fmt completions man demo release clean
+.PHONY: build install test lint fmt completions man demo video release clean
 
 build: $(EXE)
 
@@ -45,6 +45,11 @@ demo: $(EXE)
 	vhs demo/demo-pre.tape
 	bash demo/setup.sh
 	vhs demo/demo.tape
+
+video: $(EXE)
+	video/setup.sh
+	video/record.sh
+	cd video && python3 cards.py && python3 tts.py && python3 bgm.py && python3 compose.py
 
 release:
 	@echo "Tagging v$(VERSION) and pushing..."

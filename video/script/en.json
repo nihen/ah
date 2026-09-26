@@ -1,0 +1,24 @@
+{
+  "lang": "en",
+  "voice": "Puck",
+  "style": "Confident, warm male developer advocate. Upbeat and clear, conversational, not salesy. Crisp pacing for a 30-second product video.",
+  "font": "Noto Sans CJK JP",
+  "cards": {
+    "title": {
+      "name": "Agent History",
+      "tagline": "Search, inspect, and resume\ncoding-agent sessions from one CLI."
+    },
+    "cta": {
+      "tagline": "Zero config · Read-only · Fast",
+      "url": "github.com/nihen/ah"
+    }
+  },
+  "lines": [
+    {"scene": "hook",   "tts": "So many agent sessions. <short pause> Where was that OAuth fix?",               "sub": "So many agent sessions… where was that OAuth fix?"},
+    {"scene": "title",  "tts": "Meet A-H. One CLI for all your coding-agent history.",                          "sub": "Meet ah — one CLI for all your coding-agent history."},
+    {"scene": "log",    "tts": "A-H log lists every session in this project, across every agent.",               "sub": "ah log lists every session in this project, across every agent."},
+    {"scene": "search", "tts": "Full-text search across all agents and directories. <short pause> Instantly.",  "sub": "Full-text search across all agents and directories. Instantly."},
+    {"scene": "resume", "tts": "Found it? A-H resume jumps right back into the original agent.",                "sub": "Found it? ah resume jumps right back into the original agent."},
+    {"scene": "cta",    "tts": "Zero config. Read-only. <short pause> Try A-H today.",                           "sub": "Zero config. Read-only. Try ah today."}
+  ]
+}
