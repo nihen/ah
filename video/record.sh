@@ -11,7 +11,10 @@ aspects=(); scenes=()
 while [[ $# -gt 0 && "$1" != "--" ]]; do aspects+=("$1"); shift; done
 [[ "${1:-}" == "--" ]] && { shift; scenes=("$@"); }
 [[ ${#aspects[@]} -eq 0 ]] && aspects=(16x9 9x16)
-[[ ${#scenes[@]} -eq 0 ]] && scenes=(hook log search resume)
+if [[ ${#scenes[@]} -eq 0 ]]; then
+  read -r -a scenes < <(python3 -c "
+import json; print(' '.join(s['id'] for s in json.load(open('$VIDEO/timeline.json'))['scenes'] if s['kind'] == 'terminal'))")
+fi
 
 for aspect in "${aspects[@]}"; do
   read -r W H FONT < <(python3 -c "
@@ -34,7 +37,7 @@ Set WindowBar Colorful
 Set WindowBarSize 44
 Set BorderRadius 14
 Set Framerate 30
-Set TypingSpeed 45ms
+Set TypingSpeed 40ms
 Hide
 Type "source '$VIDEO/scenes/rc.sh'; clear"
 Enter

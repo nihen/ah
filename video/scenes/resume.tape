@@ -1,9 +1,16 @@
-Type "ah resume -i"
-Sleep 250ms
+# Continue from the show scene: replay it off-camera, then edit it with ↑.
+Hide
+Type "ah show -a --agent codex -q pool_timeout"
 Enter
-Sleep 1s
-Set TypingSpeed 110ms
-Type "oauth"
-Sleep 1.3s
+Sleep 500ms
+Show
+Sleep 500ms
+Up
+Sleep 400ms
+Ctrl+A
+Right 7
+Backspace 4
+Type "resume"
+Sleep 400ms
 Enter
-Sleep 2.4s
+Sleep 2s

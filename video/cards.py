@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Render still images for the video: background, title/CTA cards, vertical header.
+"""Render still images for the video: background, end card, vertical header.
 
 Usage: video/cards.py [lang ...]
-Output: video/.work/cards/<aspect>/{bg,header}.png and <lang>/{title,cta}.png
+Output: video/.work/cards/<aspect>/{bg,header}.png and <lang>/end.png
 """
 
 import json
@@ -23,7 +23,6 @@ PURPLE = (189, 147, 249)
 PINK = (255, 121, 198)
 ORANGE = (255, 184, 108)
 CHIP = (40, 42, 54)
-AGENTS = ["Claude Code", "Codex", "Gemini CLI", "Cursor", "Copilot CLI", "Antigravity", "Grok"]
 
 
 def mono(weight: str, size: int) -> ImageFont.FreeTypeFont:
@@ -76,28 +75,6 @@ def text_block(d: ImageDraw.ImageDraw, cx: int, y: int, text: str, font, fill, s
     return y
 
 
-def chips(d: ImageDraw.ImageDraw, cx: int, y: int, max_w: int, font) -> int:
-    pad_x, pad_y, gap = int(font.size * 0.7), int(font.size * 0.45), int(font.size * 0.5)
-    widths = [d.textlength(a, font=font) + pad_x * 2 for a in AGENTS]
-    rows, row, row_w = [], [], 0
-    for a, wd in zip(AGENTS, widths):
-        if row and row_w + gap + wd > max_w:
-            rows.append((row, row_w))
-            row, row_w = [], 0
-        row_w += (gap if row else 0) + wd
-        row.append((a, wd))
-    rows.append((row, row_w))
-    h = font.size + pad_y * 2
-    for row, row_w in rows:
-        x = cx - row_w / 2
-        for a, wd in row:
-            d.rounded_rectangle((x, y, x + wd, y + h), radius=h // 2, fill=CHIP, outline=(68, 71, 90), width=2)
-            d.text((x + wd / 2, y + h / 2), a, font=font, fill=FG, anchor="mm")
-            x += wd + gap
-        y += h + gap
-    return y
-
-
 def code_box(d: ImageDraw.ImageDraw, cx: int, y: int, cmd: str, font) -> int:
     w = d.textlength("$ " + cmd, font=font) + font.size * 2
     h = int(font.size * 2.2)
@@ -109,36 +86,23 @@ def code_box(d: ImageDraw.ImageDraw, cx: int, y: int, cmd: str, font) -> int:
     return y + h
 
 
-def title_card(w: int, h: int, script: dict) -> Image.Image:
+def end_card(w: int, h: int, script: dict) -> Image.Image:
     img = background(w, h)
     d = ImageDraw.Draw(img)
-    s = min(w, h) / 1080
-    vertical = h > w
-    cy = int(h * (0.36 if vertical else 0.30))
-    gradient_text(img, (w // 2, cy), "ah", mono("ExtraBold", int(260 * s * (1.25 if vertical else 1))))
-    y = cy + int(170 * s * (1.25 if vertical else 1))
-    y = text_block(d, w // 2, y, script["cards"]["title"]["name"], sans("Bold", int(64 * s)), FG)
-    y += int(24 * s)
-    y = text_block(d, w // 2, y, script["cards"]["title"]["tagline"], sans("Regular", int(40 * s)), MUTED)
+    s = min(w, h) / 1080 * (1.1 if h > w else 1)
+    card = script["cards"]["end"]
+    y = int(h * (0.24 if h > w else 0.17))
+    big = mono("ExtraBold", int(170 * s))
+    gradient_text(img, (w // 2, y), "ah", big, anchor="mt")
+    y += int(170 * s)
+    y = text_block(d, w // 2, y, card["name"], sans("Bold", int(56 * s)), FG)
+    y += int(14 * s)
+    y = text_block(d, w // 2, y, card["tagline"], sans("Regular", int(36 * s)), MUTED)
     y += int(40 * s)
-    chips(d, w // 2, y, int(w * (0.86 if vertical else 0.7)), sans("Regular", int(30 * s)))
-    return img
-
-
-def cta_card(w: int, h: int, script: dict) -> Image.Image:
-    img = background(w, h)
-    d = ImageDraw.Draw(img)
-    s = min(w, h) / 1080
-    vertical = h > w
-    cy = int(h * (0.30 if vertical else 0.22))
-    gradient_text(img, (w // 2, cy), "ah", mono("ExtraBold", int(170 * s * (1.2 if vertical else 1))))
-    y = cy + int(120 * s * (1.2 if vertical else 1))
-    y = text_block(d, w // 2, y, script["cards"]["cta"]["tagline"], sans("Bold", int(50 * s)), FG)
-    y += int(44 * s)
-    code = mono("Medium", int(40 * s))
-    y = code_box(d, w // 2, y, "brew install nihen/tap/ah", code) + int(24 * s)
-    y = code_box(d, w // 2, y, "cargo install ah-cli", code) + int(44 * s)
-    d.text((w // 2, y), script["cards"]["cta"]["url"], font=mono("Bold", int(44 * s)), fill=ORANGE, anchor="mt")
+    code = mono("Medium", int(36 * s))
+    y = code_box(d, w // 2, y, "brew install nihen/tap/ah", code) + int(20 * s)
+    y = code_box(d, w // 2, y, "cargo install ah-cli", code) + int(40 * s)
+    d.text((w // 2, y), "github.com/nihen/ah", font=mono("Bold", int(40 * s)), fill=ORANGE, anchor="mt")
     return img
 
 
@@ -166,8 +130,7 @@ def main() -> None:
         for lang in langs:
             script = json.loads((VIDEO / "script" / f"{lang}.json").read_text())
             (out / lang).mkdir(exist_ok=True)
-            title_card(a["w"], a["h"], script).save(out / lang / "title.png")
-            cta_card(a["w"], a["h"], script).save(out / lang / "cta.png")
+            end_card(a["w"], a["h"], script).save(out / lang / "end.png")
             print(f"cards: {aspect}/{lang}")
 
 

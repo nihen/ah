@@ -7,6 +7,9 @@ environment-injected credential (e.g. a proxy-managed API credential) applies.
 import base64
 import json
 import os
+import re
+import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -19,11 +22,19 @@ def interact(body: dict, timeout: int = 300) -> tuple[bytes, str]:
     if key := os.environ.get("GEMINI_API_KEY"):
         headers["x-goog-api-key"] = key
     req = urllib.request.Request(ENDPOINT, json.dumps(body).encode(), headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as res:
-            data = json.load(res)
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"{body['model']}: HTTP {e.code}: {e.read().decode()[:500]}") from None
+    for attempt in range(6):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as res:
+                data = json.load(res)
+            break
+        except urllib.error.HTTPError as e:
+            msg = e.read().decode()[:500]
+            if e.code != 429 or attempt == 5:
+                raise RuntimeError(f"{body['model']}: HTTP {e.code}: {msg}") from None
+            # Rate limited: wait as long as the API asks (default 30s).
+            wait = int(m.group(1)) + 2 if (m := re.search(r"retry in (\d+)s", msg)) else 30
+            print(f"  rate limited, retrying in {wait}s", file=sys.stderr)
+            time.sleep(wait)
     audio = [
         c
         for step in data.get("steps", [])

@@ -1,24 +1,21 @@
 {
   "lang": "en",
   "voice": "Puck",
-  "style": "Confident, warm male developer advocate. Upbeat and clear, conversational, not salesy. Crisp pacing for a 30-second product video.",
+  "style": "A calm, confident developer demoing his own tool live in a terminal. First person, conversational and natural, understated with a touch of dry humor. Not an announcer voice, not salesy.",
   "font": "Noto Sans CJK JP",
   "cards": {
-    "title": {
+    "end": {
       "name": "Agent History",
-      "tagline": "Search, inspect, and resume\ncoding-agent sessions from one CLI."
-    },
-    "cta": {
-      "tagline": "Zero config · Read-only · Fast",
-      "url": "github.com/nihen/ah"
+      "tagline": "Search, read, and resume\nevery coding-agent session."
     }
   },
   "lines": [
-    {"scene": "hook",   "tts": "So many agent sessions. <short pause> Where was that OAuth fix?",               "sub": "So many agent sessions… where was that OAuth fix?"},
-    {"scene": "title",  "tts": "Meet A-H. One CLI for all your coding-agent history.",                          "sub": "Meet ah — one CLI for all your coding-agent history."},
-    {"scene": "log",    "tts": "A-H log lists every session in this project, across every agent.",               "sub": "ah log lists every session in this project, across every agent."},
-    {"scene": "search", "tts": "Full-text search across all agents and directories. <short pause> Instantly.",  "sub": "Full-text search across all agents and directories. Instantly."},
-    {"scene": "resume", "tts": "Found it? A-H resume jumps right back into the original agent.",                "sub": "Found it? ah resume jumps right back into the original agent."},
-    {"scene": "cta",    "tts": "Zero config. Read-only. <short pause> Try A-H today.",                           "sub": "Zero config. Read-only. Try ah today."}
+    {"scene": "cold", "tts": "Checkout is falling over. Too many database connections. <short pause> I've fixed this before. But with which agent? In which repo?", "sub": ["Checkout is falling over. Too many database connections.", "I've fixed this before. But with which agent? In which repo?"]},
+    {"scene": "log", "tts": "A-H log shows every agent session for this project. <short pause> Not here.", "sub": ["ah log shows every agent session for this project.", "Not here."]},
+    {"scene": "search", "tts": "So let's search everything. Every agent, every project. <short pause> There it is: Codex, in the API gateway, last week.", "sub": ["So let's search everything. Every agent, every project.", "There it is: Codex, in api-gateway, last week."]},
+    {"scene": "show", "tts": "The whole conversation, right here. Release on the error path, five-second pool timeout.", "sub": ["The whole conversation, right here.", "Release on the error path, 5-second pool_timeout."]},
+    {"scene": "resume", "tts": "And A-H resume drops me right back into that Codex session, in the right directory.", "sub": ["And ah resume drops me right back into that Codex session,", "in the right directory."]},
+    {"scene": "noconfig", "tts": "No config. No daemon. No index. <short pause> It just reads what your agents already write.", "sub": ["No config. No daemon. No index.", "It just reads what your agents already write."]},
+    {"scene": "end", "tts": "That's A-H. Your agent history, one command away.", "sub": ["That's ah. Your agent history, one command away."]}
   ]
 }

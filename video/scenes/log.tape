@@ -1,4 +1,5 @@
+Sleep 300ms
 Type "ah log -n 2"
-Sleep 350ms
+Sleep 300ms
 Enter
-Sleep 5s
+Sleep 1.5s

@@ -3,7 +3,11 @@
 
 Usage: video/compose.py [lang ...] [--aspect 16x9|9x16 ...]
 Inputs: .work/clips/<aspect>/*.mp4 (record.sh), .work/cards (cards.py),
-        .work/tts/<lang>/*.wav (tts.py), .work/bgm.wav (bgm.py)
+        .work/tts/<lang>/*.wav (tts.py), .work/bgm.raw.mp3 (bgm.py)
+
+Each scene lasts as long as its clip or its narration needs, whichever is longer,
+so the total length follows the script. Terminal scenes hard-cut into each other
+(like clearing the screen); a scene with "transition": "fade" fades in.
 Output: video/out/ah-promo-<lang>-<aspect>.mp4
 """
 
@@ -14,10 +18,11 @@ from pathlib import Path
 
 from PIL import ImageFont
 
+import bgm
+
 VIDEO = Path(__file__).resolve().parent
 WORK = VIDEO / ".work"
 OUT = VIDEO / "out"
-MAX_TEMPO = 1.15
 SUB_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
 
 
@@ -121,62 +126,87 @@ def subtitles(tl: dict, aspect: str, script: dict, cues: list[tuple[float, float
     return path
 
 
-def narration(tl: dict, script: dict) -> tuple[list[tuple[Path, float, float]], list[tuple[float, float, str]]]:
-    """Place each line at its scene start; speed up lines that would overrun their scene."""
-    lead = tl["narration_lead"]
-    t = 0.0
-    placed, cues = [], []
+def plan(tl: dict, aspect: str, script: dict) -> list[dict]:
+    """Decide each scene's length and where its narration and subtitles go."""
     lines = {l["scene"]: l for l in script["lines"]}
+    t = 0.0
+    out = []
     for scene in tl["scenes"]:
-        line = lines.get(scene["id"])
-        if line:
+        need = scene.get("min", 0.0)
+        if scene["kind"] == "terminal":
+            need = max(need, duration(WORK / "clips" / aspect / f"{scene['id']}.mp4"))
+        item = {"scene": scene, "start": t}
+        if line := lines.get(scene["id"]):
             wav = WORK / "tts" / script["lang"] / f"{scene['id']}.wav"
+            at = scene.get("narration_at", tl["narration_lead"])
             dur = duration(wav)
-            room = scene["duration"] - lead - 0.1
-            tempo = min(MAX_TEMPO, dur / room) if dur > room else 1.0
-            if dur / tempo > room + 0.05:
-                print(f"  warning: {script['lang']}/{scene['id']} {dur:.2f}s overruns by "
-                      f"{dur / tempo - room:.2f}s even at {tempo:.2f}x", file=sys.stderr)
-            placed.append((wav, t + lead, tempo))
-            cues.append((t + lead - 0.05, t + lead + dur / tempo + 0.25, line["sub"]))
-        t += scene["duration"]
-    return placed, cues
+            need = max(need, at + dur + tl["narration_tail"])
+            item.update(wav=wav, voice_at=t + at, voice_dur=dur, sub=line["sub"])
+        item["dur"] = round(need, 2)
+        t += item["dur"]
+        out.append(item)
+    return out
+
+
+def cues(items: list[dict]) -> list[tuple[float, float, str]]:
+    """Split each narration's subtitle chunks over its audio, by text length."""
+    out = []
+    for it in items:
+        if "wav" not in it:
+            continue
+        chunks = it["sub"] if isinstance(it["sub"], list) else [it["sub"]]
+        weights = [len(c.replace("\n", "")) for c in chunks]
+        t = it["voice_at"]
+        for i, (chunk, w) in enumerate(zip(chunks, weights)):
+            d = it["voice_dur"] * w / sum(weights)
+            last = i == len(chunks) - 1
+            out.append((t - 0.05, t + d + (0.3 if last else 0.0), chunk))
+            t += d
+    return out
 
 
 def compose(tl: dict, aspect: str, lang: str) -> Path:
     script = json.loads((VIDEO / "script" / f"{lang}.json").read_text())
-    scenes, cf = tl["scenes"], tl["crossfade"]
-    total = sum(s["duration"] for s in scenes)
-    segs = [segment(tl, aspect, lang, s, s["duration"] + (cf if i < len(scenes) - 1 else 0))
-            for i, s in enumerate(scenes)]
-    placed, cues = narration(tl, script)
-    ass = subtitles(tl, aspect, script, cues)
+    items = plan(tl, aspect, script)
+    fade = tl["fade"]
+    total = sum(it["dur"] for it in items)
+    fades_in = [it["scene"].get("transition") == "fade" for it in items]
+    segs = [segment(tl, aspect, lang, it["scene"],
+                    it["dur"] + (fade if i + 1 < len(items) and fades_in[i + 1] else 0))
+            for i, it in enumerate(items)]
+    ass = subtitles(tl, aspect, script, cues(items))
 
     inputs: list[str] = []
     for seg in segs:
         inputs += ["-i", str(seg)]
-    graph, prev, offset = [], "0:v", 0.0
+    graph, prev = [], "[0:v]"
     for i in range(1, len(segs)):
-        offset += scenes[i - 1]["duration"]
-        graph.append(f"[{prev}][{i}:v]xfade=transition=fade:duration={cf}:offset={offset}[x{i}]")
-        prev = f"x{i}"
+        if fades_in[i]:
+            graph.append(f"{prev}settb=AVTB[a{i}];[{i}:v]settb=AVTB[b{i}];"
+                         f"[a{i}][b{i}]xfade=transition=fade:duration={fade}"
+                         f":offset={items[i]['start']}[v{i}]")
+        else:
+            graph.append(f"{prev}[{i}:v]concat=n=2:v=1:a=0[v{i}]")
+        prev = f"[v{i}]"
     fontsdir = "/usr/share/fonts/opentype/noto"
-    graph.append(f"[{prev}]ass={ass}:fontsdir={fontsdir},format=yuv420p[vout]")
+    graph.append(f"{prev}ass={ass}:fontsdir={fontsdir},format=yuv420p[vout]")
 
+    voiced = [it for it in items if "wav" in it]
     base = len(segs)
-    for wav, _, _ in placed:
-        inputs += ["-i", str(wav)]
-    inputs += ["-i", str(WORK / "bgm.wav")]
+    for it in voiced:
+        inputs += ["-i", str(it["wav"])]
+    music = bgm.fit(total, WORK / f"bgm-{lang}-{aspect}.wav")
+    inputs += ["-i", str(music)]
     vox = []
-    for j, (_, start, tempo) in enumerate(placed):
-        ms = int(start * 1000)
-        graph.append(f"[{base + j}:a]atempo={tempo},aresample=48000,aformat=channel_layouts=stereo,"
+    for j, it in enumerate(voiced):
+        ms = int(it["voice_at"] * 1000)
+        graph.append(f"[{base + j}:a]aresample=48000,aformat=channel_layouts=stereo,"
                      f"adelay={ms}|{ms}[n{j}]")
         vox.append(f"[n{j}]")
     graph.append(f"{''.join(vox)}amix=inputs={len(vox)}:normalize=0,apad=whole_dur={total},"
                  "asplit[vox][key]")
-    graph.append(f"[{base + len(placed)}:a]volume=0.55[music]")
-    graph.append("[music][key]sidechaincompress=threshold=0.03:ratio=6:attack=20:release=350[duck]")
+    graph.append(f"[{base + len(voiced)}:a]volume=0.4[music]")
+    graph.append("[music][key]sidechaincompress=threshold=0.03:ratio=5:attack=30:release=400[duck]")
     graph.append(f"[vox][duck]amix=inputs=2:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11,"
                  f"atrim=end={total}[aout]")
 
@@ -186,6 +216,7 @@ def compose(tl: dict, aspect: str, lang: str) -> Path:
          "-t", str(total), "-r", str(tl["fps"]), "-c:v", "libx264", "-preset", "slow", "-crf", "18",
          "-profile:v", "high", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
          "-movflags", "+faststart", str(out)])
+    print("  " + "  ".join(f"{it['scene']['id']}={it['dur']:.1f}" for it in items))
     return out
 
 

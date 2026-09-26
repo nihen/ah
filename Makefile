@@ -47,7 +47,7 @@ demo: $(EXE)
 	vhs demo/demo.tape
 
 video: $(EXE)
-	video/setup.sh
+	python3 video/sandbox.py
 	video/record.sh
 	cd video && python3 cards.py && python3 tts.py && python3 bgm.py && python3 compose.py
 
