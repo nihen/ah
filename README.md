@@ -180,6 +180,11 @@ ah completion fish > ~/.config/fish/completions/ah.fish
 
 Most commands support `-i` for fuzzy selection with transcript preview. Requires [`fzf`](https://github.com/junegunn/fzf) or a compatible finder (e.g. [`sk`](https://github.com/lotabout/skim)) in `PATH`. Override with `$AH_SELECTOR`.
 
+fzf compatibility:
+
+- Selection and transcript preview work with older fzf too, including 0.44 from Debian/Ubuntu apt.
+- Preview search (the query is highlighted in the preview and the preview scrolls to the first match; `ctrl-s` switches list filtering on and off) needs fzf 0.62 or newer. On older fzf it is turned off automatically. fzf 0.63+ calculates the scroll position in the background so typing stays responsive.
+
 Useful as a shell function — pick a project, browse its sessions, resume:
 
 ```bash
