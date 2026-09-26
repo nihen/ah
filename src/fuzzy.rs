@@ -622,7 +622,6 @@ pub fn run_resume(
 ) -> Result<(), String> {
     use crate::agents;
     use crate::resume;
-    use std::fs;
     use std::time::SystemTime;
 
     let selector = resolve_selector(ia);
@@ -791,8 +790,8 @@ pub fn run_resume(
 
     let path = PathBuf::from(&path_str);
     let plugin = agents::find_plugin_for_path(&path);
-    let mtime = fs::metadata(&path)
-        .and_then(|m| m.modified())
+    let mtime = plugin
+        .session_mtime(&path)
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let fields = resolver::resolve_fields(
         &path,

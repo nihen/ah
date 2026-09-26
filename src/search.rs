@@ -6,8 +6,6 @@ use regex::bytes::Regex as BytesRegex;
 
 use crate::agents::AgentPlugin;
 use crate::agents::MessageRole;
-#[cfg(test)]
-use crate::agents::common::mmap_file;
 
 /// Full-text search: check if file matches (early exit).
 /// NOTE: Pipeline now does mmap+search directly for better mmap sharing.
@@ -18,9 +16,8 @@ pub fn search_fulltext_matches(
     plugin: &dyn AgentPlugin,
     pattern: &BytesRegex,
 ) -> bool {
-    let search_path = plugin.search_path(path);
-    match mmap_file(&search_path) {
-        Some(mmap) => pattern.is_match(&mmap),
+    match plugin.session_bytes(path) {
+        Some(bytes) => pattern.is_match(&bytes),
         None => false,
     }
 }

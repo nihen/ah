@@ -1,4 +1,3 @@
-use std::fs;
 use std::process::{self, Command};
 use std::time::SystemTime;
 
@@ -95,9 +94,7 @@ fn build_resume_command_for_path(
     home: &std::path::Path,
 ) -> Result<String, String> {
     let plugin = agents::find_plugin_for_path(path);
-    let mtime = fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mtime = plugin.session_mtime(path).unwrap_or(SystemTime::UNIX_EPOCH);
     let fields = resolver::resolve_fields(
         path,
         plugin,

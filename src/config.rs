@@ -92,6 +92,11 @@ fn builtin_env_info(agent_id: &str) -> Option<BuiltinInfo> {
             env_var: "GROK_HOME",
             default_prefix: ".grok",
         }),
+        // opencode follows the XDG base directory spec: $XDG_DATA_HOME/opencode.
+        "opencode" => Some(BuiltinInfo {
+            env_var: "XDG_DATA_HOME",
+            default_prefix: ".local/share",
+        }),
         // "agy": Antigravity CLI has no documented env var for its data dir
         // (~/.gemini/antigravity-cli); patterns are always home-relative.
         _ => None,
@@ -136,6 +141,34 @@ fn derive_path_markers(patterns: &[String]) -> Vec<String> {
         }
     }
     markers
+}
+
+/// Path marker for an `extra_patterns` entry of a built-in agent: the
+/// literal part of the pattern. An exact path is its own marker, a glob
+/// within the file name keeps the literal prefix (`~/archive/claude-*`),
+/// and a glob spanning directories is cut back to a directory boundary
+/// (`~/.c*/x.db` -> `~`). Markers are matched as substrings and the longest
+/// wins, so a marker that also matches HOME itself (or an alias of it), or
+/// part of another agent's default location (`~/.c*.db` -> `~/.c` inside
+/// `~/.claude/`), would claim other agents' files and is not returned.
+fn extra_path_marker(pattern: &str, home: &Path, other_patterns: &[String]) -> Option<String> {
+    let fixed: String = pattern
+        .chars()
+        .take_while(|c| !matches!(c, '*' | '?' | '['))
+        .collect();
+    let marker = if pattern[fixed.len()..].contains('/') {
+        &fixed[..fixed.rfind('/')?]
+    } else {
+        fixed.as_str()
+    };
+    let marker = marker.trim_end_matches('/');
+    if marker.is_empty()
+        || home.to_string_lossy().contains(marker)
+        || other_patterns.iter().any(|p| p.contains(marker))
+    {
+        return None;
+    }
+    Some(marker.to_string())
 }
 
 /// Resolve the base directory for a built-in agent (respects env var override).
@@ -246,6 +279,12 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
         return (agents, Vec::new());
     };
 
+    // Built-in locations, for rejecting extra-pattern markers that overlap them.
+    let builtin_patterns: Vec<(String, Vec<String>)> = agents
+        .iter()
+        .map(|a| (a.id.clone(), a.glob_patterns.clone()))
+        .collect();
+
     // 3. Apply config overrides
     for (agent_id, entry) in &config.agents {
         if let Some(existing) = agents.iter_mut().find(|a| a.id == *agent_id) {
@@ -256,7 +295,29 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
             if let Some(extra) = &entry.extra_patterns {
                 for pattern in extra {
                     match expand_pattern(pattern, home) {
-                        Ok(expanded) => existing.glob_patterns.push(expanded),
+                        Ok(expanded) => {
+                            // Paths collected from extra locations must still
+                            // map back to this agent.
+                            let other_patterns: Vec<String> = builtin_patterns
+                                .iter()
+                                .filter(|(id, _)| id != agent_id)
+                                .flat_map(|(_, patterns)| patterns.iter().cloned())
+                                .collect();
+                            match extra_path_marker(&expanded, home, &other_patterns) {
+                                Some(marker) => {
+                                    if !existing.path_markers.contains(&marker) {
+                                        existing.path_markers.push(marker);
+                                    }
+                                }
+                                None => eprintln!(
+                                    "Warning: ~/.ahrc [agents.{}]: extra pattern '{}' cannot be told \
+                                     apart from HOME or another agent's directory; ignored (use a \
+                                     dedicated directory or name prefix)",
+                                    agent_id, pattern
+                                ),
+                            }
+                            existing.glob_patterns.push(expanded);
+                        }
                         Err(e) => eprintln!("Warning: ~/.ahrc [agents.{}]: {}", agent_id, e),
                     }
                 }
@@ -481,7 +542,7 @@ mod tests {
         // Without ~/.ahrc, should return built-in defaults
         let home = PathBuf::from("/nonexistent/home");
         let (agents, remotes) = load_config(&home);
-        assert_eq!(agents.len(), 7);
+        assert_eq!(agents.len(), 8);
         assert_eq!(agents[0].id, "claude");
         assert_eq!(agents[1].id, "codex");
         assert!(!agents[0].disabled);
@@ -533,6 +594,79 @@ extra_patterns = ["~/.claude-dev/projects/*/*.jsonl"]
         assert_eq!(
             config.agents["claude"].extra_patterns.as_ref().unwrap()[0],
             "~/.claude-dev/projects/*/*.jsonl"
+        );
+    }
+
+    #[test]
+    fn test_extra_patterns_extend_path_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::write(
+            home.join(".ahrc"),
+            r#"
+[agents.opencode]
+extra_patterns = ["~/backup/sessions.db", "~/*.db"]
+"#,
+        )
+        .unwrap();
+        let (agents, _) = load_config(home);
+        let opencode = agents.iter().find(|a| a.id == "opencode").unwrap();
+        let backup = home.join("backup/sessions.db");
+        assert!(opencode.matches_path(&backup.join("ses_x")));
+        // A marker at HOME itself would match every agent's files.
+        assert!(
+            !opencode
+                .path_markers
+                .contains(&home.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn test_extra_path_marker() {
+        let home = Path::new("/data/home/me");
+        let others = vec![
+            "/data/home/me/.claude/projects/*/*.jsonl".to_string(),
+            "/data/home/me/.codex/sessions/**/*.jsonl".to_string(),
+        ];
+        // A literal prefix inside another agent's directory name.
+        assert_eq!(
+            extra_path_marker("/data/home/me/.c*.db", home, &others),
+            None
+        );
+        assert_eq!(
+            extra_path_marker("/data/home/me/.*.jsonl", home, &others),
+            None
+        );
+        assert_eq!(
+            extra_path_marker("/data/home/me/backup/sessions.db", home, &others).as_deref(),
+            Some("/data/home/me/backup/sessions.db")
+        );
+        // An exact file directly under HOME is still distinguishable.
+        assert_eq!(
+            extra_path_marker("/data/home/me/opencode-backup.db", home, &others).as_deref(),
+            Some("/data/home/me/opencode-backup.db")
+        );
+        // Globs within the file name keep the literal prefix, so agents
+        // sharing a directory stay distinct.
+        assert_eq!(
+            extra_path_marker("/data/home/me/archive/claude-*.jsonl", home, &others).as_deref(),
+            Some("/data/home/me/archive/claude-")
+        );
+        assert_eq!(
+            extra_path_marker("/data/home/me/backup/*/x.db", home, &others).as_deref(),
+            Some("/data/home/me/backup")
+        );
+        // Glob in the middle of a component: cut to the directory (HOME).
+        assert_eq!(
+            extra_path_marker("/data/home/me/.c*/x.db", home, &others),
+            None
+        );
+        assert_eq!(extra_path_marker("/data/home/me/*.db", home, &others), None);
+        // An alias of HOME (e.g. /home/me -> /data/home/me) is also rejected.
+        assert_eq!(extra_path_marker("/home/me/*.jsonl", home, &others), None);
+        assert_eq!(
+            extra_path_marker("/tmp/archive/*/*.jsonl", home, &others).as_deref(),
+            Some("/tmp/archive")
         );
     }
 

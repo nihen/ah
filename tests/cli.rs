@@ -365,6 +365,7 @@ fn log_interactive_with_o_emits_field_tsv_after_selection() {
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
         .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env_remove("XDG_DATA_HOME")
         .args([
             "log",
             "-a",
@@ -498,6 +499,7 @@ fn log_interactive_display_overrides_picker_columns() {
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
         .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env_remove("XDG_DATA_HOME")
         .args([
             "log",
             "-a",
@@ -549,6 +551,7 @@ fn show_interactive_display_allows_matched() {
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
         .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env_remove("XDG_DATA_HOME")
         .args([
             "show",
             "-a",
@@ -619,6 +622,7 @@ fn show_interactive_with_o_emits_field_tsv_after_selection() {
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
         .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env_remove("XDG_DATA_HOME")
         .args([
             "show",
             "-a",
@@ -696,4 +700,172 @@ fn memory_field_list() {
         .success()
         .stdout(predicate::str::contains("agent"))
         .stdout(predicate::str::contains("path"));
+}
+
+// ─── opencode (SQLite) ─────────────────────────────────────────────
+
+/// Create `$HOME/.local/share/opencode/opencode.db` with one session.
+fn opencode_home() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    // ah canonicalizes HOME (e.g. macOS /var -> /private/var).
+    let db = fs::canonicalize(tmp.path())
+        .unwrap()
+        .join(".local/share/opencode/opencode.db");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        r#"
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
+            title TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, data TEXT NOT NULL);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+            session_id TEXT NOT NULL, data TEXT NOT NULL);
+        INSERT INTO session VALUES
+            ('ses_oc1', NULL, '/nonexistent/proj', 'Fix the parser', 1700000000000, 1700000100000);
+        INSERT INTO message VALUES
+            ('msg_1', 'ses_oc1', 1, '{"role":"user"}'),
+            ('msg_2', 'ses_oc1', 2, '{"role":"assistant"}');
+        INSERT INTO part VALUES
+            ('prt_1', 'msg_1', 'ses_oc1', '{"type":"text","text":"please fix the parser"}'),
+            ('prt_2', 'msg_2', 'ses_oc1', '{"type":"tool","state":{"output":"opencode-needle"}}'),
+            ('prt_3', 'msg_2', 'ses_oc1', '{"type":"text","text":"done"}');
+        "#,
+    )
+    .unwrap();
+    tmp
+}
+
+fn ah_opencode(home: &Path) -> Command {
+    let mut cmd = ah();
+    cmd.env("HOME", home)
+        .env_remove("XDG_DATA_HOME")
+        .env("CLAUDE_CONFIG_DIR", "/nonexistent")
+        .env("CODEX_HOME", "/nonexistent")
+        .env("GEMINI_CLI_HOME", "/nonexistent")
+        .env("COPILOT_HOME", "/nonexistent")
+        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env("GROK_HOME", "/nonexistent");
+    cmd
+}
+
+#[test]
+fn opencode_log_search_show_and_resume() {
+    let tmp = opencode_home();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let home = home.as_path();
+    let session_path = home.join(".local/share/opencode/opencode.db/ses_oc1");
+    let session_path = session_path.to_str().unwrap();
+
+    ah_opencode(home)
+        .args(["log", "-a", "-o", "agent,id,title,path"])
+        .assert()
+        .success()
+        .stdout(format!(
+            "opencode\tses_oc1\tFix the parser\t{}\n",
+            session_path
+        ));
+
+    // Full-text search covers tool output stored in the part table.
+    ah_opencode(home)
+        .args(["log", "-a", "-q", "opencode-needle", "-o", "id"])
+        .assert()
+        .success()
+        .stdout("ses_oc1\n");
+
+    ah_opencode(home)
+        .args(["show", session_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("please fix the parser"))
+        .stdout(predicate::str::contains("done"));
+
+    ah_opencode(home)
+        .args(["show", "--raw", "ses_oc1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"opencode-needle\""));
+
+    ah_opencode(home)
+        .args(["resume", "--print", "ses_oc1"])
+        .assert()
+        .success()
+        .stdout("cd '/nonexistent/proj' && 'opencode' '--session' 'ses_oc1'\n");
+}
+
+#[test]
+fn opencode_respects_xdg_data_home() {
+    let tmp = opencode_home();
+    let data_home = tmp.path().join(".local/share");
+    let other_home = TempDir::new().unwrap();
+    ah_opencode(other_home.path())
+        .env("XDG_DATA_HOME", &data_home)
+        .args(["log", "-a", "-o", "agent,id"])
+        .assert()
+        .success()
+        .stdout("opencode\tses_oc1\n");
+}
+
+#[test]
+fn opencode_duplicate_session_keeps_newest_copy() {
+    let tmp = opencode_home();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let backup = home.join(".local/share/opencode/opencode-backup.db");
+    let conn = rusqlite::Connection::open(&backup).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
+            title TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+        INSERT INTO session VALUES
+            ('ses_oc1', NULL, '/nonexistent/proj', 'Old title', 1700000000000, 1600000000000);
+        "#,
+    )
+    .unwrap();
+    drop(conn);
+
+    // The newest copy wins regardless of the sort order.
+    for sort in [
+        &[][..],
+        &["--asc"],
+        &["-S", "title"],
+        &["-S", "title", "--asc"],
+    ] {
+        ah_opencode(&home)
+            .args(["log", "-a", "-o", "agent,id,title"])
+            .args(sort)
+            .assert()
+            .success()
+            .stdout("opencode\tses_oc1\tFix the parser\n");
+    }
+    // Prefix lookup is not ambiguous.
+    ah_opencode(&home)
+        .args(["show", "-o", "title", "ses_oc"])
+        .assert()
+        .success()
+        .stdout("Fix the parser\n");
+}
+
+#[test]
+fn opencode_unattributable_extra_copy_does_not_hide_sessions() {
+    // A same-age copy directly under HOME via an overly broad extra pattern
+    // must not replace the sessions of the real database.
+    let tmp = opencode_home();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    fs::copy(
+        home.join(".local/share/opencode/opencode.db"),
+        home.join("zz.db"),
+    )
+    .unwrap();
+    fs::write(
+        home.join(".ahrc"),
+        "[agents.opencode]\nextra_patterns = [\"~/*.db\"]\n",
+    )
+    .unwrap();
+    ah_opencode(&home)
+        .args(["log", "-a", "-o", "agent,id"])
+        .assert()
+        .success()
+        .stdout("opencode\tses_oc1\n")
+        .stderr(predicate::str::contains("cannot be told apart"));
 }

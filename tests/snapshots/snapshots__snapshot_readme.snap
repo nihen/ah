@@ -6,7 +6,7 @@ expression: readme
 
 **A**gent **H**istory — search, inspect, and resume coding-agent sessions from a single CLI.
 
-`ah` discovers session files from [Claude Code](https://claude.ai/), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Cursor](https://cursor.com/), [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli), [Antigravity CLI](https://antigravity.google/) (`agy`), and [Grok CLI](https://x.ai/) (`grok`). It works with zero config, defaults to the current directory, and gives you one place to search, inspect, and resume past work.
+`ah` discovers session files from [Claude Code](https://claude.ai/), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Cursor](https://cursor.com/), [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli), [Antigravity CLI](https://antigravity.google/) (`agy`), [Grok CLI](https://x.ai/) (`grok`), and [opencode](https://opencode.ai/) (`opencode`). It works with zero config, defaults to the current directory, and gives you one place to search, inspect, and resume past work.
 
 Read-only by default. `ah` works directly on agent session files, lets you search and inspect them, and only executes when you explicitly run `resume`.
 
@@ -119,10 +119,11 @@ gemini           5  2026-03-21 10:50
 | Cursor | ✓ | ✓ | ✓ | ✓ | | |
 | Antigravity (agy) | ✓ | ✓ | ✓ | ✓ | | |
 | Grok | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| opencode | ✓ | ✓ | ✓ | ✓ | | |
 
 ## Features
 
-- **Cross-agent** — one tool for 7 agents (see `ah list-agents`)
+- **Cross-agent** — one tool for 8 agents (see `ah list-agents`)
 - **Zero-config** — scans the standard session locations for each supported CLI
 - **Fast** — parallel file collection with [rayon](https://github.com/rayon-rs/rayon), regex search via [memmap2](https://github.com/RazrFalcon/memmap2-rs), no subprocesses for search/parsing
 - **Resume-friendly** — `ah resume` and `ah show` can target the latest matching session without pasting IDs
@@ -490,7 +491,7 @@ ah_path = "/usr/local/bin/ah"      # path to ah binary on remote (optional, defa
 |-------|----------|-------------|
 | `disabled` | No | Set to `true` to hide this agent from all commands |
 | `extra_patterns` | No | Additional glob patterns to scan (built-in agents only) |
-| `plugin` | Yes* | Parser to use: `claude`, `codex`, `gemini`, `copilot`, `cursor`, `agy`, `grok` (*required for custom agents) |
+| `plugin` | Yes* | Parser to use: `claude`, `codex`, `gemini`, `copilot`, `cursor`, `agy`, `grok`, `opencode` (*required for custom agents) |
 | `file_patterns` | Yes* | Glob patterns for session files (*required for custom agents) |
 
 All glob patterns must start with `~/` or `/` (absolute paths only). `~` is expanded to the home directory.
@@ -509,6 +510,8 @@ disabled = true
 extra_patterns = ["~/claude-archive/projects/*/*.jsonl"]
 ```
 
+Sessions found through `extra_patterns` are attributed to the agent by the pattern's literal part (before the first glob character), so keep each agent's extra files in a dedicated directory or under a distinct name prefix. A pattern whose literal part cannot be told apart from your home directory or another agent's default directory (e.g. `~/*.jsonl`, `~/.c*.db`, `~/backup-*/x.db`) is ignored with a warning.
+
 ### Add a custom agent (using an existing plugin's parser)
 
 ```toml
@@ -517,7 +520,7 @@ plugin = "claude"
 file_patterns = ["~/.mybot/sessions/*.jsonl"]
 ```
 
-The `plugin` field tells `ah` how to parse the session files. Available plugins: `claude`, `codex`, `gemini`, `copilot`, `cursor`, `agy`, `grok`.
+The `plugin` field tells `ah` how to parse the session files. Available plugins: `claude`, `codex`, `gemini`, `copilot`, `cursor`, `agy`, `grok`, `opencode`.
 
 ### Remote hosts
 
@@ -558,6 +561,9 @@ Each built-in agent respects its CLI's config directory environment variable:
 | Cursor  | `projects/*/agent-transcripts/**/*.jsonl` | `CURSOR_CONFIG_DIR`| `~/.cursor` |
 | Antigravity (agy) | `antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl` | — | `~/.gemini` |
 | Grok    | `sessions/*/*/chat_history.jsonl` | `GROK_HOME`        | `~/.grok`   |
+| opencode | `opencode/opencode*.db` (SQLite) | `XDG_DATA_HOME` | `~/.local/share` |
+
+opencode stores all sessions in one SQLite database. `ah` reads it read-only and lists each top-level session (subagent sessions are skipped) under the virtual path `<db>/<session-id>`, which works with `ah show`, `ah resume`, and `-o path` like a regular session file. `ah show --raw` prints one JSON line per message with its parts.
 
 Run `ah list-agents` to see the full configuration including glob patterns and capabilities.
 
