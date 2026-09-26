@@ -221,6 +221,11 @@ def main() -> None:
     # Oldest first so the codex index and file creation order look natural.
     for agent, project, when, title, turns in sorted(SESSIONS, key=lambda s: mtime_of(s[2])):
         WRITERS[agent](str(HOME / "src" / project), title, turns, mtime_of(when))
+    # The agent scene shows the one-line setup from README "For AI Agents".
+    (HOME / "src/acme-shop/AGENTS.md").write_text(
+        "`ah` — cross-agent session history CLI. Run `ah -h` for usage; key commands: "
+        "`ah log` (list sessions), `ah show` (view transcript), "
+        "`ah log -a -q \"keyword\"` (search all).\n")
     # The cold open tails this log.
     log = HOME / "src/acme-shop/log/checkout.log"
     log.parent.mkdir(parents=True)

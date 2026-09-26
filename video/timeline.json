@@ -9,6 +9,7 @@
     {"id": "search",   "kind": "terminal"},
     {"id": "show",     "kind": "terminal"},
     {"id": "resume",   "kind": "terminal", "narration_at": 1.2},
+    {"id": "agent",    "kind": "terminal"},
     {"id": "noconfig", "kind": "terminal"},
     {"id": "end",      "kind": "card", "min": 6, "transition": "fade"}
   ],

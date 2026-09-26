@@ -1,11 +1,49 @@
 #!/usr/bin/env bash
-# Stand-in for the agent CLI during recording: shows the exact resume command
-# `ah resume` launched and where, then the tail of that session, without
-# needing an authenticated agent.
+# Stand-in for agent CLIs during recording (also linked as codex, gemini, ...).
+#
+# Resume mode (`claude --resume <id>`, `codex resume <id>`): prints the exact
+# command `ah resume` launched and where, then the tail of that session.
+#
+# Agent mode (`claude` with no args): reads a request, then plays a scripted
+# agent turn whose tool calls run the real `ah` commands, so the output shown
+# is ah's actual output. Only the agent's own sentences are scripted.
 agent="$(basename "$0")"
-id="${!#}"
-printf '\n\e[2m$ %s %s\e[0m\n' "$agent" "$*"
-printf '\e[38;2;255;184;108m●\e[0m \e[1m%s\e[0m resumed in \e[38;2;189;147;249m%s\e[0m\n\n' "$agent" "${PWD/#$HOME/\~}"
-ah show "$id" 2>/dev/null | tail -n 4
-printf '\n\e[38;2;255;121;198m›\e[0m '
+dim=$'\e[2m' bold=$'\e[1m' reset=$'\e[0m'
+orange=$'\e[38;2;255;184;108m' purple=$'\e[38;2;189;147;249m' pink=$'\e[38;2;255;121;198m'
+
+if [[ "${1:-}" == "--resume" || "${1:-}" == "resume" ]]; then
+  id="${!#}"
+  printf '\n%s$ %s %s%s\n' "$dim" "$agent" "$*" "$reset"
+  printf '%s●%s %s%s%s resumed in %s%s%s\n\n' "$orange" "$reset" "$bold" "$agent" "$reset" "$purple" "${PWD/#$HOME/\~}" "$reset"
+  ah show "$id" 2>/dev/null | tail -n 4
+  printf '\n%s›%s ' "$pink" "$reset"
+  sleep 60
+  exit
+fi
+
+say() {  # print agent prose with a quick typewriter effect
+  printf '%s●%s ' "$orange" "$reset"
+  local s="$1" i
+  for ((i = 0; i < ${#s}; i++)); do printf '%s' "${s:i:1}"; sleep 0.012; done
+  printf '\n'
+}
+run() {  # show a tool call, then its real output, indented
+  printf '  %s$ %s%s\n' "$dim" "$1" "$reset"
+  sleep 0.5
+  bash -c "$1" 2>&1 | sed 's/^/    /'
+  sleep 0.7
+}
+
+printf '%s%s%s %s· %s%s\n\n' "$bold" "$agent" "$reset" "$dim" "${PWD/#$HOME/\~}" "$reset"
+printf '%s›%s ' "$pink" "$reset"
+read -r _request
+printf '\n'
+sleep 0.4
+say "AGENTS.md says to check session history with ah."
+run "ah log -a -q pool_timeout -o agent,project,title --table"
+run "ah show -a --agent codex -q pool_timeout | tail -n 3"
+say "Codex fixed the same leak in api-gateway last week. Porting it:"
+printf '  %s✔%s src/db/pool.ts: pool_timeout = 5s, release on error path\n' "$pink" "$reset"
+sleep 0.3
+printf '  %s✔%s tests/pool-leak.test.ts: 200 concurrent checkouts, pool drains\n' "$pink" "$reset"
 sleep 60

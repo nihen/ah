@@ -6,16 +6,17 @@
   "cards": {
     "end": {
       "name": "Agent History",
-      "tagline": "Search, read, and resume\nevery coding-agent session."
+      "tagline": "Search, read, and resume coding-agent sessions.\nFor you, and for your agents."
     }
   },
   "lines": [
-    {"scene": "cold", "tts": "Checkout is falling over. Too many database connections. <short pause> I've fixed this before. But with which agent? In which repo?", "sub": ["Checkout is falling over. Too many database connections.", "I've fixed this before. But with which agent? In which repo?"]},
-    {"scene": "log", "tts": "A-H log shows every agent session for this project. <short pause> Not here.", "sub": ["ah log shows every agent session for this project.", "Not here."]},
-    {"scene": "search", "tts": "So let's search everything. Every agent, every project. <short pause> There it is: Codex, in the API gateway, last week.", "sub": ["So let's search everything. Every agent, every project.", "There it is: Codex, in api-gateway, last week."]},
+    {"scene": "cold", "tts": "Checkout is down. Too many database connections. <short pause> I've fixed this before... but where?", "sub": ["Checkout is down. Too many database connections.", "I've fixed this before… but where?"]},
+    {"scene": "log", "tts": "A-H log. Every agent session in this project. <short pause> Nope.", "sub": ["ah log. Every agent session in this project.", "Nope."]},
+    {"scene": "search", "tts": "So, search everything. <short pause> There it is: Codex, in the API gateway, last week.", "sub": ["So, search everything.", "There it is: Codex, in api-gateway, last week."]},
     {"scene": "show", "tts": "The whole conversation, right here. Release on the error path, five-second pool timeout.", "sub": ["The whole conversation, right here.", "Release on the error path, 5-second pool_timeout."]},
     {"scene": "resume", "tts": "And A-H resume drops me right back into that Codex session, in the right directory.", "sub": ["And ah resume drops me right back into that Codex session,", "in the right directory."]},
+    {"scene": "agent", "tts": "And here's the best part: my agents can use it too. <short pause> One line in AGENTS dot M D, and Claude digs up last week's fix on its own, and ports it.", "sub": ["And here's the best part: my agents can use it too.", "One line in AGENTS.md, and Claude digs up last week's fix on its own, and ports it."]},
     {"scene": "noconfig", "tts": "No config. No daemon. No index. <short pause> It just reads what your agents already write.", "sub": ["No config. No daemon. No index.", "It just reads what your agents already write."]},
-    {"scene": "end", "tts": "That's A-H. Your agent history, one command away.", "sub": ["That's ah. Your agent history, one command away."]}
+    {"scene": "end", "tts": "That's A-H. Agent history, for you and for your agents.", "sub": ["That's ah. Agent history, for you and for your agents."]}
   ]
 }

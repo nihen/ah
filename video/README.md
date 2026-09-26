@@ -2,7 +2,7 @@
 
 About one-minute intro video for `ah`, in English and Japanese, for 16:9 (YouTube, web) and 9:16 (X, Shorts).
 
-It is a single first-person debugging story told in a real terminal, with a cold open and no title card: checkout in `acme-shop` fails with "too many connections", `ah log` shows it is not in this project, `ah log -a -q` finds last week's Codex fix in `api-gateway`, `ah show` reads it, `ah resume` jumps back into it, then "no config, no daemon, no index" and an end card.
+It is a single first-person debugging story told in a real terminal, with a cold open and no title card: checkout in `acme-shop` fails with "too many connections", `ah log` shows it is not in this project, `ah log -a -q` finds last week's Codex fix in `api-gateway`, `ah show` reads it, `ah resume` jumps back into it, then an agent does the same search on its own via the one-line AGENTS.md setup from the main README, then "no config, no daemon, no index" and an end card.
 
 - Terminal footage: recorded with [VHS](https://github.com/charmbracelet/vhs) on a story-driven sandbox from `sandbox.py` (shared by both languages)
 - Narration: Gemini 3.8 Flash TTS (`gemini-3.8-flash-tts`)
@@ -44,6 +44,6 @@ TTS and BGM results are cached, so re-running only calls the API when text, voic
 - Terminal actions: `scenes/<scene>.tape`; session data: `sandbox.py`
 - Adding a language: add `script/<lang>.json`; the terminal footage is reused
 
-`bin/claude` (linked as `codex`, `gemini`, …) stands in for the agent CLI during recording: it prints the exact resume command `ah resume` launched and the tail of that session, without needing an authenticated agent.
+`bin/claude` (linked as `codex`, `gemini`, …) stands in for the agent CLI during recording, without needing an authenticated agent. For `ah resume` it prints the exact command that was launched and the tail of that session. In the agent scene it plays a scripted agent turn whose tool calls run the real `ah` commands, so the output on screen is ah's actual output; only the agent's own sentences are scripted.
 
 `ah` takes a session's start time from the file's birth time, which cannot be set, so "today" sessions get modification times just after generation and their Date range reads naturally.
