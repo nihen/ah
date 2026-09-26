@@ -59,6 +59,24 @@ pub fn decode_claude_project(encoded_dir: &str) -> String {
     full.rsplit('/').next().unwrap_or(&full).to_string()
 }
 
+/// Raw session bytes used for full-text search: a memory-mapped file, or an
+/// owned buffer for sessions that are not stored as a single file.
+pub enum SessionBytes {
+    Mmap(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for SessionBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            SessionBytes::Mmap(m) => m,
+            SessionBytes::Owned(v) => v,
+        }
+    }
+}
+
 pub fn mmap_file(path: &Path) -> Option<Mmap> {
     let file = fs::File::open(path).ok()?;
     let meta = file.metadata().ok()?;

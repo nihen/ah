@@ -5,7 +5,6 @@ use regex::Regex;
 use regex::bytes::Regex as BytesRegex;
 
 use crate::agents;
-use crate::agents::common::mmap_file;
 use crate::cli::{Field, FieldFilter, SearchMode, SortOrder};
 use crate::collector;
 use crate::color;
@@ -146,10 +145,16 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
             let plugin = agents::find_plugin_for_path(path);
 
             // Mmap the search file once — shared across search, resolve_matched,
-            // resolve_title, and resolve_cwd.
+            // resolve_title, and resolve_cwd. Plugins with expensive session
+            // bytes (e.g. SQLite exports) load them after the early filters,
+            // and only for full-text search.
             let search_path = plugin.search_path(path);
             let is_session_file = search_path == *path;
-            let mmap = mmap_file(&search_path);
+            let mut mmap = if plugin.cheap_session_bytes() {
+                plugin.session_bytes(path)
+            } else {
+                None
+            };
 
             // Early field filters (cwd, agent) — cheap, before query search.
             // Use mmap for cwd resolution when the search file IS the session file.
@@ -173,6 +178,14 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
                         return None;
                     }
                 }
+            }
+
+            if mmap.is_none()
+                && has_query
+                && params.search_mode == SearchMode::All
+                && !plugin.cheap_session_bytes()
+            {
+                mmap = plugin.session_bytes(path);
             }
 
             // Query search using pre-loaded mmap

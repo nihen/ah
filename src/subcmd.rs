@@ -145,7 +145,7 @@ pub fn resolve_session_ref(s: &str, home: &Path) -> Result<PathBuf, String> {
 
     // Try as file path
     let pb = PathBuf::from(s);
-    if pb.exists() {
+    if session_exists(&pb) {
         return Ok(pb);
     }
 
@@ -153,7 +153,7 @@ pub fn resolve_session_ref(s: &str, home: &Path) -> Result<PathBuf, String> {
     let unquoted = crate::output::strip_quotes(s);
     if unquoted != s {
         let pb = PathBuf::from(unquoted);
-        if pb.exists() {
+        if session_exists(&pb) {
             return Ok(pb);
         }
     }
@@ -165,7 +165,7 @@ pub fn resolve_session_ref(s: &str, home: &Path) -> Result<PathBuf, String> {
     let unescaped = crate::output::unescape_tsv(unquoted);
     if unescaped != unquoted {
         let pb = PathBuf::from(&unescaped);
-        if pb.exists() {
+        if session_exists(&pb) {
             return Ok(pb);
         }
         if let Ok(p) = resolve_by_id(&unescaped, home) {
@@ -175,6 +175,15 @@ pub fn resolve_session_ref(s: &str, home: &Path) -> Result<PathBuf, String> {
 
     // Try as session ID (use unquoted value)
     resolve_by_id(unquoted, home)
+}
+
+/// A session reference exists as a file, or as a virtual session of a plugin
+/// (e.g. `<opencode.db>/<session-id>`).
+fn session_exists(path: &Path) -> bool {
+    path.exists()
+        || agents::find_plugin_for_path(path)
+            .session_mtime(path)
+            .is_some()
 }
 
 fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
@@ -305,6 +314,7 @@ mod tests {
         // The matching round-trip case: `escape_tsv` emitted `\\t` for a
         // file whose actual on-disk name has a TAB; piping that back must
         // hit the unescape fallback and resolve the TAB-named file.
+        crate::config::init(&crate::agents::common::canonical_home());
         let tmp = tempfile::tempdir().unwrap();
         let real_path = tmp.path().join("real\ttab.jsonl"); // literal TAB
         std::fs::write(&real_path, "").unwrap();

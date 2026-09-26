@@ -116,7 +116,7 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
 
     match format {
         ShowFormat::Raw => {
-            if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Some(content) = plugin.raw_content(&path) {
                 print!("{}", content);
             } else {
                 return Err(format!("Failed to read: {}", path.display()));
@@ -171,9 +171,9 @@ pub(crate) fn emit_session_meta_tsv(
     let plugin = agents::find_plugin_for_path(path);
     // Fail fast if the file is unreadable so scripts get a non-zero exit
     // instead of plausible-but-empty TSV values.
-    let mtime = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map_err(|e| format!("Failed to read session metadata: {}", e))?;
+    let mtime = plugin
+        .session_mtime(path)
+        .ok_or_else(|| format!("Failed to read session metadata: {}", path.display()))?;
     // Pass query through to ResolveOpts so the `matched` field can populate
     // for `ah show -q QUERY -o matched`. transcript_limit/title_limit = 0 to
     // avoid truncating fields like `transcript`/`first_prompt`/`title` —
@@ -288,7 +288,7 @@ fn run_pretty(path: &std::path::Path, head: Option<usize>, hl_re: Option<&regex:
     if first {
         eprintln!("(only metadata — no conversation messages)");
         eprintln!();
-        if let Ok(content) = std::fs::read_to_string(path) {
+        if let Some(content) = agents::find_plugin_for_path(path).raw_content(path) {
             print!("{}", content);
         }
     }

@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -7,7 +6,7 @@ use std::time::SystemTime;
 use regex::Regex;
 use regex::bytes::Regex as BytesRegex;
 
-use crate::agents::common::{format_mtime, mmap_file};
+use crate::agents::common::format_mtime;
 use crate::agents::{AgentPlugin, Message, MessageRole};
 use crate::cli::{Field, SearchMode};
 
@@ -64,10 +63,9 @@ fn resolve_date(path: &Path, plugin: &dyn AgentPlugin, mtime: SystemTime) -> Str
         .unwrap_or_else(|| format_mtime(mtime))
 }
 
-fn resolve_created(path: &Path, mtime: SystemTime) -> String {
-    fs::metadata(path)
-        .ok()
-        .and_then(|m| m.created().ok())
+fn resolve_created(path: &Path, plugin: &dyn AgentPlugin, mtime: SystemTime) -> String {
+    plugin
+        .session_created(path)
         .map(format_mtime)
         .unwrap_or_else(|| format_mtime(mtime))
 }
@@ -80,8 +78,8 @@ fn truncate_chars(s: &str, limit: usize) -> String {
     format!("{}..", truncated)
 }
 
-fn resolve_size(path: &Path) -> u64 {
-    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+fn resolve_size(path: &Path, plugin: &dyn AgentPlugin) -> u64 {
+    plugin.session_size(path).unwrap_or(0)
 }
 
 pub fn shell_quote(value: &str) -> String {
@@ -132,7 +130,8 @@ fn resolve_matched(
                 return String::new();
             };
             resolve_matched_mmap(
-                &plugin.search_path(path),
+                path,
+                plugin,
                 bytes_re,
                 preloaded_mmap,
                 opts.literal_needle.as_deref(),
@@ -152,6 +151,7 @@ fn resolve_matched(
 /// surrounding ~200 bytes to UTF-8 for context extraction.
 fn resolve_matched_mmap(
     path: &Path,
+    plugin: &dyn AgentPlugin,
     bytes_re: &BytesRegex,
     preloaded: Option<&[u8]>,
     literal_needle: Option<&[u8]>,
@@ -160,7 +160,7 @@ fn resolve_matched_mmap(
     let data: &[u8] = if let Some(d) = preloaded {
         d
     } else {
-        mmap_holder = mmap_file(path);
+        mmap_holder = plugin.session_bytes(path);
         match &mmap_holder {
             Some(m) => m,
             None => return String::new(),
@@ -659,7 +659,7 @@ pub fn resolve_fields_with_mmap(
                 .resolve_project(path, home)
                 .unwrap_or_else(|| default_project(path)),
             Field::ModifiedAt => resolve_date(path, plugin, mtime),
-            Field::CreatedAt => resolve_created(path, mtime),
+            Field::CreatedAt => resolve_created(path, plugin, mtime),
             Field::Title => plugin_title
                 .clone()
                 .map(|s| truncate_chars(&s, opts.title_limit))
@@ -675,7 +675,7 @@ pub fn resolve_fields_with_mmap(
             Field::Cwd => cwd.clone().unwrap_or_default(),
             Field::Id => plugin.resolve_resume_id(path, home).unwrap_or_default(),
             Field::ResumeCmd => resolve_resume_command(path, plugin, home, &cwd),
-            Field::Size => resolve_size(path).to_string(),
+            Field::Size => resolve_size(path, plugin).to_string(),
             Field::Matched => resolve_matched(path, plugin, opts, preloaded_mmap),
             _ => String::new(),
         };
@@ -688,6 +688,7 @@ pub fn resolve_fields_with_mmap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::common::mmap_file;
     use crate::agents::find_plugin;
     use std::path::PathBuf;
     use std::sync::Once;
@@ -1031,7 +1032,7 @@ mod tests {
     fn test_resolve_matched_mmap_basic() {
         let path = fixture_path("claude_session.jsonl");
         let re = BytesRegex::new("(?iu)auth").unwrap();
-        let result = resolve_matched_mmap(&path, &re, None, None);
+        let result = resolve_matched_mmap(&path, find_plugin("claude").unwrap(), &re, None, None);
         assert!(!result.is_empty());
         assert!(result.contains("auth"));
     }
@@ -1040,14 +1041,20 @@ mod tests {
     fn test_resolve_matched_mmap_no_match() {
         let path = fixture_path("claude_session.jsonl");
         let re = BytesRegex::new("ZZZZNOTEXIST").unwrap();
-        let result = resolve_matched_mmap(&path, &re, None, None);
+        let result = resolve_matched_mmap(&path, find_plugin("claude").unwrap(), &re, None, None);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_resolve_matched_mmap_nonexistent_file() {
         let re = BytesRegex::new("test").unwrap();
-        let result = resolve_matched_mmap(Path::new("/nonexistent"), &re, None, None);
+        let result = resolve_matched_mmap(
+            Path::new("/nonexistent"),
+            find_plugin("claude").unwrap(),
+            &re,
+            None,
+            None,
+        );
         assert!(result.is_empty());
     }
 
@@ -1062,7 +1069,7 @@ mod tests {
             .join("\n");
         std::fs::write(&path, content).unwrap();
         let re = BytesRegex::new("hello").unwrap();
-        let result = resolve_matched_mmap(&path, &re, None, None);
+        let result = resolve_matched_mmap(&path, find_plugin("claude").unwrap(), &re, None, None);
         // Returns only the first match context (no " | " separator)
         assert!(result.contains("hello"));
         assert!(

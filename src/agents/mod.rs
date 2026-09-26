@@ -6,9 +6,13 @@ mod copilot;
 mod cursor;
 mod gemini;
 mod grok;
+mod opencode;
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+use common::{SessionBytes, mmap_file};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRole {
@@ -95,6 +99,45 @@ pub trait AgentPlugin: Sync {
         path.to_path_buf()
     }
 
+    /// Expand a file matched by `glob_patterns` into sessions.
+    /// Returns `None` when the file itself is the session (the default).
+    /// Plugins whose sessions live inside a container file (e.g. rows of a
+    /// SQLite database) return virtual paths such as `<db>/<session-id>`
+    /// with each session's modification time. Virtual paths never exist on
+    /// disk, so every filesystem access must go through the hooks below.
+    fn expand_sessions(&self, _file: &Path) -> Option<Vec<(PathBuf, SystemTime)>> {
+        None
+    }
+
+    /// Modification time of a session; `None` when the session does not exist.
+    fn session_mtime(&self, path: &Path) -> Option<SystemTime> {
+        fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
+
+    fn session_created(&self, path: &Path) -> Option<SystemTime> {
+        fs::metadata(path).and_then(|m| m.created()).ok()
+    }
+
+    fn session_size(&self, path: &Path) -> Option<u64> {
+        fs::metadata(path).map(|m| m.len()).ok()
+    }
+
+    /// Bytes used for full-text search. Defaults to mmapping `search_path`.
+    fn session_bytes(&self, path: &Path) -> Option<SessionBytes> {
+        mmap_file(&self.search_path(path)).map(SessionBytes::Mmap)
+    }
+
+    /// Whether `session_bytes` is cheap enough to load for every listed
+    /// session even when no full-text query needs it.
+    fn cheap_session_bytes(&self) -> bool {
+        true
+    }
+
+    /// Raw session content for `ah show -f raw`.
+    fn raw_content(&self, path: &Path) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
     fn resolve_project(&self, _path: &Path, _home: &Path) -> Option<String> {
         None
     }
@@ -162,7 +205,7 @@ impl AgentPlugin for UnknownPlugin {
 }
 
 static UNKNOWN_PLUGIN: UnknownPlugin = UnknownPlugin;
-static PLUGINS: [&'static dyn AgentPlugin; 7] = [
+static PLUGINS: [&'static dyn AgentPlugin; 8] = [
     &claude::PLUGIN,
     &codex::PLUGIN,
     &gemini::PLUGIN,
@@ -170,6 +213,7 @@ static PLUGINS: [&'static dyn AgentPlugin; 7] = [
     &cursor::PLUGIN,
     &agy::PLUGIN,
     &grok::PLUGIN,
+    &opencode::PLUGIN,
 ];
 
 pub fn all_plugins() -> &'static [&'static dyn AgentPlugin] {
@@ -209,6 +253,7 @@ mod tests {
         assert_eq!(find_plugin("cursor").unwrap().id(), "cursor");
         assert_eq!(find_plugin("agy").unwrap().id(), "agy");
         assert_eq!(find_plugin("grok").unwrap().id(), "grok");
+        assert_eq!(find_plugin("opencode").unwrap().id(), "opencode");
         assert!(find_plugin("foobar").is_none());
     }
 
@@ -258,6 +303,10 @@ mod tests {
             .id(),
             "grok"
         );
+        let opencode_db = crate::config::resolve_agent_base("opencode")
+            .unwrap()
+            .join("opencode/opencode.db/ses_abc");
+        assert_eq!(find_plugin_for_path(&opencode_db).id(), "opencode");
         assert_eq!(
             find_plugin_for_path(Path::new("/tmp/random.txt")).id(),
             "unknown"
