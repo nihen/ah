@@ -77,7 +77,8 @@ fn use_preview(ia: &InteractiveArgs, selector: &str) -> bool {
 /// In LTSV mode the key is `<prefix>:<escape_tsv_lossless value>`: strip the
 /// label and let `printf '%b'` decode the escapes (`\\` / `\t` / `\n` / `\r`)
 /// so the preview receives the actual path even for Windows-style cwds
-/// (`C:\...`) or paths with embedded tabs/newlines.
+/// (`C:\...`) or paths with embedded tabs/newlines. The trailing `x` guards
+/// against `$(...)` stripping trailing newlines from the decoded path.
 ///
 /// fzf runs preview/transform commands with `$SHELL`, which may not be POSIX
 /// (e.g. fish). The script is therefore passed as a single-quoted argument to
@@ -86,7 +87,7 @@ fn preview_sh(ltsv: bool, path_prefix: &str, body: &str) -> String {
     let mut script = "p=$1; eval \"p=$p\"; ".to_string();
     if ltsv {
         script.push_str(&format!(
-            "p=${{p#{}:}}; p=$(printf '%b' \"$p\"); ",
+            "p=${{p#{}:}}; p=$(printf '%bx' \"$p\"); p=${{p%x}}; ",
             path_prefix
         ));
     }
@@ -1216,6 +1217,12 @@ mod tests {
     fn preview_prefix_round_trips_special_paths() {
         let path = "/tmp/a b'c\"d$x`e`\\f.jsonl";
         let ltsv_key = format!("path:{}", output::escape_tsv_lossless(&shell_quote(path)));
+        // LTSV decoding goes through `$(...)`, which would drop trailing newlines.
+        let nl_path = "/tmp/dir\n\n";
+        let nl_key = format!(
+            "path:{}",
+            output::escape_tsv_lossless(&shell_quote(nl_path))
+        );
         // fish is the common non-POSIX $SHELL; exercise it too when installed.
         for shell in ["sh", "bash", "fish"] {
             if std::process::Command::new(shell)
@@ -1233,6 +1240,7 @@ mod tests {
                 "{shell}"
             );
             assert_eq!(eval_preview(shell, true, &ltsv_key), path, "{shell}");
+            assert_eq!(eval_preview(shell, true, &nl_key), nl_path, "{shell}");
         }
     }
 }
