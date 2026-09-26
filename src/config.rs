@@ -15,6 +15,9 @@ pub struct AgentDef {
     pub plugin: &'static dyn AgentPlugin,
     pub glob_patterns: Vec<String>,
     pub path_markers: Vec<String>,
+    /// Extra patterns without a marker of their own: their matches are used
+    /// only when they already map back to this agent's plugin.
+    pub unattributed_patterns: Vec<String>,
     pub disabled: bool,
     pub description: String,
     pub is_builtin: bool,
@@ -252,6 +255,7 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
                 plugin: *plugin,
                 glob_patterns,
                 path_markers,
+                unattributed_patterns: Vec::new(),
                 disabled: false,
                 description: plugin.description().to_string(),
                 is_builtin: true,
@@ -309,12 +313,18 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
                                         existing.path_markers.push(marker);
                                     }
                                 }
-                                None => eprintln!(
-                                    "Warning: ~/.ahrc [agents.{}]: extra pattern '{}' cannot be told \
-                                     apart from HOME or another agent's directory; ignored (use a \
-                                     dedicated directory or name prefix)",
-                                    agent_id, pattern
-                                ),
+                                None => {
+                                    eprintln!(
+                                        "Warning: ~/.ahrc [agents.{}]: extra pattern '{}' cannot be \
+                                         told apart from HOME or another agent's directory; only \
+                                         matches already inside this agent's own locations are used \
+                                         (use a dedicated directory or name prefix)",
+                                        agent_id, pattern
+                                    );
+                                    // Still scanned: matches under the agent's default
+                                    // locations map back to it; the collector skips others.
+                                    existing.unattributed_patterns.push(expanded.clone());
+                                }
                             }
                             existing.glob_patterns.push(expanded);
                         }
@@ -360,6 +370,7 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
                 plugin,
                 glob_patterns,
                 path_markers,
+                unattributed_patterns: Vec::new(),
                 disabled: entry.disabled.unwrap_or(false),
                 description: plugin.description().to_string(),
                 is_builtin: false,
@@ -613,12 +624,16 @@ extra_patterns = ["~/backup/sessions.db", "~/*.db"]
         let opencode = agents.iter().find(|a| a.id == "opencode").unwrap();
         let backup = home.join("backup/sessions.db");
         assert!(opencode.matches_path(&backup.join("ses_x")));
-        // A marker at HOME itself would match every agent's files.
+        // A marker at HOME itself would match every agent's files; the pattern
+        // is still scanned, but its matches must map back to the agent.
         assert!(
             !opencode
                 .path_markers
                 .contains(&home.to_string_lossy().to_string())
         );
+        let broad = home.join("*.db").to_string_lossy().to_string();
+        assert!(opencode.glob_patterns.contains(&broad));
+        assert_eq!(opencode.unattributed_patterns, vec![broad]);
     }
 
     #[test]

@@ -17,18 +17,22 @@ pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
     let debug = color::is_debug();
     let t0 = if debug { Some(Instant::now()) } else { None };
 
-    let patterns: Vec<(&'static dyn AgentPlugin, String)> = config::active_agents()
+    // (plugin, pattern, whether matches must be checked to map back to the plugin)
+    let patterns: Vec<(&'static dyn AgentPlugin, String, bool)> = config::active_agents()
         .flat_map(|agent| {
-            agent
-                .glob_patterns
-                .iter()
-                .map(move |pattern| (agent.plugin, pattern.clone()))
+            agent.glob_patterns.iter().map(move |pattern| {
+                (
+                    agent.plugin,
+                    pattern.clone(),
+                    agent.unattributed_patterns.contains(pattern),
+                )
+            })
         })
         .collect();
 
     let per_pattern: Vec<Vec<PathBuf>> = patterns
         .par_iter()
-        .map(|(_, pattern)| {
+        .map(|(_, pattern, _)| {
             glob::glob(pattern)
                 .map(|entries| entries.flatten().collect::<Vec<_>>())
                 .unwrap_or_default()
@@ -36,7 +40,7 @@ pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
         .collect();
 
     if debug {
-        for ((_, pattern), paths) in patterns.iter().zip(per_pattern.iter()) {
+        for ((_, pattern, _), paths) in patterns.iter().zip(per_pattern.iter()) {
             eprintln!("[debug] glob {:>5} files  {}", paths.len(), pattern);
         }
     }
@@ -51,19 +55,21 @@ pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
     let per_pattern: Vec<Vec<PathBuf>> = patterns
         .iter()
         .zip(per_pattern)
-        .map(|((plugin, _), paths)| {
+        .map(|((plugin, _, unattributed), paths)| {
+            let owned = |path: &PathBuf| config::find_plugin_for_path(path).id() == plugin.id();
             let mut files = Vec::new();
             for path in paths {
-                if expanded.contains(&path) {
+                // A match of an extra pattern without its own marker that does
+                // not map back to this plugin could not be parsed later, so it
+                // is skipped (and never opened) instead of listed as unknown.
+                if expanded.contains(&path) || (*unattributed && !owned(&path)) {
                     continue;
                 }
                 match plugin.expand_sessions(&path) {
                     Some(sessions) => {
                         for (session, mtime) in sessions {
-                            // A copy whose path does not map back to this plugin
-                            // (e.g. an extra pattern directly under HOME) could not
-                            // be parsed later, so it must not win over a good one.
-                            if config::find_plugin_for_path(&session).id() != plugin.id() {
+                            // An unowned copy must not win over a good one.
+                            if !owned(&session) {
                                 continue;
                             }
                             let key = (

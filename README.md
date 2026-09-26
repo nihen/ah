@@ -506,7 +506,7 @@ disabled = true
 extra_patterns = ["~/claude-archive/projects/*/*.jsonl"]
 ```
 
-Sessions found through `extra_patterns` are attributed to the agent by the pattern's literal part (before the first glob character), so keep each agent's extra files in a dedicated directory or under a distinct name prefix. A pattern whose literal part cannot be told apart from your home directory or another agent's default directory (e.g. `~/*.jsonl`, `~/.c*.db`, `~/backup-*/x.db`) is ignored with a warning.
+Sessions found through `extra_patterns` are attributed to the agent by the pattern's literal part (before the first glob character), so keep each agent's extra files in a dedicated directory or under a distinct name prefix. If the literal part cannot be told apart from your home directory or another agent's default directory (e.g. `~/*.jsonl`, `~/.c*.db`, `~/backup-*/x.db`), `ah` warns and uses only the matches that fall inside the agent's own locations (e.g. `~/*/.claude/projects/*/*.jsonl` still maps to Claude via its default `.claude` directory; with `CLAUDE_CONFIG_DIR` set, only paths under that directory do); other matches are skipped.
 
 ### Add a custom agent (using an existing plugin's parser)
 

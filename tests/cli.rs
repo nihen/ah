@@ -869,3 +869,88 @@ fn opencode_unattributable_extra_copy_does_not_hide_sessions() {
         .stdout("opencode\tses_oc1\n")
         .stderr(predicate::str::contains("cannot be told apart"));
 }
+
+#[test]
+fn broad_extra_pattern_keeps_attributable_files_only() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let other = home.join("other/.claude/projects/-x");
+    fs::create_dir_all(&other).unwrap();
+    fs::copy(
+        fixture_path("claude_session.jsonl"),
+        other.join("abc.jsonl"),
+    )
+    .unwrap();
+    fs::copy(
+        fixture_path("claude_session.jsonl"),
+        home.join("stray.jsonl"),
+    )
+    .unwrap();
+    fs::write(
+        home.join(".ahrc"),
+        "[agents.claude]\nextra_patterns = [\"~/*/.claude/projects/*/*.jsonl\", \"~/*.jsonl\"]\n",
+    )
+    .unwrap();
+    ah_opencode(&home)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .args(["log", "-a", "-o", "agent,path"])
+        .assert()
+        .success()
+        .stdout(format!(
+            "claude\t{}\n",
+            other.join("abc.jsonl").to_string_lossy()
+        ));
+    // `log` drops id-less sessions; `project` would list a stray file as
+    // an `unknown` agent if it were collected.
+    ah_opencode(&home)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .args(["project", "-o", "agents"])
+        .assert()
+        .success()
+        .stdout("claude\n");
+}
+
+#[test]
+fn unattributable_extra_match_is_never_opened() {
+    let tmp = opencode_home();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    fs::write(home.join("notes.db"), "not a database").unwrap();
+    fs::write(
+        home.join(".ahrc"),
+        "[agents.opencode]\nextra_patterns = [\"~/*.db\"]\n",
+    )
+    .unwrap();
+    ah_opencode(&home)
+        .args(["log", "-a", "-o", "agent,id"])
+        .assert()
+        .success()
+        .stdout("opencode\tses_oc1\n")
+        .stderr(predicate::str::contains("cannot be told apart"))
+        .stderr(predicate::str::contains("cannot read").not());
+}
+
+#[test]
+fn custom_agent_with_home_wide_marker_keeps_default_agent_sessions() {
+    // The custom agent's marker (HOME) wins the path attribution, but the
+    // built-in patterns are not filtered by owner: output stays as on main.
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let dir = home.join(".codex/sessions/2026/03/24");
+    fs::create_dir_all(&dir).unwrap();
+    fs::copy(
+        fixture_path("codex_session.jsonl"),
+        dir.join("rollout-2026-03-24T20-43-12-codex-sess-001.jsonl"),
+    )
+    .unwrap();
+    fs::write(
+        home.join(".ahrc"),
+        "[agents.wild]\nplugin = \"claude\"\nfile_patterns = [\"~/*/.wild/*.jsonl\"]\n",
+    )
+    .unwrap();
+    ah_opencode(&home)
+        .env_remove("CODEX_HOME")
+        .args(["log", "-a", "-o", "id"])
+        .assert()
+        .success()
+        .stdout("rollout-2026-03-24T20-43-12-codex-sess-001\n");
+}
