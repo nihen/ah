@@ -64,6 +64,37 @@ fn use_preview(ia: &InteractiveArgs, selector: &str) -> bool {
     !ia.no_preview && PREVIEW_SELECTORS.contains(&selector_bin)
 }
 
+/// Wrap `body` in a `sh -c` command that first loads the selected row's key
+/// column (field 1) into `$p`; `body` then refers to the path as `"$p"`.
+///
+/// The key column is already shell-quoted (`shell_quote`). We deliberately use
+/// the quoted `{1}` placeholder rather than fzf's raw `{r1}`: raw placeholders
+/// only exist since fzf 0.61, and older fzf (e.g. 0.44 shipped by Debian/Ubuntu)
+/// as well as `sk` pass `{r1}` through literally. `{1}` hands us the key as a
+/// literal string; `eval` then performs exactly the one level of shell
+/// unquoting that `p={r1}` used to, so IDs with spaces, quotes or `$` survive.
+///
+/// In LTSV mode the key is `<prefix>:<escape_tsv_lossless value>`: strip the
+/// label and let `printf '%b'` decode the escapes (`\\` / `\t` / `\n` / `\r`)
+/// so the preview receives the actual path even for Windows-style cwds
+/// (`C:\...`) or paths with embedded tabs/newlines. The trailing `x` guards
+/// against `$(...)` stripping trailing newlines from the decoded path.
+///
+/// fzf runs preview/transform commands with `$SHELL`, which may not be POSIX
+/// (e.g. fish). The script is therefore passed as a single-quoted argument to
+/// `sh -c`, a form every common shell parses the same way, with `{1}` as `$1`.
+fn preview_sh(ltsv: bool, path_prefix: &str, body: &str) -> String {
+    let mut script = "p=$1; eval \"p=$p\"; ".to_string();
+    if ltsv {
+        script.push_str(&format!(
+            "p=${{p#{}:}}; p=$(printf '%bx' \"$p\"); p=${{p%x}}; ",
+            path_prefix
+        ));
+    }
+    script.push_str(body);
+    format!("sh -c {} sh {{1}}", shell_quote(&script))
+}
+
 /// Detect the fzf version so the preview-search binds can be gated on the
 /// features they need (see `push_preview_search_binds`).
 ///
@@ -287,15 +318,10 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
     if preview {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
         let exe_quoted = shell_quote(&exe.to_string_lossy());
-        if ltsv {
-            // The key column is already shell-quoted, so use fzf raw mode.
-            selector_args.push(format!(
-                "--preview=p={{r1}}; p=${{p#path:}}; p=$(printf '%b' \"$p\"); {} show --color \"$p\"",
-                exe_quoted
-            ));
-        } else {
-            selector_args.push(format!("--preview={} show --color {{r1}}", exe_quoted));
-        }
+        selector_args.push(format!(
+            "--preview={}",
+            preview_sh(ltsv, "path", &format!("{} show --color \"$p\"", exe_quoted))
+        ));
         selector_args.push("--preview-window=right:60%:wrap".to_string());
         push_preview_search_binds(&mut selector_args, &exe_quoted, ltsv, "path", &selector);
     }
@@ -583,7 +609,14 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
     if preview {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
         let exe_quoted = shell_quote(&exe.to_string_lossy());
-        selector_args.push(format!("--preview={} show --color {{r1}}", exe_quoted));
+        selector_args.push(format!(
+            "--preview={}",
+            preview_sh(
+                false,
+                "path",
+                &format!("{} show --color \"$p\"", exe_quoted)
+            )
+        ));
         selector_args.push("--preview-window=right:60%:wrap".to_string());
         push_preview_search_binds(&mut selector_args, &exe_quoted, false, "path", &selector);
     }
@@ -748,14 +781,10 @@ pub fn run_resume(
     if preview {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
         let exe_quoted = shell_quote(&exe.to_string_lossy());
-        if ltsv {
-            selector_args.push(format!(
-                "--preview=p={{r1}}; p=${{p#path:}}; p=$(printf '%b' \"$p\"); {} show --color \"$p\"",
-                exe_quoted
-            ));
-        } else {
-            selector_args.push(format!("--preview={} show --color {{r1}}", exe_quoted));
-        }
+        selector_args.push(format!(
+            "--preview={}",
+            preview_sh(ltsv, "path", &format!("{} show --color \"$p\"", exe_quoted))
+        ));
         selector_args.push("--preview-window=right:60%:wrap".to_string());
         push_preview_search_binds(&mut selector_args, &exe_quoted, ltsv, "path", &selector);
     }
@@ -866,22 +895,6 @@ fn push_preview_search_binds(
     if version < (0, 62) {
         return;
     }
-    let (prefix, path_ref) = if ltsv {
-        // `printf '%b'` decodes the LTSV value's escape_tsv-style escapes
-        // (`\\` / `\t` / `\n` / `\r`) so the preview/scroll commands receive
-        // the actual path even for Windows-style cwds (`C:\...`) or paths
-        // with embedded tabs/newlines.
-        (
-            format!(
-                "p={{r1}}; p=${{p#{}:}}; p=$(printf '%b' \"$p\"); ",
-                path_prefix
-            ),
-            "\"$p\"",
-        )
-    } else {
-        (String::new(), "{r1}")
-    };
-
     // Always highlight $FZF_QUERY in the preview. Empty query → ah show
     // ignores --highlight, so this is safe at startup too.
     if let Some(pos) = selector_args
@@ -889,17 +902,28 @@ fn push_preview_search_binds(
         .position(|a| a.starts_with("--preview="))
     {
         selector_args[pos] = format!(
-            "--preview={}{} show --color --highlight=\"$FZF_QUERY\" {}",
-            prefix, exe_quoted, path_ref
+            "--preview={}",
+            preview_sh(
+                ltsv,
+                path_prefix,
+                &format!(
+                    "{} show --color --highlight=\"$FZF_QUERY\" \"$p\"",
+                    exe_quoted
+                )
+            )
         );
     }
 
     // Empty $FZF_QUERY is short-circuited to N=0: `grep -F ""` matches every
     // line, which would scroll to line 1 instead of resetting to the top
     // when the user clears the query.
-    let scroll_transform = format!(
-        "{}if [ -z \"$FZF_QUERY\" ]; then N=0; else N=`{} show {} | grep -Fni -m1 -- \"$FZF_QUERY\" | cut -d: -f1`; test -n \"$N\" || N=0; fi; echo \"change-preview-window(+$N)\"",
-        prefix, exe_quoted, path_ref
+    let scroll_transform = preview_sh(
+        ltsv,
+        path_prefix,
+        &format!(
+            "if [ -z \"$FZF_QUERY\" ]; then N=0; else N=`{} show \"$p\" | grep -Fni -m1 -- \"$FZF_QUERY\" | cut -d: -f1`; test -n \"$N\" || N=0; fi; echo \"change-preview-window(+$N)\"",
+            exe_quoted
+        ),
     );
     // change: re-render preview (so highlight follows the query even when
     // the top candidate doesn't change) and scroll to the first match.
@@ -1112,7 +1136,7 @@ mod tests {
     fn binds_for_exit(banner: &str, exit_code: i32) -> Vec<String> {
         let dir = tempfile::tempdir().unwrap();
         let selector = fake_fzf(dir.path(), banner, exit_code);
-        let mut args = vec!["--preview='ah' show --color {r1}".to_string()];
+        let mut args = vec!["--preview='ah' show --color \"$p\"".to_string()];
         push_preview_search_binds(&mut args, "'ah'", false, "path", &selector);
         args
     }
@@ -1159,5 +1183,64 @@ mod tests {
             change_bind(&args).contains("refresh-preview+bg-transform("),
             "{args:?}"
         );
+    }
+
+    /// Expand `{1}` the way fzf does for `shell` (recent fzf escapes `\` and
+    /// `'` for fish; POSIX shells get `'` → `'\''`) and run the resulting
+    /// preview command through `shell`, returning `$p`.
+    fn eval_preview(shell: &str, ltsv: bool, key: &str) -> String {
+        let quoted = if shell == "fish" {
+            format!("'{}'", key.replace('\\', "\\\\").replace('\'', "\\'"))
+        } else {
+            format!("'{}'", key.replace('\'', "'\\''"))
+        };
+        let cmd = preview_sh(ltsv, "path", "printf %s \"$p\"").replace("{1}", &quoted);
+        let out = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(cmd)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn preview_uses_quoted_field_placeholder_not_raw() {
+        // `{r1}` needs fzf 0.61+; older fzf and sk pass it through literally.
+        let cmd = preview_sh(true, "path", "true");
+        assert!(cmd.ends_with(" sh {1}"), "{cmd}");
+        assert!(!cmd.contains("{r1}"), "{cmd}");
+    }
+
+    #[test]
+    fn preview_prefix_round_trips_special_paths() {
+        let path = "/tmp/a b'c\"d$x`e`\\f.jsonl";
+        let ltsv_key = format!("path:{}", output::escape_tsv_lossless(&shell_quote(path)));
+        // LTSV decoding goes through `$(...)`, which would drop trailing newlines.
+        let nl_path = "/tmp/dir\n\n";
+        let nl_key = format!(
+            "path:{}",
+            output::escape_tsv_lossless(&shell_quote(nl_path))
+        );
+        // fish is the common non-POSIX $SHELL; exercise it too when installed.
+        for shell in ["sh", "bash", "fish"] {
+            if std::process::Command::new(shell)
+                .arg("-c")
+                .arg("true")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .is_err()
+            {
+                continue;
+            }
+            assert_eq!(
+                eval_preview(shell, false, &shell_quote(path)),
+                path,
+                "{shell}"
+            );
+            assert_eq!(eval_preview(shell, true, &ltsv_key), path, "{shell}");
+            assert_eq!(eval_preview(shell, true, &nl_key), nl_path, "{shell}");
+        }
     }
 }
