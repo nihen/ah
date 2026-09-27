@@ -343,7 +343,7 @@ fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
     // .json to .jsonl); pick the copy `ah log` lists. Explicit references
     // also reach archived sessions.
     let files = collector::collect_all_files(0);
-    let resolve_fields = [Field::Id, Field::ParentId];
+    let resolve_fields = [Field::Id];
     let opts = resolver::ResolveOpts::default();
 
     // Preferred file per session: exact id matches, then id-prefix matches,
@@ -361,7 +361,17 @@ fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
         let Some(v) = fields.get(&Field::Id) else {
             continue;
         };
-        let parent = fields.get(&Field::ParentId).cloned().unwrap_or_default();
+        if !v.starts_with(id) {
+            continue;
+        }
+        let parent = plugin.parent_session_id(fpath).unwrap_or_default();
+        // Files come newest first (ties by path, like `copy_preference`), so
+        // the first dedicated file of a top-level session is the preferred
+        // copy. Only subagent ids, which may repeat under other parents, and
+        // secondary records keep looking.
+        if v == id && parent.is_empty() && !plugin.is_secondary_record(fpath) {
+            return Ok(fpath.clone());
+        }
         let candidates = if v == id {
             exact.entry(parent)
         } else if v.starts_with(id) {
