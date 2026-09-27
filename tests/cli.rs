@@ -1670,6 +1670,62 @@ fn no_archived_uses_the_attributed_agent() {
         .stderr(predicate::str::contains("No sessions found"));
 }
 
+#[test]
+fn prompt_only_search_matches_escaped_prompts_only() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let dir = home.join(".claude/projects/-tmp-proj");
+    fs::create_dir_all(&dir).unwrap();
+    let user = |text: &str| {
+        format!(
+            r#"{{"type":"user","cwd":"/tmp/proj","message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    };
+    let assistant = |text: &str| {
+        format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    };
+    let sessions = [
+        // the prompt is written verbatim
+        ("verbatim", [user("fix the OAuth flow"), assistant("done")]),
+        // the prompt is written with `\uXXXX` escapes only
+        (
+            "escaped",
+            [user(r"\u4fee\u6b63 \u004fAuth"), assistant("ok")],
+        ),
+        // the query appears only outside the prompts
+        ("assistant", [user("hello"), assistant("OAuth 修正")]),
+    ];
+    for (name, lines) in &sessions {
+        fs::write(dir.join(format!("{name}.jsonl")), lines.join("\n") + "\n").unwrap();
+    }
+    let search = |query: &str| {
+        let output = ah_opencode(&home)
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .args(["log", "-a", "-p", "-q", query, "-o", "path"])
+            .output()
+            .unwrap();
+        let mut names: Vec<String> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|p| {
+                Path::new(p)
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(search("oauth"), ["escaped", "verbatim"]);
+    assert_eq!(search("修正"), ["escaped"]);
+    assert_eq!(search("修正 OAuth"), ["escaped"]);
+    assert!(search("done").is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn memory_matches_underscore_cwd_dedups_and_lists_shared_agents_md() {

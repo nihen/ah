@@ -397,6 +397,9 @@ impl AgentPlugin for GeminiPlugin {
     fn can_resume(&self) -> bool {
         true
     }
+    fn prompts_in_session_json(&self) -> bool {
+        true
+    }
 
     fn project_desc(&self) -> &'static str {
         "basename of cwd (raw: directory name from .gemini/tmp/, cwd from .project_root)"

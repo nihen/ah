@@ -6,8 +6,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use super::AgentPlugin;
 use super::Message;
 use super::common::canonicalize_if_exists;
-use super::common::for_each_jsonl_value;
+use super::common::for_each_jsonl_value_bytes;
 use super::common::is_safe_cli_id;
+use super::common::mmap_file;
 use super::common::percent_decode;
 use super::common::strip_home;
 use super::common::tagged_user_body;
@@ -145,6 +146,12 @@ impl AgentPlugin for AgyPlugin {
     fn can_resume(&self) -> bool {
         true
     }
+    fn prompts_in_session_json(&self) -> bool {
+        true
+    }
+    fn prompts_per_jsonl_line(&self) -> bool {
+        true
+    }
 
     fn can_follow(&self) -> bool {
         true
@@ -164,7 +171,18 @@ impl AgentPlugin for AgyPlugin {
     }
 
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
-        for_each_jsonl_value(path, |val| match Self::message_from_value(val) {
+        if let Some(mmap) = mmap_file(path) {
+            self.iter_messages_from_bytes(path, &mmap, visit);
+        }
+    }
+
+    fn iter_messages_from_bytes(
+        &self,
+        _path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(Message) -> bool,
+    ) {
+        for_each_jsonl_value_bytes(data, |val| match Self::message_from_value(val) {
             Some(msg) => visit(msg),
             None => true,
         });

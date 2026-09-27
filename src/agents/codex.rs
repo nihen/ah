@@ -250,6 +250,12 @@ impl AgentPlugin for CodexPlugin {
     fn can_resume(&self) -> bool {
         true
     }
+    fn prompts_in_session_json(&self) -> bool {
+        true
+    }
+    fn prompts_per_jsonl_line(&self) -> bool {
+        true
+    }
 
     fn can_detect_running(&self) -> bool {
         // Needs the kernel lock table (`/proc/locks`).
