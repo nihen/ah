@@ -115,8 +115,8 @@ fn decode_cursor_path_inner(root: &Path, encoded: &str) -> Option<String> {
 const MAX_DECODE_DEPTH: usize = 256;
 /// Upper bound on directories entered per decode.
 const MAX_DECODE_VISITS: usize = 10_000;
-/// Components probed per level when a directory cannot be listed.
-const MAX_PROBE_TOKENS: usize = 6;
+/// Tokens probed per level when a directory cannot be listed (640 names).
+const MAX_PROBE_TOKENS: usize = 4;
 
 struct Walk {
     total: usize,
@@ -163,7 +163,9 @@ fn list_dir(dir: &Path) -> DirListing {
 
 /// Candidate names for a directory that can be searched but not listed
 /// (mode `--x`): the next few tokens joined by every combination of the
-/// separators Cursor folds into `-`, with and without a leading `.`.
+/// separators Cursor folds into `-`, with and without a leading or trailing
+/// separator (which the encoding trims). Only single `.`, `_` or `-`
+/// separators are tried; runs such as `__tests__` or other symbols are not.
 fn probe_names(rest: &str) -> Vec<OsString> {
     let tokens: Vec<&str> = rest.split('-').take(MAX_PROBE_TOKENS).collect();
     let mut names = Vec::new();
@@ -176,8 +178,11 @@ fn probe_names(rest: &str) -> Vec<OsString> {
                 .collect();
         }
         for name in &prefixes {
-            names.push(OsString::from(format!(".{name}")));
-            names.push(OsString::from(name));
+            for lead in ["", ".", "_", "-"] {
+                for trail in ["", ".", "_", "-"] {
+                    names.push(OsString::from(format!("{lead}{name}{trail}")));
+                }
+            }
         }
     }
     names
@@ -482,15 +487,31 @@ mod tests {
     fn decode_probes_through_unlistable_parent() {
         use std::os::unix::fs::PermissionsExt;
         let (_tmp, root) = temp_root();
-        mkdirs(&root, &["locked/my_proj.v2/.hidden"]);
+        let names = ["my_proj.v2", ".a-b", "_c", "-d", "e_"];
+        for name in names {
+            mkdirs(&root, &[format!("locked/{name}/.hidden").as_str()]);
+        }
         let locked = root.join("locked");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o111)).unwrap();
-        let got = decode(&root, "locked-my-proj-v2-hidden");
+        let got: Vec<String> = names
+            .iter()
+            .map(|name| {
+                decode(
+                    &root,
+                    &format!("locked-{}-hidden", encode_cursor_component(name)),
+                )
+            })
+            .collect();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(
-            got,
-            root.join("locked/my_proj.v2/.hidden").to_string_lossy()
-        );
+        let want: Vec<String> = names
+            .iter()
+            .map(|name| {
+                root.join(format!("locked/{name}/.hidden"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(got, want);
     }
 
     #[test]
