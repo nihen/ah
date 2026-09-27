@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::SystemTime;
@@ -107,14 +106,6 @@ pub fn for_each_jsonl_value_bytes(data: &[u8], mut visit: impl FnMut(&serde_json
             }
         }
     }
-}
-
-pub fn read_first_line_json(path: &Path) -> Option<serde_json::Value> {
-    let file = fs::File::open(path).ok()?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    serde_json::from_str(&line).ok()
 }
 
 pub fn first_text_part(val: &serde_json::Value) -> Option<&str> {
