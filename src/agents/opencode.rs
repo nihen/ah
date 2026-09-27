@@ -15,8 +15,132 @@ use super::common::SessionBytes;
 use super::common::canonicalize_if_exists;
 use super::common::is_safe_cli_id;
 use super::common::strip_home;
+use super::{MemoryKind, MemorySource};
 
 pub static PLUGIN: OpencodePlugin = OpencodePlugin;
+
+/// opencode's config directory: `$XDG_CONFIG_HOME/opencode` or
+/// `~/.config/opencode`.
+fn opencode_config_dir(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".config"))
+        .join("opencode")
+}
+
+/// Files listed in the `instructions` array of `opencode.json` /
+/// `opencode.jsonc` in `dir`. Entries may be globs; relative ones resolve
+/// against `dir`, `~/` against the home directory. URLs are skipped.
+fn configured_instructions(dir: &Path, home: &Path) -> Vec<MemorySource> {
+    let mut sources = Vec::new();
+    for name in ["opencode.json", "opencode.jsonc"] {
+        let Ok(content) = std::fs::read_to_string(dir.join(name)) else {
+            continue;
+        };
+        let Ok(config) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(&content)) else {
+            continue;
+        };
+        let entries = config
+            .get("instructions")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str());
+        for entry in entries {
+            if entry.is_empty() || entry.contains("://") {
+                continue;
+            }
+            let source = if let Some(rest) = entry.strip_prefix("~/") {
+                MemorySource::new(home, rest, MemoryKind::Instruction)
+            } else if Path::new(entry).is_absolute() {
+                MemorySource::new(Path::new(""), entry, MemoryKind::Instruction)
+            } else {
+                MemorySource::new(dir, entry, MemoryKind::Instruction)
+            };
+            sources.push(source);
+        }
+    }
+    sources
+}
+
+/// Remove `//` and `/* */` comments and trailing commas from JSONC so it
+/// parses as JSON. String contents are left untouched.
+fn strip_jsonc(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if c == '\\' {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = '\0';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    // Trailing commas: a comma followed only by whitespace before `}` / `]`.
+    let mut cleaned = String::with_capacity(out.len());
+    let bytes: Vec<char> = out.chars().collect();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            cleaned.push(c);
+            if c == '\\' && i + 1 < bytes.len() {
+                cleaned.push(bytes[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+            cleaned.push(c);
+        } else if c == ',' {
+            let next = bytes[i + 1..].iter().find(|n| !n.is_whitespace());
+            if !matches!(next, Some('}') | Some(']')) {
+                cleaned.push(c);
+            }
+        } else {
+            cleaned.push(c);
+        }
+        i += 1;
+    }
+    cleaned
+}
 
 /// opencode (sst/opencode).
 ///
@@ -94,7 +218,7 @@ fn split_virtual_path(path: &Path) -> Option<(&Path, &str)> {
 }
 
 /// Percent-encode a filesystem path for a SQLite `file:` URI.
-fn uri_path(path: &Path) -> String {
+pub(super) fn uri_path(path: &Path) -> String {
     let mut out = String::new();
     for &b in path.to_string_lossy().as_bytes() {
         if b.is_ascii_alphanumeric() || b"/-_.~".contains(&b) {
@@ -377,6 +501,25 @@ impl AgentPlugin for OpencodePlugin {
         true
     }
 
+    fn can_memory(&self) -> bool {
+        true
+    }
+
+    fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
+        let config = opencode_config_dir(home);
+        let mut sources = vec![MemorySource::new(
+            &config,
+            "AGENTS.md",
+            MemoryKind::Instruction,
+        )];
+        sources.extend(configured_instructions(&config, home));
+        sources
+    }
+
+    fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
+        configured_instructions(dir, &super::common::canonical_home())
+    }
+
     fn project_desc(&self) -> &'static str {
         "basename of cwd (raw: home-relative session directory from opencode.db)"
     }
@@ -526,6 +669,38 @@ impl AgentPlugin for OpencodePlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_jsonc_removes_comments_and_trailing_commas() {
+        let src = "{\n  // line\n  \"a\": \"x//y /* z */\", /* block */\n  \"b\": [1, 2,],\n}\n";
+        let v: serde_json::Value = serde_json::from_str(&strip_jsonc(src)).unwrap();
+        assert_eq!(v["a"], "x//y /* z */");
+        assert_eq!(v["b"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn configured_instructions_resolve_relative_home_and_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("opencode.json"),
+            r#"{"instructions":["docs/*.md","~/g.md","/abs/x.md","https://e.com/r.md"]}"#,
+        )
+        .unwrap();
+        let home = Path::new("/home/u");
+        let patterns: Vec<String> = configured_instructions(dir, home)
+            .iter()
+            .map(MemorySource::pattern)
+            .collect();
+        assert_eq!(
+            patterns,
+            vec![
+                format!("{}/docs/*.md", dir.display()),
+                "/home/u/g.md".to_string(),
+                "/abs/x.md".to_string(),
+            ]
+        );
+    }
 
     /// Create a minimal opencode database (WAL mode, like opencode itself).
     /// The writer connection is closed before returning, so the -wal/-shm

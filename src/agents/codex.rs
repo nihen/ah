@@ -12,6 +12,7 @@ use super::Message;
 use super::common::format_mtime;
 use super::common::mmap_file;
 use super::common::strip_home;
+use super::{MemoryKind, MemorySource};
 
 static RE_CODEX_SESSIONS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r".*/sessions/(\d+/\d+/\d+)/.*").unwrap());
@@ -260,6 +261,29 @@ impl AgentPlugin for CodexPlugin {
     fn can_detect_running(&self) -> bool {
         // Needs the kernel lock table (`/proc/locks`).
         cfg!(target_os = "linux")
+    }
+
+    fn can_memory(&self) -> bool {
+        true
+    }
+
+    fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
+        let base =
+            crate::config::resolve_agent_base(self.id()).unwrap_or_else(|| home.join(".codex"));
+        vec![
+            MemorySource::new(&base, "AGENTS.md", MemoryKind::Instruction),
+            MemorySource::new(&base, "AGENTS.override.md", MemoryKind::Instruction),
+            MemorySource::new(&base, "memories/**/*.md", MemoryKind::Memory),
+            MemorySource::new(&base, "skills/*/SKILL.md", MemoryKind::Skill),
+        ]
+    }
+
+    fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
+        vec![MemorySource::new(
+            dir,
+            "AGENTS.override.md",
+            MemoryKind::Instruction,
+        )]
     }
 
     fn project_desc(&self) -> &'static str {

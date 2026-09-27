@@ -1,6 +1,6 @@
 //! Memory and instruction file listing and search (shared by `ah memory`).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -9,10 +9,8 @@ use rayon::prelude::*;
 use regex::Regex;
 
 use crate::agents;
-use crate::agents::AgentPlugin;
-use crate::agents::common::{
-    canonical_home, canonicalize_if_exists, decode_claude_project, format_mtime,
-};
+use crate::agents::common::{canonical_home, format_mtime};
+use crate::agents::{AgentPlugin, MemoryKind, MemorySource};
 use crate::cli::{Field, FilterArgs, MemoryField, MemoryResolvedArgs, SortOrder};
 use crate::collector;
 use crate::config;
@@ -146,43 +144,6 @@ fn unquote_scalar(val: &str) -> String {
     val.to_string()
 }
 
-/// Encode a filesystem path to Claude's project directory naming convention.
-/// Claude Code replaces every UTF-16 code unit outside `[A-Za-z0-9]` with `-`:
-/// `/Users/you/src/github.com/my_app` → `-Users-you-src-github-com-my-app`
-fn encode_path_for_claude(path: &str) -> String {
-    path.encode_utf16()
-        .map(|u| match char::from_u32(u32::from(u)) {
-            Some(c) if c.is_ascii_alphanumeric() => c,
-            _ => '-',
-        })
-        .collect()
-}
-
-/// Session files tried, newest first, when looking for a project's cwd.
-const PROJECT_CWD_SCAN_LIMIT: usize = 20;
-/// Working directory recorded by the newest Claude session in a project
-/// directory that has one. Used to name the project and to match the current
-/// directory when the encoded directory name alone does not (e.g. a
-/// truncated name). Sessions without a readable cwd are skipped.
-fn claude_project_cwd(project_dir: &Path, home: &Path) -> Option<String> {
-    let mut sessions: Vec<(SystemTime, PathBuf)> = fs::read_dir(project_dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|p| {
-            let mtime = fs::metadata(&p).and_then(|m| m.modified()).ok()?;
-            Some((mtime, p))
-        })
-        .collect();
-    sessions.sort_unstable_by(|a, b| b.cmp(a));
-    sessions
-        .iter()
-        .take(PROJECT_CWD_SCAN_LIMIT)
-        .find_map(|(_, p)| agents::claude::PLUGIN.resolve_cwd(p, home))
-        .map(|c| canonicalize_if_exists(&c))
-}
-
 /// Get file metadata: (mtime, ctime/birthtime, size)
 fn file_meta(path: &Path) -> (SystemTime, SystemTime, u64) {
     let meta = fs::metadata(path).ok();
@@ -198,179 +159,289 @@ fn file_meta(path: &Path) -> (SystemTime, SystemTime, u64) {
     (mtime, ctime, size)
 }
 
-/// Agent label for project-level `AGENTS.md`, which many agents read.
+/// Agent label for files that many agents read (project-level `AGENTS.md`,
+/// `.agents/skills/`).
 const SHARED_AGENT: &str = "shared";
+/// Project label for files that apply to every project.
+const GLOBAL_PROJECT: &str = "(global)";
 
-/// Instruction file definitions: (agent, filename).
-/// A global `AGENTS.md` lives in the agent's own base (`~/.codex/AGENTS.md`)
-/// and stays attributed to it; a project-level one is listed as shared.
-const INSTRUCTION_FILES: &[(&str, &str)] = &[
-    ("claude", "CLAUDE.md"),
-    ("codex", "AGENTS.md"),
-    ("gemini", "GEMINI.md"),
-    ("cursor", ".cursorrules"),
-];
+/// Shared files outside any project.
+fn shared_global_sources(home: &Path) -> Vec<MemorySource> {
+    vec![MemorySource::new(
+        &home.join(".agents"),
+        "skills/*/SKILL.md",
+        MemoryKind::Skill,
+    )]
+}
 
-/// Collect Claude memory files from ~/.claude/projects/*/memory/*.md
-fn collect_claude_memory_files(all: bool, cwd: &str) -> Vec<MemoryEntry> {
-    let home = canonical_home();
-    let claude_base = config::resolve_agent_base("claude").unwrap_or_else(|| home.join(".claude"));
-    let projects_dir = claude_base.join("projects");
+/// Shared files in a project directory.
+fn shared_project_sources(dir: &Path) -> Vec<MemorySource> {
+    vec![
+        MemorySource::new(dir, "AGENTS.md", MemoryKind::Instruction),
+        MemorySource::new(dir, ".agents/skills/*/SKILL.md", MemoryKind::Skill),
+    ]
+}
 
-    let encoded_cwd = if !all {
-        Some(encode_path_for_claude(cwd))
-    } else {
-        None
+/// Plugins of active built-in agents that know where their memory lives.
+fn memory_plugins() -> Vec<&'static dyn AgentPlugin> {
+    config::active_agents()
+        .filter(|a| a.is_builtin && a.plugin.can_memory())
+        .map(|a| a.plugin)
+        .collect()
+}
+
+/// Read one memory/instruction file into an entry. Empty files are skipped.
+fn read_entry(
+    path: PathBuf,
+    agent: &'static str,
+    project: &str,
+    kind: MemoryKind,
+) -> Option<MemoryEntry> {
+    let content = fs::read_to_string(&path).ok()?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    let (mtime, ctime, size) = file_meta(&path);
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let non_empty = |s: String, fallback: String| if s.is_empty() { fallback } else { s };
+
+    let (memory_type, name, description, body) = match kind {
+        MemoryKind::Instruction => ("instruction".to_string(), file_name, String::new(), content),
+        MemoryKind::Rule => {
+            let (fm, body) = parse_frontmatter(&content);
+            ("rule".to_string(), file_name, fm.description, body)
+        }
+        MemoryKind::Memory => {
+            let (fm, body) = parse_frontmatter(&content);
+            (
+                non_empty(fm.memory_type, "memory".to_string()),
+                non_empty(fm.name, stem),
+                fm.description,
+                body,
+            )
+        }
+        MemoryKind::Skill => {
+            let (fm, body) = parse_frontmatter(&content);
+            let dir_name = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or(stem);
+            (
+                "skill".to_string(),
+                non_empty(fm.name, dir_name),
+                fm.description,
+                body,
+            )
+        }
     };
 
-    let pattern = format!("{}/*/memory/*.md", projects_dir.display());
-    let mut results = Vec::new();
-    let memory_files: Vec<PathBuf> = glob::glob(&pattern)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .collect();
-    // Resolve each project directory's session cwd once, in parallel.
-    let project_dirs: HashSet<PathBuf> = memory_files
-        .iter()
-        .filter_map(|f| f.parent()?.parent().map(Path::to_path_buf))
-        .collect();
-    let project_cwds: HashMap<PathBuf, Option<String>> = project_dirs
-        .into_par_iter()
-        .map(|dir| {
-            let cwd = claude_project_cwd(&dir, &home);
-            (dir, cwd)
-        })
-        .collect();
+    Some(MemoryEntry {
+        path,
+        mtime,
+        ctime,
+        size,
+        agent,
+        project: project.to_string(),
+        memory_type,
+        name,
+        description,
+        body,
+    })
+}
 
-    for entry in memory_files {
-        // Skip MEMORY.md (index file)
-        if entry
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case("MEMORY.md"))
-        {
+/// Expand memory sources into entries. Skills are listed only on request
+/// (`-t skill`), since installed skills can far outnumber memory files.
+fn expand_sources(
+    sources: Vec<MemorySource>,
+    agent: &'static str,
+    project: &str,
+    with_skills: bool,
+) -> Vec<MemoryEntry> {
+    let mut entries = Vec::new();
+    for source in sources {
+        if source.kind == MemoryKind::Skill && !with_skills {
             continue;
         }
+        let mut paths = glob_files(&source.pattern());
+        paths.sort();
+        entries.extend(
+            paths
+                .into_iter()
+                .filter_map(|p| read_entry(p, agent, project, source.kind)),
+        );
+    }
+    entries
+}
 
-        let memory_dir = entry.parent();
-        let project_dir = memory_dir.and_then(|p| p.parent());
-        let encoded_name = project_dir
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+/// Deepest directory level a recursive (`**`) memory pattern descends to.
+const RECURSIVE_GLOB_MAX_DEPTH: usize = 16;
 
-        let session_cwd = project_dir.and_then(|dir| project_cwds.get(dir).cloned().flatten());
-
-        if let Some(ref filter) = encoded_cwd {
-            if encoded_name != *filter && session_cwd.as_deref() != Some(cwd) {
-                continue;
+/// Files matching `pattern`. The `glob` crate follows directory symlinks
+/// without cycle detection, so recursive patterns are walked here instead,
+/// skipping directories already visited (by canonical path).
+fn glob_files(pattern: &str) -> Vec<PathBuf> {
+    // `.` components are no-ops; drop them so they do not defeat matching.
+    // `..` depends on symlinks and is left to the glob crate.
+    let normalized: String = pattern
+        .split('/')
+        .filter(|c| *c != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    let pattern = normalized.as_str();
+    if !pattern.contains("**") || pattern.split('/').any(|c| c == "..") {
+        return glob::glob(pattern)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|p| p.is_file())
+            .collect();
+    }
+    let Ok(matcher) = glob::Pattern::new(pattern) else {
+        return Vec::new();
+    };
+    let options = glob::MatchOptions {
+        require_literal_separator: true,
+        ..glob::MatchOptions::new()
+    };
+    // Walk from the literal directory prefix (up to the first wildcard).
+    let wildcard = first_wildcard(pattern);
+    let root = match pattern[..wildcard].rfind('/') {
+        Some(0) => PathBuf::from("/"),
+        Some(i) => PathBuf::from(unescape_glob(&pattern[..i])),
+        None => return Vec::new(),
+    };
+    let mut files = Vec::new();
+    // Each entry carries the canonical directories on its own path from the
+    // root, so only a symlink back into that chain (a cycle) is cut; the same
+    // directory reached along another path is still walked there.
+    let mut stack: Vec<(PathBuf, Vec<PathBuf>)> = vec![(root, Vec::new())];
+    while let Some((dir, mut chain)) = stack.pop() {
+        let Ok(canonical) = fs::canonicalize(&dir) else {
+            continue;
+        };
+        if chain.contains(&canonical) {
+            continue;
+        }
+        chain.push(canonical);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if chain.len() <= RECURSIVE_GLOB_MAX_DEPTH {
+                    stack.push((path, chain.clone()));
+                }
+            } else if path.is_file() && matcher.matches_path_with(&path, options) {
+                files.push(path);
             }
         }
-
-        let (mtime, ctime, size) = file_meta(&entry);
-
-        let content = match fs::read_to_string(&entry) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let (fm, body) = parse_frontmatter(&content);
-
-        results.push(MemoryEntry {
-            path: entry,
-            mtime,
-            ctime,
-            size,
-            agent: "claude",
-            project: session_cwd
-                .as_deref()
-                .and_then(|c| Path::new(c).file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| decode_claude_project(&encoded_name)),
-            memory_type: fm.memory_type,
-            name: fm.name,
-            description: fm.description,
-            body,
-        });
     }
-
-    results
+    files
 }
 
-/// Collect global instruction files (e.g. ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md)
-fn collect_global_instructions() -> Vec<MemoryEntry> {
-    let mut results = Vec::new();
-
-    for &(agent, filename) in INSTRUCTION_FILES {
-        let base = match config::resolve_agent_base(agent) {
-            Some(b) => b,
-            None => continue,
-        };
-        let path = base.join(filename);
-        if !path.exists() {
-            continue;
+/// Byte offset of the first wildcard in `pattern`, skipping characters
+/// escaped by `glob::Pattern::escape` (`[*]`, `[?]`, `[[]`, `[]]`).
+fn first_wildcard(pattern: &str) -> usize {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'*' | b'?' => return i,
+            b'[' if i + 2 < bytes.len()
+                && bytes[i + 2] == b']'
+                && matches!(bytes[i + 1], b'*' | b'?' | b'[' | b']') =>
+            {
+                i += 3;
+            }
+            b'[' => return i,
+            _ => i += 1,
         }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) if !c.trim().is_empty() => c,
-            _ => continue,
-        };
-        let (mtime, ctime, size) = file_meta(&path);
-
-        results.push(MemoryEntry {
-            path,
-            mtime,
-            ctime,
-            size,
-            agent,
-            project: "(global)".to_string(),
-            memory_type: "instruction".to_string(),
-            name: filename.to_string(),
-            description: String::new(),
-            body: content,
-        });
     }
-
-    results
+    bytes.len()
 }
 
-/// Collect project-level instruction files from a directory.
-fn collect_project_instructions(dir: &Path) -> Vec<MemoryEntry> {
-    let mut results = Vec::new();
+/// Undo `glob::Pattern::escape` (`[*]` → `*`) on a literal pattern prefix.
+fn unescape_glob(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('[') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        match tail.char_indices().nth(2) {
+            Some((end, ']')) => {
+                out.push_str(&tail[1..end]);
+                rest = &tail[end + 1..];
+            }
+            _ => {
+                out.push('[');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Project-level memory and instruction files in one directory.
+fn collect_project_files(
+    dir: &Path,
+    plugins: &[&'static dyn AgentPlugin],
+    with_skills: bool,
+) -> Vec<MemoryEntry> {
     let project = dir
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-
-    for &(agent, filename) in INSTRUCTION_FILES {
-        let path = dir.join(filename);
-        if !path.exists() {
-            continue;
-        }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) if !c.trim().is_empty() => c,
-            _ => continue,
-        };
-        let (mtime, ctime, size) = file_meta(&path);
-
-        let agent = if filename == "AGENTS.md" {
-            SHARED_AGENT
-        } else {
-            agent
-        };
-        results.push(MemoryEntry {
-            path,
-            mtime,
-            ctime,
-            size,
-            agent,
-            project: project.clone(),
-            memory_type: "instruction".to_string(),
-            name: filename.to_string(),
-            description: String::new(),
-            body: content,
-        });
+    let mut entries = expand_sources(
+        shared_project_sources(dir),
+        SHARED_AGENT,
+        &project,
+        with_skills,
+    );
+    for plugin in plugins {
+        entries.extend(expand_sources(
+            plugin.project_memory_sources(dir),
+            plugin.id(),
+            &project,
+            with_skills,
+        ));
     }
+    entries
+}
 
-    results
+/// Where a file sits: its canonical parent directory plus its own name.
+/// Aliases of the directory (a symlinked home) compare equal; a file that
+/// is itself a symlink keeps its own location.
+fn location_key(path: &Path) -> PathBuf {
+    match (path.parent().map(fs::canonicalize), path.file_name()) {
+        (Some(Ok(dir)), Some(name)) => dir.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Directories whose project files apply to `cwd`: inside a git repository,
+/// every level from `cwd` up to the repository root (agents load
+/// instructions from each of them); otherwise `cwd` alone.
+fn current_project_dirs(cwd: &str) -> Vec<PathBuf> {
+    let dir = PathBuf::from(cwd);
+    match dir.ancestors().position(|d| d.join(".git").exists()) {
+        // Every level from the directory up to the repository root.
+        Some(root) => dir
+            .ancestors()
+            .take(root + 1)
+            .map(Path::to_path_buf)
+            .collect(),
+        None => vec![dir],
+    }
 }
 
 /// Collect known project cwds from session files (for -a mode).
@@ -414,41 +485,99 @@ pub fn build_memory_records(
             .unwrap_or_default()
     };
 
+    let home = canonical_home();
+    let plugins = memory_plugins();
+    let with_skills = args.memory_type.as_deref() == Some("skill");
+
     // Collect all entries
     let mut entries: Vec<MemoryEntry> = Vec::new();
 
-    // 1. Claude memory files
-    entries.extend(collect_claude_memory_files(filter.all, &cwd));
-
-    // 2. Project instruction files (before global ones, so that a project
-    //    file symlinked to/from a global one keeps its project attribution)
-    if filter.all {
-        // Scan known project cwds (sorted so duplicate resolution is stable)
-        let mut cwds = collect_known_project_cwds();
-        cwds.sort_unstable();
-        let home = canonical_home();
-        let mut seen = HashSet::new();
-        for dir in &cwds {
-            let p = Path::new(dir);
-            let canonical = match fs::canonicalize(p) {
-                Ok(c) => c,
-                Err(_) => continue, // skip non-existent dirs
-            };
-            // Only collect from dirs under home
-            if !canonical.starts_with(&home) {
-                continue;
-            }
-            if canonical.is_dir() && seen.insert(canonical.clone()) {
-                entries.extend(collect_project_instructions(&canonical));
-            }
+    // 1. Memory the agents keep per project (e.g. Claude auto memory). Agents
+    //    key it by the directory they started in, which may be any level up
+    //    to the repository root.
+    let current_dirs = current_project_dirs(&cwd);
+    let cwd_filter: Option<Vec<String>> = (!filter.all).then(|| {
+        current_dirs
+            .iter()
+            .map(|d| d.to_string_lossy().to_string())
+            .collect()
+    });
+    for plugin in &plugins {
+        for file in plugin.agent_memory_files(&home, cwd_filter.as_deref()) {
+            entries.extend(read_entry(
+                file.path,
+                plugin.id(),
+                &file.project,
+                MemoryKind::Memory,
+            ));
         }
-    } else {
-        // Current directory only
-        entries.extend(collect_project_instructions(Path::new(&cwd)));
     }
 
-    // 3. Global instruction files
-    entries.extend(collect_global_instructions());
+    // 2. Global files, collected first so that project scans can skip them
+    let mut global_entries = Vec::new();
+    for plugin in &plugins {
+        global_entries.extend(expand_sources(
+            plugin.global_memory_sources(&home),
+            plugin.id(),
+            GLOBAL_PROJECT,
+            with_skills,
+        ));
+    }
+    global_entries.extend(expand_sources(
+        shared_global_sources(&home),
+        SHARED_AGENT,
+        GLOBAL_PROJECT,
+        with_skills,
+    ));
+    // A project scan of the home directory itself reaches global files
+    // (e.g. `~/.claude/CLAUDE.md` as `<dir>/.claude/CLAUDE.md`); those stay
+    // global. Global files are keyed by their resolved directory and own
+    // name (so a symlinked home still matches), project files by the
+    // resolved project directory plus their path inside it (so symlinks
+    // inside the project keep their project attribution).
+    let global_paths: HashSet<(PathBuf, &'static str)> = global_entries
+        .iter()
+        .map(|e| (location_key(&e.path), e.agent))
+        .collect();
+
+    // 3. Project files (listed before global ones, see dedup below)
+    let project_dirs: Vec<PathBuf> = if filter.all {
+        // Scan known project cwds and their repository roots (sorted so
+        // duplicate resolution is stable)
+        let mut cwds = collect_known_project_cwds();
+        cwds.sort_unstable();
+        let mut seen = HashSet::new();
+        cwds.iter()
+            .filter_map(|dir| fs::canonicalize(dir).ok()) // skip non-existent dirs
+            .flat_map(|dir| current_project_dirs(&dir.to_string_lossy()))
+            // Only collect from dirs under home
+            .filter(|c| c.starts_with(&home) && c.is_dir())
+            .filter(|c| seen.insert(c.clone()))
+            .collect()
+    } else {
+        current_dirs
+    };
+    let project_entries: Vec<Vec<MemoryEntry>> = project_dirs
+        .par_iter()
+        .map(|dir| {
+            // Only the project directory itself is resolved: a symlinked
+            // directory inside the project (e.g. `.claude/rules` shared with
+            // `~/.claude/rules`) keeps its files attributed to the project.
+            let root = fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+            collect_project_files(dir, &plugins, with_skills)
+                .into_iter()
+                .filter(|e| {
+                    let key = match e.path.strip_prefix(dir) {
+                        Ok(rel) => root.join(rel),
+                        Err(_) => location_key(&e.path),
+                    };
+                    !global_paths.contains(&(key, e.agent))
+                })
+                .collect()
+        })
+        .collect();
+    entries.extend(project_entries.into_iter().flatten());
+    entries.extend(global_entries);
 
     if entries.is_empty() {
         return Err("No memory files found.".to_string());
@@ -658,6 +787,8 @@ pub fn run(args: MemoryResolvedArgs, filter: &FilterArgs) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::claude::encode_path_for_claude;
+    use crate::agents::common::decode_claude_project;
 
     #[test]
     fn test_parse_frontmatter_normal() {
@@ -742,5 +873,53 @@ mod tests {
     #[test]
     fn test_decode_project_name_home_prefix() {
         assert_eq!(decode_claude_project("-home-user-projects-myapp"), "myapp");
+    }
+
+    #[test]
+    fn escaped_prefix_is_literal() {
+        let pattern = format!("{}/rules/**/*.md", glob::Pattern::escape("/tmp/a[b]*c?/d"));
+        let wildcard = first_wildcard(&pattern);
+        assert_eq!(&pattern[wildcard..], "**/*.md");
+        let dir = &pattern[..pattern[..wildcard].rfind('/').unwrap()];
+        assert_eq!(unescape_glob(dir), "/tmp/a[b]*c?/d/rules");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_glob_walks_a_directory_reached_through_another_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        fs::create_dir_all(base.join("actual/rules")).unwrap();
+        fs::write(base.join("actual/rules/r.md"), "x").unwrap();
+        // `alias` sorts first and resolves to the same directory, but only
+        // the `actual/rules` path matches the pattern.
+        std::os::unix::fs::symlink(base.join("actual/rules"), base.join("alias")).unwrap();
+        let pattern = format!(
+            "{}/**/rules/*.md",
+            glob::Pattern::escape(&base.to_string_lossy())
+        );
+        let found = glob_files(&pattern);
+        assert!(found.contains(&base.join("actual/rules/r.md")), "{found:?}");
+    }
+
+    #[test]
+    fn recursive_glob_matches_nested_files_only_under_the_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("we[ird]*");
+        fs::create_dir_all(base.join("rules/a/b")).unwrap();
+        fs::write(base.join("rules/top.md"), "x").unwrap();
+        fs::write(base.join("rules/a/b/deep.md"), "x").unwrap();
+        fs::write(base.join("rules/a/skip.txt"), "x").unwrap();
+        fs::write(base.join("other.md"), "x").unwrap();
+        let pattern = format!(
+            "{}/rules/**/*.md",
+            glob::Pattern::escape(&base.to_string_lossy())
+        );
+        let mut found: Vec<String> = glob_files(&pattern)
+            .iter()
+            .map(|p| p.strip_prefix(&base).unwrap().to_string_lossy().to_string())
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["rules/a/b/deep.md", "rules/top.md"]);
     }
 }

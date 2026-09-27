@@ -237,7 +237,8 @@ fn main() {
             let all = config::agents();
             let fmt = args.output_format();
 
-            fn caps(p: &dyn agents::AgentPlugin) -> Vec<&'static str> {
+            fn caps(agent: &config::AgentDef) -> Vec<&'static str> {
+                let p = agent.plugin;
                 let mut v = Vec::new();
                 if p.can_search() {
                     v.push("search");
@@ -251,7 +252,9 @@ fn main() {
                 if p.can_detect_running() {
                     v.push("running");
                 }
-                if p.can_memory() {
+                // Memory files are found through the built-in agent's own
+                // locations, so a custom alias of the same plugin lists none.
+                if agent.is_builtin && p.can_memory() {
                     v.push("memory");
                 }
                 v
@@ -263,7 +266,7 @@ fn main() {
                         let obj = serde_json::json!({
                             "id": agent.id,
                             "description": agent.description,
-                            "capabilities": caps(agent.plugin),
+                            "capabilities": caps(agent),
                             "patterns": agent.glob_patterns,
                             "project_desc": agent.plugin.project_desc(),
                         });
@@ -276,7 +279,7 @@ fn main() {
                             "{}\t{}\t{}\t{}",
                             agent.id,
                             agent.description,
-                            caps(agent.plugin).join(","),
+                            caps(agent).join(","),
                             agent.glob_patterns.join(","),
                         );
                     }
@@ -287,7 +290,7 @@ fn main() {
                             "id:{}\tdescription:{}\tcapabilities:{}\tpatterns:{}",
                             agent.id,
                             agent.description,
-                            caps(agent.plugin).join(","),
+                            caps(agent).join(","),
                             agent.glob_patterns.join(","),
                         );
                     }
@@ -305,10 +308,7 @@ fn main() {
                             "             Patterns:     {}",
                             agent.glob_patterns.join(", ")
                         );
-                        println!(
-                            "             Capabilities: {}",
-                            caps(agent.plugin).join(", ")
-                        );
+                        println!("             Capabilities: {}", caps(agent).join(", "));
                         println!("             Project:      {}", agent.plugin.project_desc());
                         println!();
                     }
@@ -323,10 +323,7 @@ fn main() {
                                 "             Patterns:     {}",
                                 agent.glob_patterns.join(", ")
                             );
-                            println!(
-                                "             Capabilities: {}",
-                                caps(agent.plugin).join(", ")
-                            );
+                            println!("             Capabilities: {}", caps(agent).join(", "));
                             println!();
                         }
                     }

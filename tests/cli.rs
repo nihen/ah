@@ -95,6 +95,37 @@ fn list_agents_json() {
 }
 
 #[test]
+fn list_agents_advertises_memory_for_builtin_agents_only() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    fs::write(
+        home.join(".ahrc"),
+        "[agents.mybot]\nplugin = \"gemini\"\nfile_patterns = [\"~/.mybot/*.json\"]\n",
+    )
+    .unwrap();
+    let output = ah()
+        .env("HOME", &home)
+        .args(["list-agents", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let caps = |id: &str| -> Vec<String> {
+        stdout
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|v| v["id"] == id)
+            .unwrap()["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(caps("gemini").contains(&"memory".to_string()));
+    assert!(!caps("mybot").contains(&"memory".to_string()));
+}
+
+#[test]
 fn list_agents_tsv() {
     let output = ah().args(["list-agents", "--tsv"]).assert().success();
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
@@ -1778,6 +1809,7 @@ fn memory_matches_underscore_cwd_dedups_and_lists_shared_agents_md() {
             .env("COPILOT_HOME", "/nonexistent")
             .env("CURSOR_CONFIG_DIR", "/nonexistent")
             .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
             .args(args)
             .write_stdin("")
             .assert()
@@ -1850,6 +1882,7 @@ fn memory_keeps_project_attribution_for_symlinked_files() {
             .env("COPILOT_HOME", "/nonexistent")
             .env("CURSOR_CONFIG_DIR", "/nonexistent")
             .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
             .args(args)
             .write_stdin("")
             .assert()
@@ -1933,9 +1966,301 @@ fn memory_project_cwd_skips_sessions_without_cwd() {
         .env("COPILOT_HOME", "/nonexistent")
         .env("CURSOR_CONFIG_DIR", "/nonexistent")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_CONFIG_HOME")
         .args(["memory", "--tsv", "-o", "project,name"])
         .write_stdin("")
         .assert()
         .success()
         .stdout("my_app\tnote\n");
+}
+
+#[test]
+fn memory_lists_each_agents_instruction_rule_and_memory_files() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let write = |rel: &str, content: &str| {
+        let path = home.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    };
+    // Global files
+    write(".claude/CLAUDE.md", "claude global\n");
+    write(
+        ".claude/rules/style.md",
+        "---\ndescription: house style\n---\nuse tabs\n",
+    );
+    write(
+        ".claude/agent-memory/reviewer/notes.md",
+        "---\nname: review-notes\n---\nnotes\n",
+    );
+    write(
+        ".claude/skills/s1/SKILL.md",
+        "---\nname: s1\ndescription: skill one\n---\nbody\n",
+    );
+    write(".codex/AGENTS.md", "codex global\n");
+    write(".codex/memories/m1.md", "remember this\n");
+    write(
+        ".gemini/settings.json",
+        r#"{"context":{"fileName":["AGENTS.md","CONTEXT.md"]}}"#,
+    );
+    write(".gemini/CONTEXT.md", "gemini context\n");
+    write(".gemini/GEMINI.md", "not loaded with a custom fileName\n");
+    write(".gemini/config/rules/r.md", "agy rule\n");
+    write(".grok/AGENTS.md", "grok global\n");
+    write(".grok/memory-v2/global/topics/g.md", "# G\nglobal topic\n");
+    write(".grok/memory-v2/global/MEMORY.md", "# index\n");
+    write(
+        ".grok/memory-v2/workspaces/repo-0123abcd/topics/t.md",
+        "# T\nworkspace topic\n",
+    );
+    write(
+        ".grok/memory-v2/workspaces/other-89abcdef/topics/o.md",
+        "# O\nother workspace\n",
+    );
+    write(".copilot/copilot-instructions.md", "copilot global\n");
+    write(
+        ".cursor/rules/u.mdc",
+        "---\ndescription: user rule\n---\nx\n",
+    );
+    write(
+        ".config/opencode/opencode.jsonc",
+        "{\n  // comment\n  \"instructions\": [\"~/extra.md\",],\n}\n",
+    );
+    write("extra.md", "opencode extra\n");
+    write(
+        ".agents/skills/sk/SKILL.md",
+        "---\nname: sk\n---\nshared skill\n",
+    );
+    // Project files at the repository root; the command runs in a subdirectory.
+    write("repo/.git/HEAD", "ref: refs/heads/main\n");
+    write("repo/CLAUDE.local.md", "local\n");
+    write("repo/.claude/rules/x.md", "project rule\n");
+    write("repo/.cursorrules", "cursor legacy\n");
+    write("repo/.cursor/rules/p.mdc", "project cursor rule\n");
+    write("repo/.github/copilot-instructions.md", "copilot project\n");
+    write("repo/.agents/rules/a.md", "agy project rule\n");
+    write("repo/AGENTS.override.md", "codex override\n");
+    write("repo/AGENTS.md", "shared\n");
+    write("repo/CONTEXT.md", "gemini project\n");
+    write("repo/opencode.json", r#"{"instructions":["docs/*.md"]}"#);
+    write("repo/docs/d.md", "opencode project doc\n");
+    write("repo/.grok/rules/gr.md", "grok project rule\n");
+    write(".grok/rules/gg.md", "grok global rule\n");
+    write(".grok/memory/MEMORY.md", "- legacy note\n");
+    write(".cursor/rules/team/nested.mdc", "nested user rule\n");
+    // An intermediate directory between the repository root and the cwd.
+    write("repo/pkg/AGENTS.md", "package rules\n");
+    let cwd = home.join("repo/pkg/sub");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let run = |args: &[&str]| {
+        let mut cmd = ah();
+        cmd.current_dir(&cwd).env("HOME", &home);
+        for var in [
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "GEMINI_CLI_HOME",
+            "COPILOT_HOME",
+            "CURSOR_DATA_DIR",
+            "GROK_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+        ] {
+            cmd.env_remove(var);
+        }
+        let assert = cmd.args(args).write_stdin("").assert().success();
+        let mut rows: Vec<String> = String::from_utf8(assert.get_output().stdout.clone())
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        rows.sort();
+        rows
+    };
+
+    assert_eq!(
+        run(&[
+            "memory",
+            "--tsv",
+            "-o",
+            "agent,project,type,name,description"
+        ]),
+        vec![
+            "agy\t(global)\trule\tr.md\t",
+            "agy\trepo\trule\ta.md\t",
+            "claude\t(global)\tinstruction\tCLAUDE.md\t",
+            "claude\t(global)\tmemory\treview-notes\t",
+            "claude\t(global)\trule\tstyle.md\thouse style",
+            "claude\trepo\tinstruction\tCLAUDE.local.md\t",
+            "claude\trepo\trule\tx.md\t",
+            "codex\t(global)\tinstruction\tAGENTS.md\t",
+            "codex\t(global)\tmemory\tm1\t",
+            "codex\trepo\tinstruction\tAGENTS.override.md\t",
+            "copilot\t(global)\tinstruction\tcopilot-instructions.md\t",
+            "copilot\trepo\tinstruction\tcopilot-instructions.md\t",
+            "cursor\t(global)\trule\tnested.mdc\t",
+            "cursor\t(global)\trule\tu.mdc\tuser rule",
+            "cursor\trepo\tinstruction\t.cursorrules\t",
+            "cursor\trepo\trule\tp.mdc\t",
+            "gemini\t(global)\tinstruction\tCONTEXT.md\t",
+            "gemini\trepo\tinstruction\tCONTEXT.md\t",
+            "grok\t(global)\tinstruction\tAGENTS.md\t",
+            "grok\t(global)\tmemory\tMEMORY\t",
+            "grok\t(global)\tmemory\tg\t",
+            "grok\t(global)\trule\tgg.md\t",
+            "grok\trepo\tmemory\tt\t",
+            "grok\trepo\trule\tgr.md\t",
+            "opencode\t(global)\tinstruction\textra.md\t",
+            "opencode\trepo\tinstruction\td.md\t",
+            "shared\tpkg\tinstruction\tAGENTS.md\t",
+            "shared\trepo\tinstruction\tAGENTS.md\t",
+        ]
+    );
+
+    assert_eq!(
+        run(&[
+            "memory",
+            "-t",
+            "skill",
+            "--tsv",
+            "-o",
+            "agent,name,description"
+        ]),
+        vec!["claude\ts1\tskill one", "shared\tsk\t"]
+    );
+}
+
+/// `ah memory` with only memory-related env vars cleared, run in `cwd`.
+fn memory_cmd(home: &Path, cwd: &Path) -> Command {
+    let mut cmd = ah();
+    cmd.current_dir(cwd).env("HOME", home);
+    for var in [
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "GEMINI_CLI_HOME",
+        "COPILOT_HOME",
+        "CURSOR_DATA_DIR",
+        "GROK_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+#[test]
+fn memory_all_scans_repository_root_of_known_cwds() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let sub = home.join("repo/sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::create_dir_all(home.join("repo/.git")).unwrap();
+    fs::write(home.join("repo/AGENTS.md"), "root rules\n").unwrap();
+    // The only known session was started in the subdirectory.
+    let project_dir = home.join(".claude/projects/-sub");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(
+        project_dir.join("s.jsonl"),
+        format!(
+            "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n",
+            sub.display()
+        ),
+    )
+    .unwrap();
+
+    memory_cmd(&home, &home)
+        .args(["memory", "-a", "--tsv", "-o", "agent,project,name"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("shared\trepo\tAGENTS.md\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_keeps_global_files_global_through_a_home_alias() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::write(home.join(".claude/CLAUDE.md"), "global\n").unwrap();
+    let alias = home.join("alias");
+    std::os::unix::fs::symlink(&home, &alias).unwrap();
+
+    memory_cmd(&home, &home)
+        .env("CLAUDE_CONFIG_DIR", alias.join(".claude"))
+        .args(["memory", "--tsv", "-o", "agent,project,name"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("claude\t(global)\tCLAUDE.md\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_recursive_patterns_survive_symlink_cycles() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let rules = home.join(".claude/rules");
+    fs::create_dir_all(rules.join("nested")).unwrap();
+    fs::write(rules.join("nested/r.md"), "rule\n").unwrap();
+    std::os::unix::fs::symlink(".", rules.join("l1")).unwrap();
+    std::os::unix::fs::symlink(".", rules.join("l2")).unwrap();
+    std::os::unix::fs::symlink("..", rules.join("nested/up")).unwrap();
+
+    memory_cmd(&home, &home)
+        .timeout(std::time::Duration::from_secs(20))
+        .args(["memory", "--tsv", "-o", "agent,type,name"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("claude\trule\tr.md\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_symlinked_project_directory_keeps_project_attribution() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    fs::create_dir_all(home.join(".claude/rules")).unwrap();
+    fs::write(home.join(".claude/rules/shared.md"), "shared rule\n").unwrap();
+    let repo = home.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::create_dir_all(repo.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(home.join(".claude/rules"), repo.join(".claude/rules")).unwrap();
+
+    let assert = memory_cmd(&home, &repo)
+        .args(["memory", "--tsv", "-o", "agent,project,name"])
+        .write_stdin("")
+        .assert()
+        .success();
+    let mut rows: Vec<String> = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    rows.sort();
+    // The same file is listed once, attributed to the project (#35).
+    assert_eq!(rows, vec!["claude\trepo\tshared.md"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_dot_components_do_not_bypass_cycle_protection() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let rules = home.join(".claude/rules");
+    fs::create_dir_all(&rules).unwrap();
+    fs::write(rules.join("r.md"), "rule\n").unwrap();
+    std::os::unix::fs::symlink(".", rules.join("l1")).unwrap();
+    std::os::unix::fs::symlink(".", rules.join("l2")).unwrap();
+
+    memory_cmd(&home, &home)
+        .env("CLAUDE_CONFIG_DIR", home.join(".").join(".claude"))
+        .timeout(std::time::Duration::from_secs(20))
+        .args(["memory", "--tsv", "-o", "agent,type,name"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("claude\trule\tr.md\n");
 }

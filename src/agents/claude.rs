@@ -1,13 +1,16 @@
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use memchr::memmem;
+use rayon::prelude::*;
 
-use super::AgentPlugin;
-use super::Message;
 use super::common::{
-    RE_HOME_PREFIX, for_each_jsonl_value, for_each_jsonl_value_bytes, is_pid_alive, json_pid,
-    mmap_file, process_start_ticks,
+    RE_HOME_PREFIX, canonicalize_if_exists, decode_claude_project, for_each_jsonl_value,
+    for_each_jsonl_value_bytes, is_pid_alive, json_pid, mmap_file, process_start_ticks,
 };
+use super::{AgentMemoryFile, AgentPlugin, MemoryKind, MemorySource, Message};
 
 pub static PLUGIN: ClaudePlugin = ClaudePlugin;
 
@@ -288,6 +291,126 @@ impl AgentPlugin for ClaudePlugin {
             .map(|base| running_in(&base.join("sessions"), process_start_ticks))
             .unwrap_or_default()
     }
+
+    fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
+        let base = claude_base(home);
+        vec![
+            MemorySource::new(&base, "CLAUDE.md", MemoryKind::Instruction),
+            MemorySource::new(&base, "rules/**/*.md", MemoryKind::Rule),
+            // Subagent memory, user scope: agent-memory/<agent>/*.md
+            MemorySource::new(&base, "agent-memory/*/*.md", MemoryKind::Memory),
+            MemorySource::new(&base, "skills/*/SKILL.md", MemoryKind::Skill),
+        ]
+    }
+
+    fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
+        vec![
+            MemorySource::new(dir, "CLAUDE.md", MemoryKind::Instruction),
+            MemorySource::new(dir, "CLAUDE.local.md", MemoryKind::Instruction),
+            MemorySource::new(dir, ".claude/CLAUDE.md", MemoryKind::Instruction),
+            MemorySource::new(dir, ".claude/rules/**/*.md", MemoryKind::Rule),
+            MemorySource::new(dir, ".claude/agent-memory/*/*.md", MemoryKind::Memory),
+            MemorySource::new(dir, ".claude/agent-memory-local/*/*.md", MemoryKind::Memory),
+            MemorySource::new(dir, ".claude/skills/*/SKILL.md", MemoryKind::Skill),
+        ]
+    }
+
+    /// Auto memory: `projects/<encoded-cwd>/memory/*.md` (MEMORY.md is its index).
+    fn agent_memory_files(&self, home: &Path, cwds: Option<&[String]>) -> Vec<AgentMemoryFile> {
+        let projects_dir = claude_base(home).join("projects");
+        let pattern = format!(
+            "{}/*/memory/*.md",
+            glob::Pattern::escape(&projects_dir.to_string_lossy())
+        );
+        let memory_files: Vec<PathBuf> = glob::glob(&pattern)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|p| {
+                !p.file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("MEMORY.md"))
+            })
+            .collect();
+        // Resolve each project directory's session cwd once, in parallel.
+        let project_dirs: HashSet<PathBuf> = memory_files
+            .iter()
+            .filter_map(|f| f.parent()?.parent().map(Path::to_path_buf))
+            .collect();
+        let project_cwds: HashMap<PathBuf, Option<String>> = project_dirs
+            .into_par_iter()
+            .map(|dir| {
+                let cwd = claude_project_cwd(&dir, home);
+                (dir, cwd)
+            })
+            .collect();
+        let encoded_cwds: Option<HashSet<String>> =
+            cwds.map(|c| c.iter().map(|d| encode_path_for_claude(d)).collect());
+
+        memory_files
+            .into_iter()
+            .filter_map(|path| {
+                let project_dir = path.parent()?.parent()?;
+                let encoded_name = project_dir.file_name()?.to_string_lossy().to_string();
+                let session_cwd = project_cwds.get(project_dir).cloned().flatten();
+                if let (Some(encoded), Some(cwds)) = (&encoded_cwds, cwds) {
+                    let by_cwd = session_cwd
+                        .as_deref()
+                        .is_some_and(|s| cwds.iter().any(|c| c == s));
+                    if !encoded.contains(&encoded_name) && !by_cwd {
+                        return None;
+                    }
+                }
+                let project = session_cwd
+                    .as_deref()
+                    .and_then(|c| Path::new(c).file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| decode_claude_project(&encoded_name));
+                Some(AgentMemoryFile { path, project })
+            })
+            .collect()
+    }
+}
+
+/// Claude's config directory (`CLAUDE_CONFIG_DIR` or `~/.claude`).
+fn claude_base(home: &Path) -> PathBuf {
+    crate::config::resolve_agent_base("claude").unwrap_or_else(|| home.join(".claude"))
+}
+
+/// Encode a filesystem path to Claude's project directory naming convention.
+/// Claude Code replaces every UTF-16 code unit outside `[A-Za-z0-9]` with `-`:
+/// `/Users/you/src/github.com/my_app` → `-Users-you-src-github-com-my-app`
+pub(crate) fn encode_path_for_claude(path: &str) -> String {
+    path.encode_utf16()
+        .map(|u| match char::from_u32(u32::from(u)) {
+            Some(c) if c.is_ascii_alphanumeric() => c,
+            _ => '-',
+        })
+        .collect()
+}
+
+/// Session files tried, newest first, when looking for a project's cwd.
+const PROJECT_CWD_SCAN_LIMIT: usize = 20;
+/// Working directory recorded by the newest Claude session in a project
+/// directory that has one. Used to name the project and to match the current
+/// directory when the encoded directory name alone does not (e.g. a
+/// truncated name). Sessions without a readable cwd are skipped.
+fn claude_project_cwd(project_dir: &Path, home: &Path) -> Option<String> {
+    let mut sessions: Vec<(SystemTime, PathBuf)> = fs::read_dir(project_dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .filter_map(|p| {
+            let mtime = fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+            Some((mtime, p))
+        })
+        .collect();
+    sessions.sort_unstable_by(|a, b| b.cmp(a));
+    sessions
+        .iter()
+        .take(PROJECT_CWD_SCAN_LIMIT)
+        .find_map(|(_, p)| PLUGIN.resolve_cwd(p, home))
+        .map(|c| canonicalize_if_exists(&c))
 }
 
 /// Running sessions from Claude Code's `sessions/<pid>.json` registry.
