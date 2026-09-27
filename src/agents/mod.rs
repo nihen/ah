@@ -277,6 +277,13 @@ mod tests {
         );
         assert_eq!(
             find_plugin_for_path(Path::new(
+                "/home/user/.gemini/tmp/proj/chats/session-2026-06-01T00-00-abcd1234.jsonl"
+            ))
+            .id(),
+            "gemini"
+        );
+        assert_eq!(
+            find_plugin_for_path(Path::new(
                 "/home/user/.copilot/session-state/uuid/workspace.yaml"
             ))
             .id(),

@@ -557,7 +557,7 @@ Each built-in agent respects its CLI's config directory environment variable:
 |---------|---------------|--------------------|-------------|
 | Claude  | `projects/*/*.jsonl` | `CLAUDE_CONFIG_DIR`| `~/.claude` |
 | Codex   | `sessions/**/*.jsonl` | `CODEX_HOME`       | `~/.codex`  |
-| Gemini  | `tmp/*/chats/session-*.json` | `GEMINI_CLI_HOME`  | `~/.gemini` |
+| Gemini  | `tmp/*/chats/session-*.jsonl` (`.json` before v0.39) | `GEMINI_CLI_HOME`  | `~/.gemini` |
 | Copilot | `session-state/*/workspace.yaml` | `COPILOT_HOME`     | `~/.copilot`|
 | Cursor  | `projects/*/agent-transcripts/**/*.jsonl` | `CURSOR_CONFIG_DIR`| `~/.cursor` |
 | Antigravity (agy) | `antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl` | — | `~/.gemini` |

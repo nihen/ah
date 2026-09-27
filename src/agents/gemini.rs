@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
+use chrono::{Local, NaiveDateTime, TimeZone, Utc};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
@@ -12,9 +14,137 @@ use super::common::first_text_part;
 use super::common::format_mtime;
 use super::common::mmap_file;
 
-static RE_GEMINI_TMP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r".*/tmp/([^/]+)/.*").unwrap());
-static RE_GEMINI_DATE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"session-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})").unwrap());
+/// Project directory of a session file: `tmp/{project}/chats/session-*` or
+/// `tmp/{project}/logs.json`. Anchored to the end of the path so that a
+/// project named `tmp` (cwd `/tmp`) does not capture `chats`.
+static RE_GEMINI_TMP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/tmp/([^/]+)/(?:chats/[^/]+|logs\.json)$").unwrap());
+/// Session start time in the file name, written in UTC by Gemini CLI
+/// (`new Date().toISOString()`).
+static RE_GEMINI_DATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"session-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2})(?:-[^/]*)?\.jsonl?$").unwrap()
+});
+
+fn is_jsonl(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+}
+
+/// Look up the project directory name in `{base}/projects.json`
+/// (`{"projects": {"<cwd>": "<project>"}}`) and return the matching cwd.
+fn resolve_cwd_from_projects_json(gemini_base: &Path, project: &str) -> Option<String> {
+    let content = fs::read_to_string(gemini_base.join("projects.json")).ok()?;
+    let root: serde_json::Value = serde_json::from_str(&content).ok()?;
+    root.get("projects")?
+        .as_object()?
+        .iter()
+        .find(|(_, name)| name.as_str() == Some(project))
+        .map(|(cwd, _)| cwd.clone())
+}
+
+/// Messages and session id reconstructed from a `session-*.jsonl` file.
+///
+/// The file is an append-only log: the first line holds session metadata,
+/// message records are upserted by `id`, `{"$set": {...}}` updates metadata
+/// (a `messages` array replaces the whole conversation), and
+/// `{"$rewindTo": "<id>"}` drops that message and everything after it.
+#[derive(Default)]
+struct JsonlSession {
+    session_id: Option<String>,
+    messages: Vec<serde_json::Value>,
+    index: HashMap<String, usize>,
+}
+
+impl JsonlSession {
+    fn upsert(&mut self, message: serde_json::Value) {
+        let Some(id) = message.get("id").and_then(|v| v.as_str()) else {
+            return;
+        };
+        match self.index.get(id) {
+            Some(&i) => self.messages[i] = message,
+            None => {
+                self.index.insert(id.to_string(), self.messages.len());
+                self.messages.push(message);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.messages.clear();
+        self.index.clear();
+    }
+
+    fn replay(data: &[u8]) -> Self {
+        let mut session = JsonlSession::default();
+        for line in data.split(|&b| b == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let Ok(mut record) = serde_json::from_slice::<serde_json::Value>(line) else {
+                continue;
+            };
+            if let Some(target) = record.get("$rewindTo").and_then(|v| v.as_str()) {
+                match session.index.get(target).copied() {
+                    Some(cut) => {
+                        session.messages.truncate(cut);
+                        session.index.retain(|_, i| *i < cut);
+                    }
+                    None => session.clear(),
+                }
+            } else if record.get("id").is_some_and(|v| v.is_string()) {
+                session.upsert(record);
+            } else if let Some(set) = record.get_mut("$set").and_then(|v| v.as_object_mut()) {
+                if let Some(id) = set.get("sessionId").and_then(|v| v.as_str()) {
+                    session.session_id = Some(id.to_string());
+                }
+                if let Some(serde_json::Value::Array(messages)) = set.remove("messages") {
+                    session.clear();
+                    messages.into_iter().for_each(|m| session.upsert(m));
+                }
+            } else if record.get("projectHash").is_some_and(|v| v.is_string()) {
+                if let Some(id) = record.get("sessionId").and_then(|v| v.as_str()) {
+                    session.session_id = Some(id.to_string());
+                }
+                if let Some(serde_json::Value::Array(messages)) =
+                    record.as_object_mut().and_then(|o| o.remove("messages"))
+                {
+                    messages.into_iter().for_each(|m| session.upsert(m));
+                }
+            }
+        }
+        session
+    }
+}
+
+/// Session id of a `session-*.jsonl` file without replaying its messages:
+/// the metadata line, overridden by any `$set.sessionId`.
+fn jsonl_session_id(data: &[u8]) -> Option<String> {
+    let mut session_id = None;
+    for (n, line) in data.split(|&b| b == b'\n').enumerate() {
+        let is_set = line.starts_with(b"{\"$set\"");
+        if n > 0 && !is_set {
+            continue;
+        }
+        if is_set && memchr::memmem::find(line, b"\"sessionId\"").is_none() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        let meta = if is_set {
+            record.get("$set")
+        } else {
+            Some(&record)
+        };
+        if let Some(id) = meta
+            .and_then(|m| m.get("sessionId"))
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+        {
+            session_id = Some(id.to_string());
+        }
+    }
+    session_id
+}
 
 /// Derive the Gemini base directory by finding `tmp/{project}` or `history/{project}` in the path.
 /// Returns the parent of `tmp`/`history` (i.e., the Gemini home).
@@ -65,18 +195,63 @@ fn resolve_hash_to_path(hash: &str, home: &Path) -> Option<String> {
     None
 }
 
+/// Convert one Gemini message record into a transcript message and visit it.
+/// Returns `false` to stop iteration.
+fn visit_message(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -> bool) -> bool {
+    match val.get("type").and_then(|v| v.as_str()) {
+        Some("user") => {
+            // chats/session-*.json(l) uses "content", logs.json uses "message"
+            let text = val
+                .get("content")
+                .and_then(first_text_part)
+                .or_else(|| val.get("message").and_then(|v| v.as_str()));
+            if let Some(text) = text {
+                if !text.starts_with('<') {
+                    return visit(Message::user(text.to_string()));
+                }
+            }
+        }
+        Some("gemini") => {
+            // Tool-call-only turns carry an empty "content"
+            if let Some(text) = val
+                .get("content")
+                .and_then(first_text_part)
+                .filter(|t| !t.is_empty())
+            {
+                return visit(Message::assistant(text.to_string()));
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
 pub static PLUGIN: GeminiPlugin = GeminiPlugin;
 
 pub struct GeminiPlugin;
 
 impl GeminiPlugin {
-    fn for_each_root_message(path: &Path, mut visit: impl FnMut(&serde_json::Value) -> bool) {
-        let mmap = match mmap_file(path) {
-            Some(mmap) => mmap,
-            None => return,
-        };
+    fn for_each_root_message(path: &Path, visit: impl FnMut(&serde_json::Value) -> bool) {
+        if let Some(mmap) = mmap_file(path) {
+            Self::for_each_root_message_bytes(path, &mmap, visit);
+        }
+    }
 
-        let root = match serde_json::from_slice::<serde_json::Value>(&mmap) {
+    fn for_each_root_message_bytes(
+        path: &Path,
+        data: &[u8],
+        mut visit: impl FnMut(&serde_json::Value) -> bool,
+    ) {
+        if is_jsonl(path) {
+            for message in &JsonlSession::replay(data).messages {
+                if !visit(message) {
+                    return;
+                }
+            }
+            return;
+        }
+
+        let root = match serde_json::from_slice::<serde_json::Value>(data) {
             Ok(root) => root,
             Err(_) => return,
         };
@@ -120,6 +295,7 @@ impl AgentPlugin for GeminiPlugin {
     fn glob_patterns(&self) -> &'static [&'static str] {
         &[
             ".gemini/tmp/*/chats/session-*.json",
+            ".gemini/tmp/*/chats/session-*.jsonl",
             ".gemini/tmp/*/logs.json",
         ]
     }
@@ -129,29 +305,16 @@ impl AgentPlugin for GeminiPlugin {
     }
 
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
-        Self::for_each_root_message(path, |val| {
-            match val.get("type").and_then(|v| v.as_str()) {
-                Some("user") => {
-                    // chats/session-*.json uses "content", logs.json uses "message"
-                    let text = val
-                        .get("content")
-                        .and_then(first_text_part)
-                        .or_else(|| val.get("message").and_then(|v| v.as_str()));
-                    if let Some(text) = text {
-                        if !text.starts_with('<') {
-                            return visit(Message::user(text.to_string()));
-                        }
-                    }
-                }
-                Some("gemini") => {
-                    if let Some(text) = val.get("content").and_then(first_text_part) {
-                        return visit(Message::assistant(text.to_string()));
-                    }
-                }
-                _ => {}
-            }
-            true
-        });
+        Self::for_each_root_message(path, |val| visit_message(val, visit));
+    }
+
+    fn iter_messages_from_bytes(
+        &self,
+        path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(Message) -> bool,
+    ) {
+        Self::for_each_root_message_bytes(path, data, |val| visit_message(val, visit));
     }
 
     fn resolve_project(&self, path: &Path, _home: &Path) -> Option<String> {
@@ -164,7 +327,13 @@ impl AgentPlugin for GeminiPlugin {
     fn resolve_date(&self, path: &Path, mtime: SystemTime) -> Option<String> {
         RE_GEMINI_DATE
             .captures(&path.to_string_lossy())
-            .map(|caps| format!("{} {}:{}", &caps[1], &caps[2], &caps[3]))
+            .and_then(|caps| NaiveDateTime::parse_from_str(&caps[1], "%Y-%m-%dT%H-%M").ok())
+            .map(|utc| {
+                Utc.from_utc_datetime(&utc)
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
             .or_else(|| Some(format_mtime(mtime)))
     }
 
@@ -175,7 +344,7 @@ impl AgentPlugin for GeminiPlugin {
         // Derive gemini base from session file path (supports GEMINI_CLI_HOME override).
         // Walk up from the file until we find {tmp,history}/{project} and take the parent of tmp/history.
         // This handles both:
-        //   {base}/tmp/{project}/chats/session-*.json
+        //   {base}/tmp/{project}/chats/session-*.json(l)
         //   {base}/tmp/{project}/logs.json
         let gemini_base = derive_gemini_base(path, project)
             .or_else(|| path.parent()?.parent()?.parent()?.parent())?;
@@ -189,6 +358,10 @@ impl AgentPlugin for GeminiPlugin {
                     return Some(trimmed);
                 }
             }
+        }
+
+        if let Some(cwd) = resolve_cwd_from_projects_json(gemini_base, project) {
+            return Some(cwd);
         }
 
         // Fallback: try home-based path (legacy)
@@ -211,6 +384,9 @@ impl AgentPlugin for GeminiPlugin {
 
     fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
         let mmap = mmap_file(path)?;
+        if is_jsonl(path) {
+            return jsonl_session_id(&mmap);
+        }
         let root = serde_json::from_slice::<serde_json::Value>(&mmap).ok()?;
         // chats/session-*.json: root is an object with "sessionId"
         if let Some(id) = root.get("sessionId").and_then(|v| v.as_str()) {
@@ -234,5 +410,134 @@ impl AgentPlugin for GeminiPlugin {
     fn resume_args(&self, path: &Path, home: &Path) -> Option<Vec<String>> {
         let id = self.resolve_resume_id(path, home)?;
         Some(vec!["gemini".to_string(), "--resume".to_string(), id])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::MessageRole;
+    use super::*;
+    use std::path::PathBuf;
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    fn messages(path: &Path) -> Vec<(MessageRole, String)> {
+        let mut out = Vec::new();
+        PLUGIN.iter_messages(path, &mut |m| {
+            out.push((m.role, m.text));
+            true
+        });
+        out
+    }
+
+    #[test]
+    fn jsonl_replays_upserts_rewinds_and_checkpoints() {
+        use MessageRole::{Assistant, User};
+        assert_eq!(
+            messages(&fixture_path("gemini_session.jsonl")),
+            vec![
+                (User, "draft the migration plan".to_string()),
+                (Assistant, "Here is the plan.".to_string()),
+                (User, "add a rollback step".to_string()),
+                (Assistant, "Rollback step added.".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn jsonl_checkpoint_replaces_messages() {
+        let checkpoint = r#"{"sessionId":"s","projectHash":"h"}
+{"id":"a","type":"user","content":[{"text":"old"}]}
+{"$set":{"messages":[{"id":"b","type":"user","content":[{"text":"new"}]}]}}
+{"id":"c","type":"user","content":[{"text":"next"}]}
+"#;
+        let ids = |data: &str| -> Vec<String> {
+            JsonlSession::replay(data.as_bytes())
+                .messages
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids(checkpoint), ["b", "c"]);
+        // Rewinding to an unknown id clears the conversation
+        let reset = format!(
+            "{checkpoint}{}\n{}\n",
+            r#"{"$rewindTo":"missing"}"#, r#"{"id":"d","type":"user","content":"after reset"}"#
+        );
+        assert_eq!(ids(&reset), ["d"]);
+    }
+
+    #[test]
+    fn jsonl_session_id_prefers_latest_set() {
+        let path = fixture_path("gemini_session.jsonl");
+        assert_eq!(
+            PLUGIN.resolve_resume_id(&path, Path::new("/")).as_deref(),
+            Some("gemini-jsonl-001")
+        );
+        let data = br#"{"sessionId":"first","projectHash":"h"}
+{"id":"m","type":"user","content":"mentions \"sessionId\""}
+{"$set":{"sessionId":"second"}}
+"#;
+        assert_eq!(jsonl_session_id(data).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn project_dir_named_tmp_is_not_confused_with_chats() {
+        let home = Path::new("/home/u");
+        let path =
+            Path::new("/home/u/.gemini/tmp/tmp/chats/session-2026-06-01T00-00-abcd1234.jsonl");
+        assert_eq!(PLUGIN.resolve_project(path, home).as_deref(), Some("tmp"));
+        let logs = Path::new("/tmp/x/.gemini/tmp/proj/logs.json");
+        assert_eq!(PLUGIN.resolve_project(logs, home).as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn cwd_resolves_from_project_root_then_projects_json() {
+        let base = std::env::temp_dir().join(format!("ah-gemini-cwd-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("tmp/tmp/chats")).unwrap();
+        fs::create_dir_all(base.join("tmp/myproj/chats")).unwrap();
+        fs::write(base.join("tmp/tmp/.project_root"), "/tmp\n").unwrap();
+        fs::write(
+            base.join("projects.json"),
+            r#"{"projects":{"/work/myproj":"myproj"}}"#,
+        )
+        .unwrap();
+        let home = Path::new("/nonexistent");
+        let name = "session-2026-06-01T00-00-abcd1234.jsonl";
+        let tmp_session = base.join("tmp/tmp/chats").join(name);
+        let proj_session = base.join("tmp/myproj/chats").join(name);
+        let tmp_cwd = PLUGIN.resolve_cwd(&tmp_session, home);
+        let proj_cwd = PLUGIN.resolve_cwd(&proj_session, home);
+        fs::remove_dir_all(&base).unwrap();
+        assert_eq!(tmp_cwd.as_deref(), Some("/tmp"));
+        assert_eq!(proj_cwd.as_deref(), Some("/work/myproj"));
+    }
+
+    #[test]
+    fn file_name_time_is_utc() {
+        let utc = NaiveDateTime::parse_from_str("2026-06-11T02-44", "%Y-%m-%dT%H-%M").unwrap();
+        let expected = Local
+            .from_utc_datetime(&utc)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        for name in [
+            "session-2026-06-11T02-44-acc93477.jsonl",
+            "session-2026-06-11T02-44-1-acc93477.jsonl",
+            "session-2026-06-11T02-44-acc93477.json",
+        ] {
+            let path = PathBuf::from("/h/.gemini/tmp/p/chats").join(name);
+            assert_eq!(
+                PLUGIN
+                    .resolve_date(&path, SystemTime::UNIX_EPOCH)
+                    .as_deref(),
+                Some(expected.as_str()),
+                "{name}"
+            );
+        }
     }
 }

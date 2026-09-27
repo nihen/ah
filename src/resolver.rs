@@ -813,6 +813,27 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_fields_gemini_jsonl() {
+        let path = fixture_path("gemini_session.jsonl");
+        let plugin = find_plugin("gemini").unwrap();
+        let fields = vec![Field::Turns, Field::FirstPrompt, Field::Id];
+        let result = resolve_fields(
+            &path,
+            plugin,
+            SystemTime::now(),
+            Path::new("/"),
+            &fields,
+            &opts(500, 30),
+        );
+        assert_eq!(result.get(&Field::Turns).unwrap(), "2");
+        assert_eq!(
+            result.get(&Field::FirstPrompt).unwrap(),
+            "draft the migration plan"
+        );
+        assert_eq!(result.get(&Field::Id).unwrap(), "gemini-jsonl-001");
+    }
+
+    #[test]
     fn test_resolve_matched_prompt_only() {
         let path = fixture_path("claude_session.jsonl");
         let plugin = find_plugin("claude").unwrap();
