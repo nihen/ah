@@ -1,14 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use chrono::DateTime;
 use regex::Regex;
 
 use super::AgentPlugin;
 use super::Message;
-use super::common::{for_each_jsonl_value, format_mtime, strip_home};
+use super::common::{
+    for_each_jsonl_value, format_mtime, is_pid_alive, process_start_time, strip_home,
+};
 
 static RE_COPILOT_SESSION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(.*/session-state/[^/]+)/.*").unwrap());
@@ -207,6 +209,11 @@ impl AgentPlugin for CopilotPlugin {
         true
     }
 
+    fn can_detect_running(&self) -> bool {
+        // Needs a pid liveness check, which is only implemented on Unix.
+        cfg!(unix)
+    }
+
     fn project_desc(&self) -> &'static str {
         "basename of cwd (raw: home-relative path of cwd)"
     }
@@ -330,6 +337,59 @@ impl AgentPlugin for CopilotPlugin {
         // `copilot --help` documents for a specific session.
         Some(vec!["copilot".to_string(), format!("--resume={}", id)])
     }
+
+    fn running_sessions(&self) -> Vec<(String, Option<u32>)> {
+        crate::config::resolve_agent_base("copilot")
+            .map(|base| running_in(&base.join("session-state"), process_start_time))
+            .unwrap_or_default()
+    }
+}
+
+/// Slack for comparing a lock file's mtime with its owner's start time.
+const LOCK_START_SLACK: Duration = Duration::from_secs(2);
+
+/// Running sessions from the `session-state/<id>/inuse.<pid>.lock` files an
+/// interactive Copilot CLI holds while a session is open. Locks survive a
+/// crash, so the pid must be alive, and a process that started after the
+/// lock was written is an unrelated one that reused the pid.
+fn running_in(
+    state_dir: &Path,
+    start_time: impl Fn(u32) -> Option<SystemTime>,
+) -> Vec<(String, Option<u32>)> {
+    let Ok(sessions) = fs::read_dir(state_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for session in sessions.flatten() {
+        let Ok(files) = fs::read_dir(session.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name();
+            let Some(pid) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix("inuse.")?.strip_suffix(".lock"))
+                .and_then(|p| p.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if !is_pid_alive(pid) {
+                continue;
+            }
+            let locked_at = file.metadata().and_then(|m| m.modified()).ok();
+            if let (Some(locked_at), Some(started)) = (locked_at, start_time(pid)) {
+                if started > locked_at + LOCK_START_SLACK {
+                    continue;
+                }
+            }
+            out.push((
+                session.file_name().to_string_lossy().into_owned(),
+                Some(pid),
+            ));
+            break;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -502,5 +562,37 @@ paras: >\n  one\n  two\n\n  three\n";
             PLUGIN.resume_args(&path, tmp.path()).unwrap(),
             vec!["copilot".to_string(), "--resume=abc-123".to_string()]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_in_requires_live_owner_that_predates_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let lock = |session: &str, pid: u32| {
+            let d = dir.path().join(session);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join(format!("inuse.{pid}.lock")), pid.to_string()).unwrap();
+        };
+        lock("live", me);
+        lock("dead", i32::MAX as u32);
+        fs::create_dir_all(dir.path().join("idle")).unwrap();
+        fs::write(dir.path().join("idle/workspace.yaml"), "id: idle").unwrap();
+        fs::write(dir.path().join("idle/inuse.notapid.lock"), "").unwrap();
+
+        let past = SystemTime::now() - Duration::from_secs(3600);
+        assert_eq!(
+            running_in(dir.path(), |_| Some(past)),
+            vec![("live".to_string(), Some(me))]
+        );
+        // Unknown start time: liveness only.
+        assert_eq!(
+            running_in(dir.path(), |_| None),
+            vec![("live".to_string(), Some(me))]
+        );
+        // Owner started after the lock was written: the pid was reused.
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        assert!(running_in(dir.path(), |_| Some(future)).is_empty());
+        assert!(running_in(&dir.path().join("missing"), |_| None).is_empty());
     }
 }

@@ -4,7 +4,10 @@ use memchr::memmem;
 
 use super::AgentPlugin;
 use super::Message;
-use super::common::{RE_HOME_PREFIX, for_each_jsonl_value, for_each_jsonl_value_bytes, mmap_file};
+use super::common::{
+    RE_HOME_PREFIX, for_each_jsonl_value, for_each_jsonl_value_bytes, is_pid_alive, json_pid,
+    mmap_file, process_start_ticks,
+};
 
 pub static PLUGIN: ClaudePlugin = ClaudePlugin;
 
@@ -279,6 +282,56 @@ impl AgentPlugin for ClaudePlugin {
         let id = self.resolve_resume_id(path, home)?;
         Some(vec!["claude".to_string(), "--resume".to_string(), id])
     }
+
+    fn running_sessions(&self) -> Vec<(String, Option<u32>)> {
+        crate::config::resolve_agent_base("claude")
+            .map(|base| running_in(&base.join("sessions"), process_start_ticks))
+            .unwrap_or_default()
+    }
+}
+
+/// Running sessions from Claude Code's `sessions/<pid>.json` registry.
+/// `procStart` records the process start time (on Linux, clock ticks since
+/// boot); when both it and the live process's start time are known, a
+/// mismatch means the PID was reused by an unrelated process.
+fn running_in(
+    sessions_dir: &Path,
+    start_ticks: impl Fn(u32) -> Option<u64>,
+) -> Vec<(String, Option<u32>)> {
+    let Ok(entries) = std::fs::read_dir(sessions_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let Some(val) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        else {
+            continue;
+        };
+        let Some(pid) = json_pid(&val, "pid") else {
+            continue;
+        };
+        let session_id = val.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+        if session_id.is_empty() || !is_pid_alive(pid) {
+            continue;
+        }
+        let recorded = val.get("procStart").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        });
+        if let (Some(recorded), Some(actual)) = (recorded, start_ticks(pid)) {
+            if recorded != actual {
+                continue;
+            }
+        }
+        out.push((session_id.to_string(), Some(pid)));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -426,5 +479,50 @@ mod tests {
             ClaudePlugin::extract_title_from_bytes(data).as_deref(),
             Some("first prompt")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_in_checks_liveness_and_pid_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let write = |name: &str, body: String| std::fs::write(dir.path().join(name), body).unwrap();
+        write(
+            "a.json",
+            format!(r#"{{"pid":{me},"sessionId":"alive","procStart":"100"}}"#),
+        );
+        write(
+            "b.json",
+            format!(r#"{{"pid":{me},"sessionId":"reused","procStart":"999"}}"#),
+        );
+        write(
+            "c.json",
+            format!(r#"{{"pid":{me},"sessionId":"no-start"}}"#),
+        );
+        write(
+            "d.json",
+            format!(r#"{{"pid":{},"sessionId":"dead"}}"#, i32::MAX),
+        );
+        write("e.json", format!(r#"{{"pid":{me},"sessionId":""}}"#));
+        write(
+            "f.txt",
+            format!(r#"{{"pid":{me},"sessionId":"not-json-ext"}}"#),
+        );
+
+        let mut got = running_in(dir.path(), |pid| (pid == me).then_some(100));
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("alive".to_string(), Some(me)),
+                ("no-start".to_string(), Some(me)),
+            ]
+        );
+
+        // Start time unavailable (e.g. non-Linux): fall back to liveness only.
+        let mut got = running_in(dir.path(), |_| None);
+        got.sort();
+        let ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["alive", "no-start", "reused"]);
     }
 }

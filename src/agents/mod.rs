@@ -202,6 +202,24 @@ pub trait AgentPlugin: Sync {
     fn resume_args(&self, _path: &Path, _home: &Path) -> Option<Vec<String>> {
         None
     }
+
+    /// Sessions of this agent that are running now, as `(session id, pid)`.
+    /// The id must match what `resolve_resume_id` returns. `pid` is `None`
+    /// when the owning process cannot be identified. Only called when
+    /// `can_detect_running` is true.
+    fn running_sessions(&self) -> Vec<(String, Option<u32>)> {
+        Vec::new()
+    }
+}
+
+/// Map of session id → pid (if known) for every running session of the
+/// built-in agents that can detect it.
+pub fn running_session_map() -> std::collections::HashMap<String, Option<u32>> {
+    all_plugins()
+        .iter()
+        .filter(|p| p.can_detect_running())
+        .flat_map(|p| p.running_sessions())
+        .collect()
 }
 
 struct UnknownPlugin;
