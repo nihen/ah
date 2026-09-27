@@ -31,6 +31,12 @@ pub fn collect_all_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
     collect(limit, false)
 }
 
+/// Newest first; equal mtimes by path descending, so the order (and the copy
+/// an id lookup picks) is stable across runs.
+fn newest_first(a: &(PathBuf, SystemTime), b: &(PathBuf, SystemTime)) -> Ordering {
+    b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0))
+}
+
 fn collect(limit: usize, exclude_archived: bool) -> Vec<(PathBuf, SystemTime)> {
     let debug = color::is_debug();
     let t0 = if debug { Some(Instant::now()) } else { None };
@@ -70,7 +76,7 @@ fn collect(limit: usize, exclude_archived: bool) -> Vec<(PathBuf, SystemTime)> {
     let mut expanded: HashSet<PathBuf> = HashSet::new();
     let mut virtual_entries: HashMap<(&'static str, OsString), (PathBuf, SystemTime)> =
         HashMap::new();
-    let per_pattern: Vec<(&'static dyn AgentPlugin, Vec<PathBuf>)> = patterns
+    let per_pattern: Vec<Vec<PathBuf>> = patterns
         .iter()
         .zip(per_pattern)
         .map(|((plugin, _, unattributed), paths)| {
@@ -112,26 +118,21 @@ fn collect(limit: usize, exclude_archived: bool) -> Vec<(PathBuf, SystemTime)> {
                     None => files.push(path),
                 }
             }
-            (*plugin, files)
+            files
         })
         .collect();
 
-    // Each file keeps the plugin of the first pattern that matched it.
-    let mut all_paths: HashMap<PathBuf, &'static dyn AgentPlugin> = HashMap::new();
-    for (plugin, files) in per_pattern {
-        for path in files {
-            all_paths.entry(path).or_insert(plugin);
-        }
-    }
+    let all_paths: HashSet<PathBuf> = per_pattern.into_iter().flatten().collect();
     let unique_count = all_paths.len();
 
-    // Parallel stat. The matching pattern's plugin decides the session's
-    // mtime (e.g. Copilot's events.jsonl is newer than the workspace.yaml the
-    // glob matched), so time filters, `-n` and project dates agree with
-    // `modified_at`.
+    // Parallel stat. The plugin the file is attributed to decides the
+    // session's mtime (e.g. Copilot's events.jsonl is newer than the
+    // workspace.yaml the glob matched), so time filters, `-n` and project
+    // dates agree with `modified_at`.
     let mut entries: Vec<(PathBuf, SystemTime)> = all_paths
         .into_par_iter()
-        .filter_map(|(path, plugin)| {
+        .filter_map(|path| {
+            let plugin = config::find_plugin_for_path(&path);
             if exclude_archived && plugin.is_archived(&path) {
                 return None;
             }
@@ -159,7 +160,7 @@ fn collect(limit: usize, exclude_archived: bool) -> Vec<(PathBuf, SystemTime)> {
     // No limit: sort and return all
     if limit == 0 || limit >= entries.len() {
         let mut sorted = entries;
-        sorted.sort_by_key(|e| std::cmp::Reverse(e.1));
+        sorted.sort_by(newest_first);
         return sorted;
     }
 
@@ -197,6 +198,6 @@ fn collect(limit: usize, exclude_archived: bool) -> Vec<(PathBuf, SystemTime)> {
     }
 
     let mut result: Vec<_> = heap.into_iter().map(|e| (e.path, e.mtime)).collect();
-    result.sort_by_key(|e| std::cmp::Reverse(e.1));
+    result.sort_by(newest_first);
     result
 }

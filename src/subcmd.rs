@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -196,7 +197,7 @@ fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
 
     // Preferred file per session id: exact match, then id-prefix matches.
     let mut exact: Option<(PathBuf, SystemTime)> = None;
-    let mut prefix_matches: Vec<(String, PathBuf, SystemTime)> = Vec::new();
+    let mut prefix_matches: HashMap<String, (PathBuf, SystemTime)> = HashMap::new();
     let better = |a: &PathBuf, a_mtime: SystemTime, b: &PathBuf, b_mtime: SystemTime| {
         pipeline::copy_preference(a, a_mtime) > pipeline::copy_preference(b, b_mtime)
     };
@@ -208,8 +209,9 @@ fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
             continue;
         };
         if v == id {
-            // Files come newest first, so the first dedicated session file
-            // is the preferred copy; only a secondary record keeps looking.
+            // Files come newest first (ties by path, like `copy_preference`),
+            // so the first dedicated session file is the preferred copy; only
+            // a secondary record keeps looking.
             if !plugin.is_secondary_record(fpath) {
                 return Ok(fpath.clone());
             }
@@ -220,14 +222,15 @@ fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
                 exact = Some((fpath.clone(), *mtime));
             }
         } else if v.starts_with(id) {
-            match prefix_matches.iter_mut().find(|(seen, _, _)| seen == v) {
+            match prefix_matches.get_mut(v) {
                 Some(entry) => {
-                    if better(fpath, *mtime, &entry.1, entry.2) {
-                        entry.1 = fpath.clone();
-                        entry.2 = *mtime;
+                    if better(fpath, *mtime, &entry.0, entry.1) {
+                        *entry = (fpath.clone(), *mtime);
                     }
                 }
-                None => prefix_matches.push((v.clone(), fpath.clone(), *mtime)),
+                None => {
+                    prefix_matches.insert(v.clone(), (fpath.clone(), *mtime));
+                }
             }
         }
     }
@@ -235,9 +238,10 @@ fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
     if let Some((path, _)) = exact {
         return Ok(path);
     }
-    match prefix_matches.len() {
-        0 => Err(format!("No session found for id: {}", id)),
-        1 => Ok(prefix_matches.remove(0).1),
+    let mut matches = prefix_matches.into_values();
+    match (matches.next(), matches.next()) {
+        (None, _) => Err(format!("No session found for id: {}", id)),
+        (Some((path, _)), None) => Ok(path),
         _ => Err(format!("Ambiguous session id prefix: {}", id)),
     }
 }

@@ -1423,3 +1423,66 @@ fn gemini_session_file_wins_over_newer_logs_json() {
         .success()
         .stdout(format!("{chat}\n"));
 }
+
+#[test]
+fn duplicate_session_id_with_equal_mtime_resolves_consistently() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let codex = home.join(".codex");
+    let id = "019c0000-0000-7000-8000-00000000dddd";
+    let a = write_codex_rollout(&codex.join("sessions/a"), "2026-09-27T10-00-00", id);
+    let z = write_codex_rollout(&codex.join("sessions/z"), "2026-09-27T10-00-00", id);
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    for path in [&a, &z] {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+    // Ties are broken by path, the same way in log and in id lookups.
+    for _ in 0..5 {
+        ah_codex(&home)
+            .args(["log", "-a", "-o", "path"])
+            .assert()
+            .success()
+            .stdout(format!("{z}\n"));
+        ah_codex(&home)
+            .args(["show", "-o", "path", id])
+            .write_stdin("")
+            .assert()
+            .success()
+            .stdout(format!("{z}\n"));
+    }
+}
+
+#[test]
+fn no_archived_uses_the_attributed_agent() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    // A custom Codex agent whose files live under a Claude-looking path.
+    let dir = home.join("logs/.claude/projects/archived_sessions");
+    let id = "019c0000-0000-7000-8000-00000000eeee";
+    write_codex_rollout(&dir, "2026-09-27T10-00-00", id);
+    fs::write(
+        home.join(".ahrc"),
+        format!(
+            "[agents.customcodex]\nplugin = \"codex\"\nfile_patterns = [\"{}/*.jsonl\"]\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    ah_codex(&home)
+        .env("CLAUDE_CONFIG_DIR", home.join("logs/.claude"))
+        .args(["log", "-a", "-o", "agent,archived"])
+        .assert()
+        .success()
+        .stdout("customcodex\ttrue\n");
+    ah_codex(&home)
+        .env("CLAUDE_CONFIG_DIR", home.join("logs/.claude"))
+        .args(["log", "-a", "--no-archived", "-o", "agent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No sessions found"));
+}
