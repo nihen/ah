@@ -2425,3 +2425,112 @@ fn grok_and_cursor_subagents_are_hidden_by_default() {
         .stdout(predicate::str::contains("grok\t0192-sub\t\t"))
         .stdout(predicate::str::contains("cursor\tsub-1\tchat-1\t\n"));
 }
+
+#[test]
+fn claude_subagents_sharing_an_id_under_different_parents_stay_distinct() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let claude = home.join(".claude");
+    let project = claude.join("projects/-tmp-proj");
+    let mut children = Vec::new();
+    for parent in ["parent-a", "parent-b"] {
+        fs::create_dir_all(project.join(parent).join("subagents")).unwrap();
+        fs::write(
+            project.join(format!("{parent}.jsonl")),
+            "{\"type\":\"user\",\"cwd\":\"/tmp/proj\",\"message\":{\"role\":\"user\",\"content\":\"p\"}}\n",
+        )
+        .unwrap();
+        let child = project.join(format!("{parent}/subagents/agent-dup1.jsonl"));
+        fs::write(
+            &child,
+            "{\"type\":\"user\",\"cwd\":\"/tmp/proj\",\"message\":{\"role\":\"user\",\"content\":\"c\"}}\n",
+        )
+        .unwrap();
+        children.push(child);
+    }
+    let ah_claude = || {
+        let mut cmd = ah_opencode(&home);
+        cmd.env("CLAUDE_CONFIG_DIR", &claude);
+        cmd
+    };
+
+    ah_claude()
+        .args([
+            "log",
+            "-a",
+            "--subagents",
+            "-o",
+            "id,parent_id",
+            "-S",
+            "parent_id",
+            "--asc",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dup1\tparent-a\ndup1\tparent-b\n"));
+    ah_claude()
+        .args(["show", "-o", "path", "dup1"])
+        .write_stdin("")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Ambiguous session id"));
+    // The path still selects one of them.
+    ah_claude()
+        .args(["show", "-o", "parent_id", children[1].to_str().unwrap()])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("parent-b\n");
+}
+
+#[test]
+fn gemini_project_named_chats_is_not_a_subagent() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let gemini = home.join(".gemini");
+    let chats = gemini.join("tmp/chats/chats");
+    fs::create_dir_all(&chats).unwrap();
+    fs::write(
+        chats.join("session-2026-06-11T02-44-aaaa1111.jsonl"),
+        "{\"sessionId\":\"aaaa1111-0000\",\"projectHash\":\"h\",\"kind\":\"main\"}\n",
+    )
+    .unwrap();
+    let mut cmd = ah_opencode(&home);
+    cmd.env("GEMINI_CLI_HOME", &gemini)
+        .args(["log", "-a", "-o", "id,parent_id"])
+        .assert()
+        .success()
+        .stdout("aaaa1111-0000\t\n");
+}
+
+#[test]
+fn opencode_child_sessions_are_listed_only_with_subagents() {
+    let tmp = opencode_home();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let child_dir = home.join("child-only");
+    fs::create_dir_all(&child_dir).unwrap();
+    fs::write(child_dir.join("AGENTS.md"), "child rules\n").unwrap();
+    let conn = rusqlite::Connection::open(home.join(".local/share/opencode/opencode.db")).unwrap();
+    conn.execute(
+        "INSERT INTO session VALUES ('ses_child', 'ses_oc1', ?1, 'Child', 1700000000000, 1700000200000)",
+        [child_dir.to_str().unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+
+    ah_opencode(&home)
+        .args(["log", "-a", "-o", "id"])
+        .assert()
+        .success()
+        .stdout("ses_oc1\n");
+    ah_opencode(&home)
+        .args(["log", "-a", "--subagents", "-o", "id,parent_id"])
+        .assert()
+        .success()
+        .stdout("ses_child\tses_oc1\nses_oc1\t\n");
+    // Project discovery for `ah memory` still ignores child sessions.
+    ah_opencode(&home)
+        .args(["memory", "-a", "-o", "path"])
+        .assert()
+        .stdout(predicate::str::contains("child-only").not());
+}

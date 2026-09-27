@@ -1645,6 +1645,7 @@ const PROJECT_GLOBAL_OPTIONS: &str = concatcp!(
   --remote <NAME>         Include projects from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --subagents             Include subagent sessions (spawned by another session)
 
 "#,
     DISPLAY_OPTIONS
@@ -1674,6 +1675,7 @@ const AGENT_GLOBAL_OPTIONS: &str = concatcp!(
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --subagents             Include subagent sessions (spawned by another session)
 
 "#,
     DISPLAY_OPTIONS

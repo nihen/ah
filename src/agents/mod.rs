@@ -229,7 +229,7 @@ pub trait AgentPlugin: Sync {
     }
 
     /// Sessions of this agent that are running now, as `(session id, pid)`.
-    /// The id must match what `resolve_resume_id` returns. `pid` is `None`
+    /// The id must match what `session_id` returns. `pid` is `None`
     /// when the owning process cannot be identified. Only called when
     /// `can_detect_running` is true.
     fn running_sessions(&self) -> Vec<(String, Option<u32>)> {

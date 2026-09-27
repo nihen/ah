@@ -30,7 +30,9 @@ pub fn init_include_subagents(include: bool) {
 enum Subagents {
     /// Skip sessions a plugin reports as subagents (the listing default).
     Hide,
-    /// Keep whatever the main patterns match, without the subagent patterns.
+    /// Keep what the main patterns matched before subagents could be
+    /// listed: plain files unfiltered, container rows (opencode) without
+    /// their child sessions, and no subagent patterns.
     Unfiltered,
     /// Also collect the plugins' subagent patterns (`--subagents`, lookups).
     Include,
@@ -77,6 +79,7 @@ fn collect(
     subagents: Subagents,
 ) -> Vec<(PathBuf, SystemTime)> {
     let hide_subagents = subagents == Subagents::Hide;
+    let hide_subagent_rows = subagents != Subagents::Include;
     let debug = color::is_debug();
     let t0 = if debug { Some(Instant::now()) } else { None };
 
@@ -147,7 +150,7 @@ fn collect(
                             // An unowned copy must not win over a good one.
                             if !owned(&session)
                                 || (exclude_archived && plugin.is_archived(&session))
-                                || (hide_subagents && plugin.is_subagent(&session))
+                                || (hide_subagent_rows && plugin.is_subagent(&session))
                             {
                                 continue;
                             }

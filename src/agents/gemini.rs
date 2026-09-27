@@ -19,11 +19,18 @@ use super::{MemoryKind, MemorySource};
 /// Project directory of a session file: `tmp/{project}/chats/session-*` or
 /// `tmp/{project}/logs.json`. Anchored to the end of the path so that a
 /// project named `tmp` (cwd `/tmp`) does not capture `chats`.
-/// Parent session id of a subagent log (`chats/<parent id>/<id>.json` or
-/// `.jsonl`).
+/// Parent session id of a subagent log
+/// (`tmp/<project>/chats/<parent id>/<id>.json` or `.jsonl`). The whole
+/// layout is checked, so a project named `chats` is not mistaken for one;
+/// main session files are always named `session-*`, subagent logs never.
 fn subagent_parent(path: &Path) -> Option<&str> {
+    if path.file_name()?.to_str()?.starts_with("session-") {
+        return None;
+    }
     let dir = path.parent()?;
-    if dir.parent()?.file_name()? != "chats" {
+    let chats = dir.parent()?;
+    let tmp = chats.parent()?.parent()?;
+    if chats.file_name()? != "chats" || tmp.file_name()? != "tmp" {
         return None;
     }
     dir.file_name()?.to_str()
@@ -673,6 +680,9 @@ mod tests {
         );
         let main = chats.join("session-2026-06-11T02-44-acc93477.jsonl");
         assert!(!PLUGIN.is_subagent(&main));
+        // A base directory named `tmp` with a project named `chats`.
+        let nested = Path::new("/x/tmp/tmp/chats/chats/session-2026-06-11T02-44-acc93477.json");
+        assert!(!PLUGIN.is_subagent(nested));
     }
 
     fn fixture_path(name: &str) -> PathBuf {
