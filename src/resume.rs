@@ -192,6 +192,7 @@ mod tests {
             limit: 0,
             running: false,
             no_archived: false,
+            subagents: false,
             remote: vec![],
             since: None,
             until: None,

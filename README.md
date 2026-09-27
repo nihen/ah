@@ -247,6 +247,7 @@ Global options:
   --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
   --running               Show only currently running sessions (Claude, Codex, Copilot, Grok)
   --no-archived           Hide sessions the agent has archived (Codex)
+  --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
@@ -587,9 +588,20 @@ Each built-in agent respects the environment variable its CLI uses to relocate s
 | Grok    | `sessions/*/*/chat_history.jsonl` | `GROK_HOME`        | `~/.grok`   |
 | opencode | `opencode/opencode*.db` (SQLite) | `XDG_DATA_HOME` | `~/.local/share` |
 
-opencode stores all sessions in one SQLite database. `ah` reads it read-only and lists each top-level session (subagent sessions are skipped) under the virtual path `<db>/<session-id>`, which works with `ah show`, `ah resume`, and `-o path` like a regular session file. `ah show --raw` prints one JSON line per message with its parts.
+opencode stores all sessions in one SQLite database. `ah` reads it read-only and lists each session under the virtual path `<db>/<session-id>`, which works with `ah show`, `ah resume`, and `-o path` like a regular session file. `ah show --raw` prints one JSON line per message with its parts.
 
 Codex sessions archived with `codex archive` stay listed and resumable (`codex resume` still finds them). They carry `archived=true` (`-o archived`); hide them with `--no-archived`.
+
+Subagent sessions (started by another session, e.g. Claude's Task tool) are hidden from `log`, `project`, and `agent` unless `--subagents` is given; `-o parent_id` shows the session that spawned them. A subagent's id or path still works with `ah show` directly. Claude, Cursor, and Gemini subagent transcripts cannot be resumed on their own, so they have no resume command.
+
+| Agent | Subagent sessions | `parent_id` |
+|-------|-------------------|-------------|
+| Claude | `projects/*/<parent>/subagents/agent-<id>.jsonl` (`id` is the agent id) | ✓ |
+| Codex | sessions whose `session_meta` source is a subagent | ✓ (spawned threads) |
+| Gemini | `tmp/*/chats/<parent>/<id>.json(l)` | ✓ |
+| Cursor | `projects/*/agent-transcripts/<parent>/subagents/*.jsonl` | ✓ |
+| Grok | `summary.json` with `session_kind: subagent` | not recorded |
+| opencode | child sessions (`parent_id` column) | ✓ |
 
 Run `ah list-agents` to see the full configuration including glob patterns and capabilities.
 

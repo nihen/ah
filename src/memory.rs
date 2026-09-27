@@ -448,7 +448,7 @@ fn current_project_dirs(cwd: &str) -> Vec<PathBuf> {
 /// `--no-archived` hides sessions, not the projects they reveal.
 fn collect_known_project_cwds() -> Vec<String> {
     let home = canonical_home();
-    let files = collector::collect_all_files(0);
+    let files = collector::collect_project_files(0);
     let resolve_fields = vec![Field::Cwd];
 
     let cwds: HashSet<String> = files

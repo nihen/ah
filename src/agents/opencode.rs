@@ -147,7 +147,7 @@ fn strip_jsonc(src: &str) -> String {
 /// Sessions live in a SQLite database: `~/.local/share/opencode/opencode.db`
 /// (`opencode-<channel>.db` for non-release channels). Each top-level session
 /// is exposed as the virtual path `<db>/<session-id>`, which never exists on
-/// disk. Child (subagent) sessions are skipped, like Claude's sidechains.
+/// disk. Child (subagent) sessions are listed only with `--subagents`.
 ///
 /// The searchable/raw form of a session is JSONL with one line per message:
 /// `{"id":"msg_…","info":<message.data>,"parts":[<part.data>,…]}`.
@@ -156,6 +156,7 @@ pub struct OpencodePlugin;
 /// Session metadata from the `session` table.
 #[derive(Clone)]
 struct SessionRow {
+    parent_id: Option<String>,
     directory: String,
     title: String,
     time_created: i64,
@@ -302,6 +303,7 @@ fn column_bytes(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Vec<u8>
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
+        parent_id: row.get("parent_id")?,
         directory: row.get("directory")?,
         title: row.get("title")?,
         time_created: row.get("time_created")?,
@@ -320,8 +322,8 @@ fn session_row(path: &Path) -> Option<SessionRow> {
     let (db, id) = split_virtual_path(path)?;
     let row = match with_connection(db, |conn| {
         conn.query_row(
-            "SELECT directory, title, time_created, time_updated \
-             FROM session WHERE id = ?1 AND parent_id IS NULL",
+            "SELECT parent_id, directory, title, time_created, time_updated \
+             FROM session WHERE id = ?1",
             [id],
             row_to_session,
         )
@@ -576,8 +578,8 @@ impl AgentPlugin for OpencodePlugin {
     fn expand_sessions(&self, file: &Path) -> Option<Vec<(PathBuf, SystemTime)>> {
         let rows = with_connection(file, |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, directory, title, time_created, time_updated \
-                 FROM session WHERE parent_id IS NULL",
+                "SELECT id, parent_id, directory, title, time_created, time_updated \
+                 FROM session",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>("id")?, row_to_session(row)?))
@@ -720,6 +722,10 @@ impl AgentPlugin for OpencodePlugin {
         let id = self.resolve_resume_id(path, home)?;
         Some(vec!["opencode".to_string(), "--session".to_string(), id])
     }
+
+    fn parent_session_id(&self, path: &Path) -> Option<String> {
+        session_row(path)?.parent_id.filter(|id| !id.is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -819,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn expands_top_level_sessions_only() {
+    fn expands_child_sessions_as_subagents() {
         let tmp = tempfile::tempdir().unwrap();
         let db = create_db(tmp.path());
         let mut sessions = PLUGIN.expand_sessions(&db).unwrap();
@@ -828,9 +834,16 @@ mod tests {
             sessions,
             vec![
                 (db.join("ses_aaa"), millis_to_system_time(1700000100000)),
+                (db.join("ses_child"), millis_to_system_time(1700000200000)),
                 (db.join("ses_empty"), millis_to_system_time(1700000000000)),
             ]
         );
+        assert!(PLUGIN.is_subagent(&db.join("ses_child")));
+        assert_eq!(
+            PLUGIN.parent_session_id(&db.join("ses_child")).as_deref(),
+            Some("ses_aaa")
+        );
+        assert!(!PLUGIN.is_subagent(&db.join("ses_aaa")));
     }
 
     #[test]
@@ -953,11 +966,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_child_sessions_do_not_exist() {
+    fn missing_sessions_do_not_exist() {
         let tmp = tempfile::tempdir().unwrap();
         let db = create_db(tmp.path());
         assert_eq!(PLUGIN.session_mtime(&db.join("ses_nope")), None);
-        assert_eq!(PLUGIN.session_mtime(&db.join("ses_child")), None);
+        assert_eq!(
+            PLUGIN.session_mtime(&db.join("ses_child")),
+            Some(millis_to_system_time(1700000200000))
+        );
         assert_eq!(PLUGIN.session_mtime(&tmp.path().join("x.db/ses_aaa")), None);
         assert!(PLUGIN.session_bytes(&db.join("ses_nope")).is_none());
         assert_eq!(PLUGIN.session_size(&db.join("ses_nope")), None);
@@ -1013,7 +1029,7 @@ mod tests {
     fn immutable_connection_is_reopened_after_the_database_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let db = create_db(tmp.path());
-        assert_eq!(PLUGIN.expand_sessions(&db).unwrap().len(), 2);
+        assert_eq!(PLUGIN.expand_sessions(&db).unwrap().len(), 3);
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch(
             "PRAGMA journal_mode = DELETE; \
@@ -1029,14 +1045,14 @@ mod tests {
             .unwrap()
             .set_modified(SystemTime::now() + Duration::from_secs(10))
             .unwrap();
-        assert_eq!(PLUGIN.expand_sessions(&db).unwrap().len(), 3);
+        assert_eq!(PLUGIN.expand_sessions(&db).unwrap().len(), 4);
     }
 
     #[test]
     fn active_writer_is_read_through_its_wal() {
         let tmp = tempfile::tempdir().unwrap();
         let db = create_db(tmp.path());
-        assert_eq!(PLUGIN.expand_sessions(&db).unwrap().len(), 2);
+        assert_eq!(PLUGIN.expand_sessions(&db).unwrap().len(), 3);
         // A writer keeps its connection open: the new row lives in the -wal.
         let writer = Connection::open(&db).unwrap();
         writer
@@ -1045,7 +1061,7 @@ mod tests {
             )
             .unwrap();
         assert!(db.with_file_name("opencode.db-wal").exists());
-        assert_eq!(PLUGIN.expand_sessions(&db).unwrap().len(), 3);
+        assert_eq!(PLUGIN.expand_sessions(&db).unwrap().len(), 4);
         drop(writer);
     }
 
@@ -1059,7 +1075,7 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        assert_eq!(PLUGIN.expand_sessions(&db).unwrap().len(), 2);
+        assert_eq!(PLUGIN.expand_sessions(&db).unwrap().len(), 3);
     }
 
     #[test]

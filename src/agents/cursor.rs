@@ -35,6 +35,20 @@ fn visit_message_value(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -
     true
 }
 
+/// Parent chat id of a subagent transcript
+/// (`agent-transcripts/<parent id>/subagents/<id>.jsonl`).
+fn subagent_parent(path: &Path) -> Option<&str> {
+    let dir = path.parent()?;
+    if dir.file_name()? != "subagents" {
+        return None;
+    }
+    let parent = dir.parent()?;
+    if parent.parent()?.file_name()? != "agent-transcripts" {
+        return None;
+    }
+    parent.file_name()?.to_str()
+}
+
 static RE_CURSOR_PROJECTS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r".*/projects/([^/]+)/.*").unwrap());
 
@@ -338,6 +352,14 @@ impl AgentPlugin for CursorPlugin {
         ]
     }
 
+    fn subagent_glob_patterns(&self) -> &'static [&'static str] {
+        &[".cursor/projects/*/agent-transcripts/*/subagents/*.jsonl"]
+    }
+
+    fn parent_session_id(&self, path: &Path) -> Option<String> {
+        subagent_parent(path).map(str::to_string)
+    }
+
     fn path_markers(&self) -> &'static [&'static str] {
         &["/.cursor/"]
     }
@@ -399,7 +421,15 @@ impl AgentPlugin for CursorPlugin {
             .or_else(|| Some("?".to_string()))
     }
 
-    fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
+    // Subagent transcripts are not resumable chats of their own.
+    fn resolve_resume_id(&self, path: &Path, home: &Path) -> Option<String> {
+        if subagent_parent(path).is_some() {
+            return None;
+        }
+        self.session_id(path, home)
+    }
+
+    fn session_id(&self, path: &Path, _home: &Path) -> Option<String> {
         path.file_stem()
             .map(|stem| stem.to_string_lossy().to_string())
             .filter(|id| is_safe_cli_id(id))

@@ -95,6 +95,9 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
     if !resolve_fields.contains(&Field::Id) {
         resolve_fields.push(Field::Id);
     }
+    if !resolve_fields.contains(&Field::ParentId) {
+        resolve_fields.push(Field::ParentId);
+    }
     FieldFilter::ensure_fields(&params.filters, &mut resolve_fields);
     let wants_matched = resolve_fields.contains(&Field::Matched);
     let resolve_fields_but_matched: Vec<Field> = resolve_fields
@@ -395,20 +398,20 @@ pub fn copy_preference(path: &Path, mtime: SystemTime) -> (bool, SystemTime, &Pa
     (!secondary, mtime, path)
 }
 
-/// Keep one session per id, the copy `copy_preference` ranks highest.
-/// Sessions without an id are distinct and all kept.
+/// Keep one session per id (and parent, so subagents of different sessions
+/// that share an id stay distinct), the copy `copy_preference` ranks
+/// highest. Sessions without an id are distinct and all kept.
 fn dedup_by_id(sessions: Vec<(Session, SystemTime)>) -> Vec<Session> {
-    let mut best: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    fn field(session: &Session, field: Field) -> &str {
+        session.fields.get(&field).map(|v| v.as_str()).unwrap_or("")
+    }
+    let mut best: std::collections::HashMap<(&str, &str), usize> = std::collections::HashMap::new();
     for (i, (session, mtime)) in sessions.iter().enumerate() {
-        let id = session
-            .fields
-            .get(&Field::Id)
-            .map(|v| v.as_str())
-            .unwrap_or("");
+        let id = field(session, Field::Id);
         if id.is_empty() {
             continue;
         }
-        best.entry(id)
+        best.entry((id, field(session, Field::ParentId)))
             .and_modify(|j| {
                 let (other, other_mtime) = &sessions[*j];
                 if copy_preference(&session.path, *mtime)

@@ -269,40 +269,48 @@ fn visit_message_value(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -
 }
 
 /// The `session_meta` fields ah reads from the first line of a rollout.
-/// Each field is `None` unless it is a JSON string.
+/// Each string field is `None` unless it is a JSON string.
 #[derive(Clone)]
 struct SessionMeta {
     id: Option<String>,
     cwd: Option<String>,
+    /// `source` names a subagent (a thread another thread spawned, or a
+    /// review run on its behalf).
+    subagent: bool,
+    /// The spawning thread, when the source records it.
+    parent_id: Option<String>,
 }
 
-/// Path, size and mtime of the cached file, and its metadata.
-type CachedMeta = (PathBuf, IndexStamp, SessionMeta);
+/// Size and mtime of the cached file, and its metadata (`None` when the
+/// first line is not JSON).
+type CachedMeta = (IndexStamp, Option<SessionMeta>);
 
-thread_local! {
-    static LAST_META: std::cell::RefCell<Option<CachedMeta>> =
-        const { std::cell::RefCell::new(None) };
-}
+static SESSION_METAS: LazyLock<Mutex<HashMap<PathBuf, CachedMeta>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Session metadata from the first line, or `None` when that line cannot be
-/// read as JSON. Listing a session resolves its id, cwd and title
-/// separately, so each thread keeps the last parsed line, re-read when the
-/// file's size or mtime changes.
+/// read as JSON. The collector checks for subagents and listing resolves
+/// the id, cwd and title separately, possibly on other threads, so each
+/// file's line is parsed once and re-read when its size or mtime changes.
 fn session_meta(path: &Path) -> Option<SessionMeta> {
     let stamp = fs::metadata(path)
         .ok()
         .map(|m| (m.len(), m.modified().ok()));
-    let cached = LAST_META.with_borrow(|last| {
-        last.as_ref()
-            .filter(|(p, s, _)| p == path && *s == stamp)
-            .map(|(_, _, meta)| meta.clone())
-    });
-    if cached.is_some() {
-        return cached;
+    if let Some((cached_stamp, meta)) = SESSION_METAS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)
+    {
+        if *cached_stamp == stamp {
+            return meta.clone();
+        }
     }
-    let meta = read_session_meta(path)?;
-    LAST_META.set(Some((path.to_path_buf(), stamp, meta.clone())));
-    Some(meta)
+    let meta = read_session_meta(path);
+    SESSION_METAS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf(), (stamp, meta.clone()));
+    meta
 }
 
 fn read_session_meta(path: &Path) -> Option<SessionMeta> {
@@ -315,9 +323,13 @@ fn read_session_meta(path: &Path) -> Option<SessionMeta> {
             .and_then(|v| v.as_str())
             .map(str::to_string)
     };
+    let subagent = val.pointer("/payload/source/subagent").is_some();
     Some(SessionMeta {
         id: field("/payload/id"),
         cwd: field("/payload/cwd"),
+        subagent,
+        parent_id: field("/payload/source/subagent/thread_spawn/parent_thread_id")
+            .filter(|id| !id.is_empty()),
     })
 }
 
@@ -456,6 +468,14 @@ impl AgentPlugin for CodexPlugin {
 
     fn is_archived(&self, path: &Path) -> bool {
         sessions_root(path).and_then(|dir| dir.file_name()) == Some("archived_sessions".as_ref())
+    }
+
+    fn is_subagent(&self, path: &Path) -> bool {
+        session_meta(path).is_some_and(|meta| meta.subagent)
+    }
+
+    fn parent_session_id(&self, path: &Path) -> Option<String> {
+        session_meta(path)?.parent_id
     }
 
     // `codex resume <id>` also finds archived sessions, so they keep their id.
