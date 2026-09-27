@@ -95,6 +95,37 @@ fn list_agents_json() {
 }
 
 #[test]
+fn list_agents_advertises_memory_for_builtin_agents_only() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    fs::write(
+        home.join(".ahrc"),
+        "[agents.mybot]\nplugin = \"gemini\"\nfile_patterns = [\"~/.mybot/*.json\"]\n",
+    )
+    .unwrap();
+    let output = ah()
+        .env("HOME", &home)
+        .args(["list-agents", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let caps = |id: &str| -> Vec<String> {
+        stdout
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|v| v["id"] == id)
+            .unwrap()["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(caps("gemini").contains(&"memory".to_string()));
+    assert!(!caps("mybot").contains(&"memory".to_string()));
+}
+
+#[test]
 fn list_agents_tsv() {
     let output = ah().args(["list-agents", "--tsv"]).assert().success();
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
