@@ -961,8 +961,8 @@ fn broad_extra_pattern_keeps_attributable_files_only() {
             "claude\t{}\n",
             other.join("abc.jsonl").to_string_lossy()
         ));
-    // `log` drops id-less sessions; `project` would list a stray file as
-    // an `unknown` agent if it were collected.
+    // `project` would list a stray file as an `unknown` agent if it were
+    // collected.
     ah_opencode(&home)
         .env_remove("CLAUDE_CONFIG_DIR")
         .args(["project", "-o", "agents"])
@@ -1214,9 +1214,8 @@ fn gemini_disabled_agent_owning_jsonl_keeps_legacy_file() {
         .args(["log", "-a", "-o", "agent,path"])
         .assert()
         .success()
-        // The disabled agent's .jsonl is listed as unknown, not as gemini.
-        .stdout(predicate::str::contains(format!("gemini\t{json}\n")))
-        .stdout(predicate::str::contains(format!("gemini\t{jsonl}")).not());
+        // The disabled agent's .jsonl stays hidden.
+        .stdout(format!("gemini\t{json}\n"));
 }
 
 fn write_codex_rollout(dir: &Path, stamp: &str, id: &str) -> String {

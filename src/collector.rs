@@ -8,7 +8,7 @@ use std::time::{Instant, SystemTime};
 
 use rayon::prelude::*;
 
-use crate::agents::AgentPlugin;
+use crate::agents::{self, AgentPlugin};
 use crate::color;
 use crate::config;
 
@@ -133,7 +133,11 @@ fn collect(limit: usize, exclude_archived: bool) -> Vec<(PathBuf, SystemTime)> {
         .into_par_iter()
         .filter_map(|path| {
             let plugin = config::find_plugin_for_path(&path);
-            if exclude_archived && plugin.is_archived(&path) {
+            // No active owner (e.g. a file attributed to a disabled agent):
+            // it could not be parsed, and disabled agents stay hidden.
+            if plugin.id() == agents::unknown_plugin().id()
+                || (exclude_archived && plugin.is_archived(&path))
+            {
                 return None;
             }
             plugin.session_mtime(&path).map(|mtime| (path, mtime))
