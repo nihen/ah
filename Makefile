@@ -6,12 +6,13 @@ bindir := $(prefix)/bin
 datadir := $(prefix)/share
 mandir := $(datadir)/man/man1
 exe_name := ah
+SOURCES := $(shell find src -name '*.rs')
 
 .PHONY: build install test lint fmt completions man demo release clean
 
 build: $(EXE)
 
-$(EXE): Cargo.toml src/**/*.rs
+$(EXE): Cargo.toml Cargo.lock $(SOURCES)
 	cargo build --profile $(PROFILE)
 
 test:
