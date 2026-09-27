@@ -9,6 +9,7 @@ use regex::Regex;
 use super::AgentPlugin;
 use super::Message;
 use super::common::{for_each_jsonl_value, format_mtime, strip_home};
+use super::{MemoryKind, MemorySource};
 
 static RE_COPILOT_SESSION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(.*/session-state/[^/]+)/.*").unwrap());
@@ -202,6 +203,36 @@ impl AgentPlugin for CopilotPlugin {
 
     fn can_resume(&self) -> bool {
         true
+    }
+
+    fn can_memory(&self) -> bool {
+        true
+    }
+
+    fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
+        let base =
+            crate::config::resolve_agent_base(self.id()).unwrap_or_else(|| home.join(".copilot"));
+        vec![MemorySource::new(
+            &base,
+            "copilot-instructions.md",
+            MemoryKind::Instruction,
+        )]
+    }
+
+    fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
+        vec![
+            MemorySource::new(
+                dir,
+                ".github/copilot-instructions.md",
+                MemoryKind::Instruction,
+            ),
+            // Path-specific instructions (`applyTo` frontmatter).
+            MemorySource::new(
+                dir,
+                ".github/instructions/**/*.instructions.md",
+                MemoryKind::Rule,
+            ),
+        ]
     }
 
     fn project_desc(&self) -> &'static str {

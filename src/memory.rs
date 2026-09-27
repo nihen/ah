@@ -1,6 +1,6 @@
 //! Memory and instruction file listing and search (shared by `ah memory`).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -9,10 +9,8 @@ use rayon::prelude::*;
 use regex::Regex;
 
 use crate::agents;
-use crate::agents::AgentPlugin;
-use crate::agents::common::{
-    canonical_home, canonicalize_if_exists, decode_claude_project, format_mtime,
-};
+use crate::agents::common::{canonical_home, format_mtime};
+use crate::agents::{AgentPlugin, MemoryKind, MemorySource};
 use crate::cli::{Field, FilterArgs, MemoryField, MemoryResolvedArgs, SortOrder};
 use crate::collector;
 use crate::config;
@@ -146,43 +144,6 @@ fn unquote_scalar(val: &str) -> String {
     val.to_string()
 }
 
-/// Encode a filesystem path to Claude's project directory naming convention.
-/// Claude Code replaces every UTF-16 code unit outside `[A-Za-z0-9]` with `-`:
-/// `/Users/you/src/github.com/my_app` → `-Users-you-src-github-com-my-app`
-fn encode_path_for_claude(path: &str) -> String {
-    path.encode_utf16()
-        .map(|u| match char::from_u32(u32::from(u)) {
-            Some(c) if c.is_ascii_alphanumeric() => c,
-            _ => '-',
-        })
-        .collect()
-}
-
-/// Session files tried, newest first, when looking for a project's cwd.
-const PROJECT_CWD_SCAN_LIMIT: usize = 20;
-/// Working directory recorded by the newest Claude session in a project
-/// directory that has one. Used to name the project and to match the current
-/// directory when the encoded directory name alone does not (e.g. a
-/// truncated name). Sessions without a readable cwd are skipped.
-fn claude_project_cwd(project_dir: &Path, home: &Path) -> Option<String> {
-    let mut sessions: Vec<(SystemTime, PathBuf)> = fs::read_dir(project_dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|p| {
-            let mtime = fs::metadata(&p).and_then(|m| m.modified()).ok()?;
-            Some((mtime, p))
-        })
-        .collect();
-    sessions.sort_unstable_by(|a, b| b.cmp(a));
-    sessions
-        .iter()
-        .take(PROJECT_CWD_SCAN_LIMIT)
-        .find_map(|(_, p)| agents::claude::PLUGIN.resolve_cwd(p, home))
-        .map(|c| canonicalize_if_exists(&c))
-}
-
 /// Get file metadata: (mtime, ctime/birthtime, size)
 fn file_meta(path: &Path) -> (SystemTime, SystemTime, u64) {
     let meta = fs::metadata(path).ok();
@@ -198,179 +159,171 @@ fn file_meta(path: &Path) -> (SystemTime, SystemTime, u64) {
     (mtime, ctime, size)
 }
 
-/// Agent label for project-level `AGENTS.md`, which many agents read.
+/// Agent label for files that many agents read (project-level `AGENTS.md`,
+/// `.agents/skills/`).
 const SHARED_AGENT: &str = "shared";
+/// Project label for files that apply to every project.
+const GLOBAL_PROJECT: &str = "(global)";
 
-/// Instruction file definitions: (agent, filename).
-/// A global `AGENTS.md` lives in the agent's own base (`~/.codex/AGENTS.md`)
-/// and stays attributed to it; a project-level one is listed as shared.
-const INSTRUCTION_FILES: &[(&str, &str)] = &[
-    ("claude", "CLAUDE.md"),
-    ("codex", "AGENTS.md"),
-    ("gemini", "GEMINI.md"),
-    ("cursor", ".cursorrules"),
-];
+/// Shared files outside any project.
+fn shared_global_sources(home: &Path) -> Vec<MemorySource> {
+    vec![MemorySource::new(
+        &home.join(".agents"),
+        "skills/*/SKILL.md",
+        MemoryKind::Skill,
+    )]
+}
 
-/// Collect Claude memory files from ~/.claude/projects/*/memory/*.md
-fn collect_claude_memory_files(all: bool, cwd: &str) -> Vec<MemoryEntry> {
-    let home = canonical_home();
-    let claude_base = config::resolve_agent_base("claude").unwrap_or_else(|| home.join(".claude"));
-    let projects_dir = claude_base.join("projects");
+/// Shared files in a project directory.
+fn shared_project_sources(dir: &Path) -> Vec<MemorySource> {
+    vec![
+        MemorySource::new(dir, "AGENTS.md", MemoryKind::Instruction),
+        MemorySource::new(dir, ".agents/skills/*/SKILL.md", MemoryKind::Skill),
+    ]
+}
 
-    let encoded_cwd = if !all {
-        Some(encode_path_for_claude(cwd))
-    } else {
-        None
+/// Plugins of active built-in agents that know where their memory lives.
+fn memory_plugins() -> Vec<&'static dyn AgentPlugin> {
+    config::active_agents()
+        .filter(|a| a.is_builtin && a.plugin.can_memory())
+        .map(|a| a.plugin)
+        .collect()
+}
+
+/// Read one memory/instruction file into an entry. Empty files are skipped.
+fn read_entry(
+    path: PathBuf,
+    agent: &'static str,
+    project: &str,
+    kind: MemoryKind,
+) -> Option<MemoryEntry> {
+    let content = fs::read_to_string(&path).ok()?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    let (mtime, ctime, size) = file_meta(&path);
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let non_empty = |s: String, fallback: String| if s.is_empty() { fallback } else { s };
+
+    let (memory_type, name, description, body) = match kind {
+        MemoryKind::Instruction => ("instruction".to_string(), file_name, String::new(), content),
+        MemoryKind::Rule => {
+            let (fm, body) = parse_frontmatter(&content);
+            ("rule".to_string(), file_name, fm.description, body)
+        }
+        MemoryKind::Memory => {
+            let (fm, body) = parse_frontmatter(&content);
+            (
+                non_empty(fm.memory_type, "memory".to_string()),
+                non_empty(fm.name, stem),
+                fm.description,
+                body,
+            )
+        }
+        MemoryKind::Skill => {
+            let (fm, body) = parse_frontmatter(&content);
+            let dir_name = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or(stem);
+            (
+                "skill".to_string(),
+                non_empty(fm.name, dir_name),
+                fm.description,
+                body,
+            )
+        }
     };
 
-    let pattern = format!("{}/*/memory/*.md", projects_dir.display());
-    let mut results = Vec::new();
-    let memory_files: Vec<PathBuf> = glob::glob(&pattern)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .collect();
-    // Resolve each project directory's session cwd once, in parallel.
-    let project_dirs: HashSet<PathBuf> = memory_files
-        .iter()
-        .filter_map(|f| f.parent()?.parent().map(Path::to_path_buf))
-        .collect();
-    let project_cwds: HashMap<PathBuf, Option<String>> = project_dirs
-        .into_par_iter()
-        .map(|dir| {
-            let cwd = claude_project_cwd(&dir, &home);
-            (dir, cwd)
-        })
-        .collect();
-
-    for entry in memory_files {
-        // Skip MEMORY.md (index file)
-        if entry
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case("MEMORY.md"))
-        {
-            continue;
-        }
-
-        let memory_dir = entry.parent();
-        let project_dir = memory_dir.and_then(|p| p.parent());
-        let encoded_name = project_dir
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let session_cwd = project_dir.and_then(|dir| project_cwds.get(dir).cloned().flatten());
-
-        if let Some(ref filter) = encoded_cwd {
-            if encoded_name != *filter && session_cwd.as_deref() != Some(cwd) {
-                continue;
-            }
-        }
-
-        let (mtime, ctime, size) = file_meta(&entry);
-
-        let content = match fs::read_to_string(&entry) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let (fm, body) = parse_frontmatter(&content);
-
-        results.push(MemoryEntry {
-            path: entry,
-            mtime,
-            ctime,
-            size,
-            agent: "claude",
-            project: session_cwd
-                .as_deref()
-                .and_then(|c| Path::new(c).file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| decode_claude_project(&encoded_name)),
-            memory_type: fm.memory_type,
-            name: fm.name,
-            description: fm.description,
-            body,
-        });
-    }
-
-    results
+    Some(MemoryEntry {
+        path,
+        mtime,
+        ctime,
+        size,
+        agent,
+        project: project.to_string(),
+        memory_type,
+        name,
+        description,
+        body,
+    })
 }
 
-/// Collect global instruction files (e.g. ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md)
-fn collect_global_instructions() -> Vec<MemoryEntry> {
-    let mut results = Vec::new();
-
-    for &(agent, filename) in INSTRUCTION_FILES {
-        let base = match config::resolve_agent_base(agent) {
-            Some(b) => b,
-            None => continue,
-        };
-        let path = base.join(filename);
-        if !path.exists() {
+/// Expand memory sources into entries. Skills are listed only on request
+/// (`-t skill`), since installed skills can far outnumber memory files.
+fn expand_sources(
+    sources: Vec<MemorySource>,
+    agent: &'static str,
+    project: &str,
+    with_skills: bool,
+) -> Vec<MemoryEntry> {
+    let mut entries = Vec::new();
+    for source in sources {
+        if source.kind == MemoryKind::Skill && !with_skills {
             continue;
         }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) if !c.trim().is_empty() => c,
-            _ => continue,
-        };
-        let (mtime, ctime, size) = file_meta(&path);
-
-        results.push(MemoryEntry {
-            path,
-            mtime,
-            ctime,
-            size,
-            agent,
-            project: "(global)".to_string(),
-            memory_type: "instruction".to_string(),
-            name: filename.to_string(),
-            description: String::new(),
-            body: content,
-        });
+        let mut paths: Vec<PathBuf> = glob::glob(&source.pattern())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|p| p.is_file())
+            .collect();
+        paths.sort();
+        entries.extend(
+            paths
+                .into_iter()
+                .filter_map(|p| read_entry(p, agent, project, source.kind)),
+        );
     }
-
-    results
+    entries
 }
 
-/// Collect project-level instruction files from a directory.
-fn collect_project_instructions(dir: &Path) -> Vec<MemoryEntry> {
-    let mut results = Vec::new();
+/// Project-level memory and instruction files in one directory.
+fn collect_project_files(
+    dir: &Path,
+    plugins: &[&'static dyn AgentPlugin],
+    with_skills: bool,
+) -> Vec<MemoryEntry> {
     let project = dir
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-
-    for &(agent, filename) in INSTRUCTION_FILES {
-        let path = dir.join(filename);
-        if !path.exists() {
-            continue;
-        }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) if !c.trim().is_empty() => c,
-            _ => continue,
-        };
-        let (mtime, ctime, size) = file_meta(&path);
-
-        let agent = if filename == "AGENTS.md" {
-            SHARED_AGENT
-        } else {
-            agent
-        };
-        results.push(MemoryEntry {
-            path,
-            mtime,
-            ctime,
-            size,
-            agent,
-            project: project.clone(),
-            memory_type: "instruction".to_string(),
-            name: filename.to_string(),
-            description: String::new(),
-            body: content,
-        });
+    let mut entries = expand_sources(
+        shared_project_sources(dir),
+        SHARED_AGENT,
+        &project,
+        with_skills,
+    );
+    for plugin in plugins {
+        entries.extend(expand_sources(
+            plugin.project_memory_sources(dir),
+            plugin.id(),
+            &project,
+            with_skills,
+        ));
     }
+    entries
+}
 
-    results
+/// Directories whose project files apply to `cwd`: the directory itself and
+/// its git root, where agents also look for instruction files.
+fn current_project_dirs(cwd: &str) -> Vec<PathBuf> {
+    let dir = PathBuf::from(cwd);
+    let mut dirs = vec![dir.clone()];
+    if let Some(root) = dir.ancestors().find(|d| d.join(".git").exists()) {
+        if root != dir {
+            dirs.push(root.to_path_buf());
+        }
+    }
+    dirs
 }
 
 /// Collect known project cwds from session files (for -a mode).
@@ -414,41 +367,88 @@ pub fn build_memory_records(
             .unwrap_or_default()
     };
 
+    let home = canonical_home();
+    let plugins = memory_plugins();
+    let with_skills = args.memory_type.as_deref() == Some("skill");
+
     // Collect all entries
     let mut entries: Vec<MemoryEntry> = Vec::new();
 
-    // 1. Claude memory files
-    entries.extend(collect_claude_memory_files(filter.all, &cwd));
+    // 1. Memory the agents keep per project (e.g. Claude auto memory). Agents
+    //    key it by the directory they started in or by its repository root.
+    let current_dirs = current_project_dirs(&cwd);
+    let cwd_filters: Vec<Option<String>> = if filter.all {
+        vec![None]
+    } else {
+        current_dirs
+            .iter()
+            .map(|d| Some(d.to_string_lossy().to_string()))
+            .collect()
+    };
+    for plugin in &plugins {
+        for cwd_filter in &cwd_filters {
+            for file in plugin.agent_memory_files(&home, cwd_filter.as_deref()) {
+                entries.extend(read_entry(
+                    file.path,
+                    plugin.id(),
+                    &file.project,
+                    MemoryKind::Memory,
+                ));
+            }
+        }
+    }
 
-    // 2. Project instruction files (before global ones, so that a project
-    //    file symlinked to/from a global one keeps its project attribution)
-    if filter.all {
+    // 2. Global files, collected first so that project scans can skip them
+    let mut global_entries = Vec::new();
+    for plugin in &plugins {
+        global_entries.extend(expand_sources(
+            plugin.global_memory_sources(&home),
+            plugin.id(),
+            GLOBAL_PROJECT,
+            with_skills,
+        ));
+    }
+    global_entries.extend(expand_sources(
+        shared_global_sources(&home),
+        SHARED_AGENT,
+        GLOBAL_PROJECT,
+        with_skills,
+    ));
+    // A project scan of the home directory itself reaches global files
+    // (e.g. `~/.claude/CLAUDE.md` as `<dir>/.claude/CLAUDE.md`); those stay
+    // global. Only the literal path counts, so a project file symlinked
+    // to/from a global one keeps its project attribution.
+    let global_paths: HashSet<(PathBuf, &'static str)> = global_entries
+        .iter()
+        .map(|e| (e.path.clone(), e.agent))
+        .collect();
+
+    // 3. Project files (listed before global ones, see dedup below)
+    let project_dirs: Vec<PathBuf> = if filter.all {
         // Scan known project cwds (sorted so duplicate resolution is stable)
         let mut cwds = collect_known_project_cwds();
         cwds.sort_unstable();
-        let home = canonical_home();
         let mut seen = HashSet::new();
-        for dir in &cwds {
-            let p = Path::new(dir);
-            let canonical = match fs::canonicalize(p) {
-                Ok(c) => c,
-                Err(_) => continue, // skip non-existent dirs
-            };
+        cwds.iter()
+            .filter_map(|dir| fs::canonicalize(dir).ok()) // skip non-existent dirs
             // Only collect from dirs under home
-            if !canonical.starts_with(&home) {
-                continue;
-            }
-            if canonical.is_dir() && seen.insert(canonical.clone()) {
-                entries.extend(collect_project_instructions(&canonical));
-            }
-        }
+            .filter(|c| c.starts_with(&home) && c.is_dir())
+            .filter(|c| seen.insert(c.clone()))
+            .collect()
     } else {
-        // Current directory only
-        entries.extend(collect_project_instructions(Path::new(&cwd)));
-    }
-
-    // 3. Global instruction files
-    entries.extend(collect_global_instructions());
+        current_dirs
+    };
+    let project_entries: Vec<Vec<MemoryEntry>> = project_dirs
+        .par_iter()
+        .map(|dir| collect_project_files(dir, &plugins, with_skills))
+        .collect();
+    entries.extend(
+        project_entries
+            .into_iter()
+            .flatten()
+            .filter(|e| !global_paths.contains(&(e.path.clone(), e.agent))),
+    );
+    entries.extend(global_entries);
 
     if entries.is_empty() {
         return Err("No memory files found.".to_string());
@@ -658,6 +658,8 @@ pub fn run(args: MemoryResolvedArgs, filter: &FilterArgs) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::claude::encode_path_for_claude;
+    use crate::agents::common::decode_claude_project;
 
     #[test]
     fn test_parse_frontmatter_normal() {

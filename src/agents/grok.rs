@@ -10,6 +10,7 @@ use super::common::is_safe_cli_id;
 use super::common::percent_decode;
 use super::common::strip_home;
 use super::common::tagged_user_body;
+use super::{AgentMemoryFile, MemoryKind, MemorySource};
 
 pub static PLUGIN: GrokPlugin = GrokPlugin;
 
@@ -161,12 +162,157 @@ impl AgentPlugin for GrokPlugin {
         let id = self.resolve_resume_id(path, home)?;
         Some(vec!["grok".to_string(), "--resume".to_string(), id])
     }
+
+    fn can_memory(&self) -> bool {
+        true
+    }
+
+    fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
+        vec![MemorySource::new(
+            &grok_base(home),
+            "AGENTS.md",
+            MemoryKind::Instruction,
+        )]
+    }
+
+    /// Cross-session memory (`memory-v2`): curated topic files under
+    /// `global/topics/` and `workspaces/<name>-<hash>/topics/`. `MEMORY.md`
+    /// is a generated index; `observations/` and `archive/` hold raw captures.
+    fn agent_memory_files(&self, home: &Path, cwd: Option<&str>) -> Vec<AgentMemoryFile> {
+        let base = grok_base(home);
+        let root = base.join("memory-v2");
+        let topics = |dir: &Path, project: &str| -> Vec<AgentMemoryFile> {
+            let pattern = format!(
+                "{}/topics/*.md",
+                glob::Pattern::escape(&dir.to_string_lossy())
+            );
+            glob::glob(&pattern)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|path| AgentMemoryFile {
+                    path,
+                    project: project.to_string(),
+                })
+                .collect()
+        };
+
+        let mut files = topics(&root.join("global"), "(global)");
+        let Ok(entries) = fs::read_dir(root.join("workspaces")) else {
+            return files;
+        };
+        let cwd_name = cwd.and_then(|c| Path::new(c).file_name());
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            let name = workspace_name(&dir_name);
+            let ws_cwd = workspace_cwd(&dir, &base);
+            if let Some(cwd) = cwd {
+                let matches = match ws_cwd.as_deref() {
+                    Some(ws) => ws == cwd,
+                    // Unknown workspace: fall back to the directory name.
+                    None => cwd_name.is_some_and(|n| n.to_string_lossy() == name),
+                };
+                if !matches {
+                    continue;
+                }
+            }
+            let project = ws_cwd
+                .as_deref()
+                .and_then(|c| Path::new(c).file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| name.to_string());
+            files.extend(topics(&dir, &project));
+        }
+        files
+    }
+}
+
+/// Grok's home (`GROK_HOME` or `~/.grok`).
+fn grok_base(home: &Path) -> std::path::PathBuf {
+    crate::config::resolve_agent_base("grok").unwrap_or_else(|| home.join(".grok"))
+}
+
+/// Workspace name without the `-<8 hex>` suffix Grok appends.
+fn workspace_name(dir_name: &str) -> &str {
+    match dir_name.rsplit_once('-') {
+        Some((name, hash))
+            if !name.is_empty()
+                && hash.len() == 8
+                && hash.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            name
+        }
+        _ => dir_name,
+    }
+}
+
+/// Working directory of a memory workspace, found through the sessions it
+/// captured (`memory_state.sqlite`) and their `sessions/<cwd>/<id>/` dirs.
+fn workspace_cwd(ws_dir: &Path, base: &Path) -> Option<String> {
+    let db = ws_dir.join("memory_state.sqlite");
+    if !db.is_file() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let mut stmt = conn
+        .prepare("SELECT session_id FROM capture_sessions")
+        .ok()?;
+    let ids: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .ok()?
+        .flatten()
+        .filter(|id| is_safe_cli_id(id) && !id.contains('/'))
+        .collect();
+    let sessions = base.join("sessions");
+    ids.iter().find_map(|id| {
+        let pattern = format!(
+            "{}/*/{}",
+            glob::Pattern::escape(&sessions.to_string_lossy()),
+            glob::Pattern::escape(id)
+        );
+        let dir = glob::glob(&pattern).ok()?.flatten().next()?;
+        let encoded = dir.parent()?.file_name()?.to_string_lossy().to_string();
+        Some(canonicalize_if_exists(&percent_decode(&encoded)))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn workspace_name_strips_hash_suffix() {
+        assert_eq!(workspace_name("chiba-0810bc52"), "chiba");
+        assert_eq!(workspace_name("my-app-0123abcd"), "my-app");
+        assert_eq!(workspace_name("my-app"), "my-app");
+        assert_eq!(workspace_name("-0123abcd"), "-0123abcd");
+    }
+
+    #[test]
+    fn workspace_cwd_follows_captured_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join(".grok");
+        let ws = base.join("memory-v2/workspaces/proj-0123abcd");
+        fs::create_dir_all(&ws).unwrap();
+        let conn = rusqlite::Connection::open(ws.join("memory_state.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE capture_sessions (session_id TEXT PRIMARY KEY);
+             INSERT INTO capture_sessions VALUES ('0192-aaaa');",
+        )
+        .unwrap();
+        drop(conn);
+        fs::create_dir_all(base.join("sessions/%2Fsrv%2Fproj/0192-aaaa")).unwrap();
+        assert_eq!(workspace_cwd(&ws, &base).as_deref(), Some("/srv/proj"));
+    }
 
     fn write_session(dir: &Path, history: &str, summary: Option<&str>) -> std::path::PathBuf {
         fs::create_dir_all(dir).unwrap();

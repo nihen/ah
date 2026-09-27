@@ -14,6 +14,7 @@ use super::MessageRole;
 use super::common::first_text_part;
 use super::common::format_mtime;
 use super::common::mmap_file;
+use super::{MemoryKind, MemorySource};
 
 /// Project directory of a session file: `tmp/{project}/chats/session-*` or
 /// `tmp/{project}/logs.json`. Anchored to the end of the path so that a
@@ -25,6 +26,40 @@ static RE_GEMINI_TMP: LazyLock<Regex> =
 static RE_GEMINI_DATE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"session-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2})(?:-[^/]*)?\.jsonl?$").unwrap()
 });
+
+/// Gemini CLI's home (`GEMINI_CLI_HOME` or `~/.gemini`).
+fn gemini_base(home: &Path) -> PathBuf {
+    crate::config::resolve_agent_base("gemini").unwrap_or_else(|| home.join(".gemini"))
+}
+
+/// Context file names Gemini CLI loads (`GEMINI.md` unless `settings.json`
+/// sets `context.fileName` or the older `contextFileName`, either a string
+/// or a list). Names are escaped for use in glob patterns.
+fn context_file_names(base: &Path) -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let settings = fs::read_to_string(base.join("settings.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        let configured = settings.as_ref().and_then(|s| {
+            s.pointer("/context/fileName")
+                .or_else(|| s.get("contextFileName"))
+        });
+        let mut names: Vec<String> = match configured {
+            Some(serde_json::Value::String(name)) => vec![name.clone()],
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        names.retain(|n| !n.is_empty() && !n.contains('/'));
+        if names.is_empty() {
+            names.push("GEMINI.md".to_string());
+        }
+        names.iter().map(|n| glob::Pattern::escape(n)).collect()
+    })
+}
 
 /// Whether `path` is listed as a Gemini session on its own: it is attributed
 /// to an active agent parsed by this plugin, and such an agent globs it. A
@@ -396,6 +431,28 @@ impl AgentPlugin for GeminiPlugin {
 
     fn can_resume(&self) -> bool {
         true
+    }
+
+    fn can_memory(&self) -> bool {
+        true
+    }
+
+    fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
+        let base = gemini_base(home);
+        context_file_names(&base)
+            .iter()
+            .map(|name| MemorySource::new(&base, name, MemoryKind::Instruction))
+            .collect()
+    }
+
+    fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
+        let base = gemini_base(&super::common::canonical_home());
+        context_file_names(&base)
+            .iter()
+            // A project AGENTS.md is listed once, as shared.
+            .filter(|name| name.as_str() != "AGENTS.md")
+            .map(|name| MemorySource::new(dir, name, MemoryKind::Instruction))
+            .collect()
     }
 
     fn project_desc(&self) -> &'static str {

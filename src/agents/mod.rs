@@ -186,6 +186,75 @@ pub trait AgentPlugin: Sync {
     fn resume_args(&self, _path: &Path, _home: &Path) -> Option<Vec<String>> {
         None
     }
+
+    /// Memory and instruction files that apply to every project
+    /// (e.g. `~/.claude/CLAUDE.md`).
+    fn global_memory_sources(&self, _home: &Path) -> Vec<MemorySource> {
+        Vec::new()
+    }
+
+    /// Memory and instruction files the agent reads from a project directory.
+    /// Project-level `AGENTS.md` is shared by many agents and listed by
+    /// `ah memory` itself, so plugins leave it out.
+    fn project_memory_sources(&self, _dir: &Path) -> Vec<MemorySource> {
+        Vec::new()
+    }
+
+    /// Memory the agent writes itself under its own data directory, keyed by
+    /// project (e.g. Claude auto memory). With `cwd`, only files for that
+    /// project and global ones are returned.
+    fn agent_memory_files(&self, _home: &Path, _cwd: Option<&str>) -> Vec<AgentMemoryFile> {
+        Vec::new()
+    }
+}
+
+/// How `ah memory` labels a memory/instruction file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryKind {
+    /// Always-loaded instructions (`CLAUDE.md`, `AGENTS.md`, ...).
+    Instruction,
+    /// Rule files, often scoped by path or trigger (`.cursor/rules/*.mdc`).
+    Rule,
+    /// Memory written by the agent; the frontmatter `type` wins when present.
+    Memory,
+    /// Agent Skills (`SKILL.md`); listed only with `-t skill`.
+    Skill,
+}
+
+/// A glob of memory/instruction files. `glob` is matched under `base`, which
+/// is escaped; an empty `base` means `glob` is already a full pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySource {
+    pub base: PathBuf,
+    pub glob: String,
+    pub kind: MemoryKind,
+}
+
+impl MemorySource {
+    pub fn new(base: &Path, glob: &str, kind: MemoryKind) -> Self {
+        Self {
+            base: base.to_path_buf(),
+            glob: glob.to_string(),
+            kind,
+        }
+    }
+
+    /// Full glob pattern with the literal base escaped.
+    pub fn pattern(&self) -> String {
+        if self.base.as_os_str().is_empty() {
+            return self.glob.clone();
+        }
+        let base = glob::Pattern::escape(&self.base.to_string_lossy());
+        format!("{}/{}", base.trim_end_matches('/'), self.glob)
+    }
+}
+
+/// A memory file the agent keeps for a project, with that project's name
+/// (`(global)` for memory that applies everywhere).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMemoryFile {
+    pub path: PathBuf,
+    pub project: String,
 }
 
 struct UnknownPlugin;

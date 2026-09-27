@@ -1722,6 +1722,7 @@ fn memory_matches_underscore_cwd_dedups_and_lists_shared_agents_md() {
             .env("COPILOT_HOME", "/nonexistent")
             .env("CURSOR_CONFIG_DIR", "/nonexistent")
             .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
             .args(args)
             .write_stdin("")
             .assert()
@@ -1794,6 +1795,7 @@ fn memory_keeps_project_attribution_for_symlinked_files() {
             .env("COPILOT_HOME", "/nonexistent")
             .env("CURSOR_CONFIG_DIR", "/nonexistent")
             .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
             .args(args)
             .write_stdin("")
             .assert()
@@ -1877,9 +1879,155 @@ fn memory_project_cwd_skips_sessions_without_cwd() {
         .env("COPILOT_HOME", "/nonexistent")
         .env("CURSOR_CONFIG_DIR", "/nonexistent")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_CONFIG_HOME")
         .args(["memory", "--tsv", "-o", "project,name"])
         .write_stdin("")
         .assert()
         .success()
         .stdout("my_app\tnote\n");
+}
+
+#[test]
+fn memory_lists_each_agents_instruction_rule_and_memory_files() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let write = |rel: &str, content: &str| {
+        let path = home.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    };
+    // Global files
+    write(".claude/CLAUDE.md", "claude global\n");
+    write(
+        ".claude/rules/style.md",
+        "---\ndescription: house style\n---\nuse tabs\n",
+    );
+    write(
+        ".claude/agent-memory/reviewer/notes.md",
+        "---\nname: review-notes\n---\nnotes\n",
+    );
+    write(
+        ".claude/skills/s1/SKILL.md",
+        "---\nname: s1\ndescription: skill one\n---\nbody\n",
+    );
+    write(".codex/AGENTS.md", "codex global\n");
+    write(".codex/memories/m1.md", "remember this\n");
+    write(
+        ".gemini/settings.json",
+        r#"{"context":{"fileName":["AGENTS.md","CONTEXT.md"]}}"#,
+    );
+    write(".gemini/CONTEXT.md", "gemini context\n");
+    write(".gemini/GEMINI.md", "not loaded with a custom fileName\n");
+    write(".gemini/config/rules/r.md", "agy rule\n");
+    write(".grok/AGENTS.md", "grok global\n");
+    write(".grok/memory-v2/global/topics/g.md", "# G\nglobal topic\n");
+    write(".grok/memory-v2/global/MEMORY.md", "# index\n");
+    write(
+        ".grok/memory-v2/workspaces/repo-0123abcd/topics/t.md",
+        "# T\nworkspace topic\n",
+    );
+    write(
+        ".grok/memory-v2/workspaces/other-89abcdef/topics/o.md",
+        "# O\nother workspace\n",
+    );
+    write(".copilot/copilot-instructions.md", "copilot global\n");
+    write(
+        ".cursor/rules/u.mdc",
+        "---\ndescription: user rule\n---\nx\n",
+    );
+    write(
+        ".config/opencode/opencode.jsonc",
+        "{\n  // comment\n  \"instructions\": [\"~/extra.md\",],\n}\n",
+    );
+    write("extra.md", "opencode extra\n");
+    write(
+        ".agents/skills/sk/SKILL.md",
+        "---\nname: sk\n---\nshared skill\n",
+    );
+    // Project files at the repository root; the command runs in a subdirectory.
+    write("repo/.git/HEAD", "ref: refs/heads/main\n");
+    write("repo/CLAUDE.local.md", "local\n");
+    write("repo/.claude/rules/x.md", "project rule\n");
+    write("repo/.cursorrules", "cursor legacy\n");
+    write("repo/.cursor/rules/p.mdc", "project cursor rule\n");
+    write("repo/.github/copilot-instructions.md", "copilot project\n");
+    write("repo/.agents/rules/a.md", "agy project rule\n");
+    write("repo/AGENTS.override.md", "codex override\n");
+    write("repo/AGENTS.md", "shared\n");
+    write("repo/CONTEXT.md", "gemini project\n");
+    write("repo/opencode.json", r#"{"instructions":["docs/*.md"]}"#);
+    write("repo/docs/d.md", "opencode project doc\n");
+    let cwd = home.join("repo/sub");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let run = |args: &[&str]| {
+        let mut cmd = ah();
+        cmd.current_dir(&cwd).env("HOME", &home);
+        for var in [
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "GEMINI_CLI_HOME",
+            "COPILOT_HOME",
+            "CURSOR_DATA_DIR",
+            "GROK_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+        ] {
+            cmd.env_remove(var);
+        }
+        let assert = cmd.args(args).write_stdin("").assert().success();
+        let mut rows: Vec<String> = String::from_utf8(assert.get_output().stdout.clone())
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        rows.sort();
+        rows
+    };
+
+    assert_eq!(
+        run(&[
+            "memory",
+            "--tsv",
+            "-o",
+            "agent,project,type,name,description"
+        ]),
+        vec![
+            "agy\t(global)\trule\tr.md\t",
+            "agy\trepo\trule\ta.md\t",
+            "claude\t(global)\tinstruction\tCLAUDE.md\t",
+            "claude\t(global)\tmemory\treview-notes\t",
+            "claude\t(global)\trule\tstyle.md\thouse style",
+            "claude\trepo\tinstruction\tCLAUDE.local.md\t",
+            "claude\trepo\trule\tx.md\t",
+            "codex\t(global)\tinstruction\tAGENTS.md\t",
+            "codex\t(global)\tmemory\tm1\t",
+            "codex\trepo\tinstruction\tAGENTS.override.md\t",
+            "copilot\t(global)\tinstruction\tcopilot-instructions.md\t",
+            "copilot\trepo\tinstruction\tcopilot-instructions.md\t",
+            "cursor\t(global)\trule\tu.mdc\tuser rule",
+            "cursor\trepo\tinstruction\t.cursorrules\t",
+            "cursor\trepo\trule\tp.mdc\t",
+            "gemini\t(global)\tinstruction\tCONTEXT.md\t",
+            "gemini\trepo\tinstruction\tCONTEXT.md\t",
+            "grok\t(global)\tinstruction\tAGENTS.md\t",
+            "grok\t(global)\tmemory\tg\t",
+            "grok\trepo\tmemory\tt\t",
+            "opencode\t(global)\tinstruction\textra.md\t",
+            "opencode\trepo\tinstruction\td.md\t",
+            "shared\trepo\tinstruction\tAGENTS.md\t",
+        ]
+    );
+
+    assert_eq!(
+        run(&[
+            "memory",
+            "-t",
+            "skill",
+            "--tsv",
+            "-o",
+            "agent,name,description"
+        ]),
+        vec!["claude\ts1\tskill one", "shared\tsk\t"]
+    );
 }

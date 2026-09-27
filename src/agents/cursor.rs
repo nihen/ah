@@ -11,6 +11,7 @@ use super::common::first_text_part;
 use super::common::for_each_jsonl_value;
 use super::common::is_safe_cli_id;
 use super::common::tagged_user_body;
+use super::{MemoryKind, MemorySource};
 
 static RE_CURSOR_PROJECTS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r".*/projects/([^/]+)/.*").unwrap());
@@ -269,6 +270,27 @@ impl AgentPlugin for CursorPlugin {
 
     fn can_resume(&self) -> bool {
         true
+    }
+
+    fn can_memory(&self) -> bool {
+        true
+    }
+
+    /// User rules live in `$HOME/.cursor/rules` even when `CURSOR_DATA_DIR`
+    /// moves the session data.
+    fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
+        vec![MemorySource::new(
+            &home.join(".cursor/rules"),
+            "*.mdc",
+            MemoryKind::Rule,
+        )]
+    }
+
+    fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
+        vec![
+            MemorySource::new(dir, ".cursorrules", MemoryKind::Instruction),
+            MemorySource::new(dir, ".cursor/rules/**/*.mdc", MemoryKind::Rule),
+        ]
     }
 
     fn project_desc(&self) -> &'static str {

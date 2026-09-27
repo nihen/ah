@@ -94,6 +94,22 @@ shared  my-webapp  instruction  AGENTS.md         2026-03-21 15:30
 
 A project-level `AGENTS.md` is read by several agents, so it is listed as `shared` and matches any `--agent` filter.
 
+Files listed per agent (global paths honor each agent's env var; project paths are looked up in the current directory and its git root, or in every known project with `-a`):
+
+| Agent | Global | Project |
+|-------|--------|---------|
+| Claude | `~/.claude/CLAUDE.md`, `rules/**/*.md`, `agent-memory/*/*.md`, auto memory `projects/*/memory/*.md` | `CLAUDE.md`, `CLAUDE.local.md`, `.claude/CLAUDE.md`, `.claude/rules/**/*.md`, `.claude/agent-memory{,-local}/*/*.md` |
+| Codex | `~/.codex/AGENTS.md`, `AGENTS.override.md`, `memories/**/*.md` | `AGENTS.override.md` |
+| Gemini | `~/.gemini/GEMINI.md` (or `context.fileName` in `settings.json`) | same file names |
+| Copilot | `~/.copilot/copilot-instructions.md` | `.github/copilot-instructions.md`, `.github/instructions/**/*.instructions.md` |
+| Cursor | `~/.cursor/rules/*.mdc` | `.cursorrules`, `.cursor/rules/**/*.mdc` |
+| Antigravity (agy) | `~/.gemini/config/rules/*.md` | `.agents/rules/*.md`, `.agent/rules/*.md` |
+| Grok | `~/.grok/AGENTS.md`, memory topics `memory-v2/{global,workspaces/*}/topics/*.md` | — |
+| opencode | `~/.config/opencode/AGENTS.md`, `instructions` in `opencode.json(c)` | `instructions` in `opencode.json(c)` |
+| shared | — | `AGENTS.md` |
+
+Types: `instruction` (always-loaded files), `rule`, `memory` (or the type in a memory file's frontmatter, such as `feedback`), and `skill`. Skills (`SKILL.md` under `skills/*/` of Claude, Codex, and agy, and `.agents/skills/*/`) are listed only with `-t skill`.
+
 Show session summary per agent:
 
 ```console
@@ -111,13 +127,13 @@ gemini           5  2026-03-21 10:50
 | Agent | List | Search | Show | Resume | Running | Memory |
 |-------|------|--------|------|--------|---------|--------|
 | Claude | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Codex | ✓ | ✓ | ✓ | ✓ | | |
-| Gemini | ✓ | ✓ | ✓ | ✓ | | |
-| Copilot | ✓ | ✓ | ✓ | ✓ | | |
-| Cursor | ✓ | ✓ | ✓ | ✓ | | |
-| Antigravity (agy) | ✓ | ✓ | ✓ | ✓ | | |
-| Grok | ✓ | ✓ | ✓ | ✓ | ✓ | |
-| opencode | ✓ | ✓ | ✓ | ✓ | | |
+| Codex | ✓ | ✓ | ✓ | ✓ | | ✓ |
+| Gemini | ✓ | ✓ | ✓ | ✓ | | ✓ |
+| Copilot | ✓ | ✓ | ✓ | ✓ | | ✓ |
+| Cursor | ✓ | ✓ | ✓ | ✓ | | ✓ |
+| Antigravity (agy) | ✓ | ✓ | ✓ | ✓ | | ✓ |
+| Grok | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| opencode | ✓ | ✓ | ✓ | ✓ | | ✓ |
 
 ## Features
 
@@ -411,7 +427,7 @@ Options:
   -o, --fields <FIELDS>   Select output fields (replaces defaults, see --list-fields)
                           Default: agent, project, type, name, modified_at, description
   -O, --extra-fields <FIELDS>  Add fields to defaults (comma-separated)
-  -t, --type <TYPE>       Filter by memory type (user/feedback/project/reference/instruction)
+  -t, --type <TYPE>       Filter by memory type (instruction/rule/memory/skill, or a memory's own type such as feedback)
   --table                 Aligned table with header row
   --tsv                   Tab-separated values (no header, no color)
   --ltsv                  Labeled Tab-Separated Values
@@ -425,6 +441,7 @@ Default output (when no format flag is given):
   Aligned table with auto-pager on TTY, plain TSV when piped
 
 A project-level AGENTS.md is listed as agent `shared` and matches any --agent filter.
+Skills (SKILL.md) are listed only with -t skill.
 
 Interactive mode:
   -i, --interactive       Browse memory files via fuzzy finder

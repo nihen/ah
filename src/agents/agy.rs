@@ -11,6 +11,7 @@ use super::common::is_safe_cli_id;
 use super::common::percent_decode;
 use super::common::strip_home;
 use super::common::tagged_user_body;
+use super::{MemoryKind, MemorySource};
 
 pub static PLUGIN: AgyPlugin = AgyPlugin;
 
@@ -144,6 +145,26 @@ impl AgentPlugin for AgyPlugin {
 
     fn can_resume(&self) -> bool {
         true
+    }
+
+    fn can_memory(&self) -> bool {
+        true
+    }
+
+    /// Global customizations live in `~/.gemini/config/`.
+    fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
+        let config = home.join(".gemini/config");
+        vec![
+            MemorySource::new(&config, "rules/*.md", MemoryKind::Rule),
+            MemorySource::new(&config, "skills/*/SKILL.md", MemoryKind::Skill),
+        ]
+    }
+
+    fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
+        vec![
+            MemorySource::new(dir, ".agents/rules/*.md", MemoryKind::Rule),
+            MemorySource::new(dir, ".agent/rules/*.md", MemoryKind::Rule),
+        ]
     }
 
     fn can_follow(&self) -> bool {

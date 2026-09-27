@@ -1102,7 +1102,9 @@ impl MemoryField {
         match self {
             MemoryField::Agent => "Agent name",
             MemoryField::Project => "Decoded project path",
-            MemoryField::Type => "Memory type (user/feedback/project/reference/instruction)",
+            MemoryField::Type => {
+                "Memory type (instruction/rule/memory/skill, or a memory's own type such as feedback)"
+            }
             MemoryField::Name => "Memory name (from frontmatter or filename)",
             MemoryField::Description => "Memory description (from frontmatter)",
             MemoryField::ModifiedAt => "File modified time",
@@ -1203,7 +1205,7 @@ pub struct MemoryArgs {
     #[arg(long = "desc", conflicts_with = "asc")]
     desc: bool,
 
-    /// Filter by memory type (user/feedback/project/reference/instruction)
+    /// Filter by memory type (instruction/rule/memory/skill, or a memory's own type such as feedback)
     #[arg(short = 't', long = "type")]
     pub memory_type: Option<String>,
 
@@ -1841,7 +1843,7 @@ Options:
   -o, --fields <FIELDS>   Select output fields (replaces defaults, see --list-fields)
                           Default: agent, project, type, name, modified_at, description
   -O, --extra-fields <FIELDS>  Add fields to defaults (comma-separated)
-  -t, --type <TYPE>       Filter by memory type (user/feedback/project/reference/instruction)
+  -t, --type <TYPE>       Filter by memory type (instruction/rule/memory/skill, or a memory's own type such as feedback)
   --table                 Aligned table with header row
   --tsv                   Tab-separated values (no header, no color)
   --ltsv                  Labeled Tab-Separated Values
@@ -1855,6 +1857,7 @@ Default output (when no format flag is given):
   Aligned table with auto-pager on TTY, plain TSV when piped
 
 A project-level AGENTS.md is listed as agent `shared` and matches any --agent filter.
+Skills (SKILL.md) are listed only with -t skill.
 
 Interactive mode:
   -i, --interactive       Browse memory files via fuzzy finder
