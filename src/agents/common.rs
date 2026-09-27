@@ -196,12 +196,47 @@ pub fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Whether `pid` is a live process. A zombie (exited but not yet reaped by
+/// its parent) still answers `kill(pid, 0)`, so on Linux its state is
+/// checked too.
 #[cfg(unix)]
 pub fn is_pid_alive(pid: u32) -> bool {
-    match i32::try_from(pid) {
+    let signalable = match i32::try_from(pid) {
         Ok(p) if p > 0 => unsafe { libc::kill(p, 0) == 0 },
         _ => false,
-    }
+    };
+    signalable && !is_zombie(pid)
+}
+
+/// `/proc/<pid>/stat`. The command name in it is not necessarily UTF-8 (it
+/// can be cut mid-character), so it is decoded lossily.
+#[cfg(target_os = "linux")]
+fn read_proc_stat(pid: u32) -> Option<String> {
+    fs::read(format!("/proc/{}/stat", pid))
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: u32) -> bool {
+    read_proc_stat(pid)
+        .and_then(|stat| parse_stat_state(&stat))
+        .is_some_and(|state| matches!(state, 'Z' | 'X' | 'x'))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_zombie(_pid: u32) -> bool {
+    false
+}
+
+/// Extract field 3 (state) from a `/proc/<pid>/stat` line.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_stat_state(stat: &str) -> Option<char> {
+    stat[stat.rfind(')')? + 1..]
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
 }
 
 #[cfg(not(unix))]
@@ -223,8 +258,7 @@ pub fn json_pid(val: &serde_json::Value, key: &str) -> Option<u32> {
 pub fn process_start_ticks(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-        parse_stat_start_ticks(&stat)
+        parse_stat_start_ticks(&read_proc_stat(pid)?)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -269,9 +303,10 @@ pub fn process_start_time(pid: u32) -> Option<SystemTime> {
     }
 }
 
-/// Holders of file locks, keyed by `(device major, device minor, inode)`,
-/// from `/proc/locks`. Blocked waiters (`->` lines) are ignored. Empty where
-/// the kernel does not expose the table.
+/// Holders of exclusive `flock(2)` locks (`FLOCK ADVISORY WRITE`), keyed by
+/// `(device major, device minor, inode)`, from `/proc/locks`. Shared, POSIX
+/// and blocked-waiter (`->`) entries are ignored. Empty where the kernel does
+/// not expose the table.
 pub fn file_lock_holders() -> std::collections::HashMap<(u64, u64, u64), u32> {
     #[cfg(target_os = "linux")]
     {
@@ -290,7 +325,7 @@ fn parse_proc_locks(text: &str) -> std::collections::HashMap<(u64, u64, u64), u3
     for line in text.lines() {
         // "1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF"
         let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 6 || cols[1] == "->" {
+        if cols.len() < 6 || cols[1..4] != ["FLOCK", "ADVISORY", "WRITE"] {
             continue;
         }
         let Ok(pid) = cols[4].parse::<u32>() else {
@@ -389,15 +424,27 @@ mod tests {
     }
 
     #[test]
-    fn proc_locks_parses_holders_and_skips_waiters() {
+    fn proc_locks_keeps_exclusive_flock_holders_only() {
         let text = "1: FLOCK  ADVISORY  WRITE 165470 103:02:23794220 0 EOF\n\
                     1: -> FLOCK  ADVISORY  WRITE 999 103:02:23794220 0 EOF\n\
-                    2: POSIX  ADVISORY  READ 42 00:2c:77 0 EOF\n\
+                    2: POSIX  ADVISORY  READ 42 103:02:23794220 0 EOF\n\
+                    3: FLOCK  ADVISORY  READ 43 00:2c:77 0 EOF\n\
+                    4: POSIX  ADVISORY  WRITE 44 00:2c:78 0 EOF\n\
                     bad line\n";
         let map = parse_proc_locks(text);
         assert_eq!(map.get(&(0x103, 0x02, 23794220)), Some(&165470));
-        assert_eq!(map.get(&(0, 0x2c, 77)), Some(&42));
-        assert_eq!(map.len(), 2);
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn stat_state_reads_field_after_comm() {
+        assert_eq!(parse_stat_state("12 (co)dex) Z 1 2"), Some('Z'));
+        assert_eq!(parse_stat_state("12 (codex) S 1 2"), Some('S'));
+        assert_eq!(parse_stat_state("garbage"), None);
+        // A comm cut mid-character is not UTF-8; lossy decoding keeps the
+        // fields after it intact.
+        let raw = b"12 (a\xe3\x81) Z 1 2";
+        assert_eq!(parse_stat_state(&String::from_utf8_lossy(raw)), Some('Z'));
     }
 
     #[test]
@@ -419,6 +466,21 @@ mod tests {
         assert!(process_start_ticks(pid).is_some());
         let started = process_start_time(pid).unwrap();
         assert!(started <= SystemTime::now());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreaped_child_is_not_alive() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        // Leave the exited child unreaped so it stays a zombie.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !is_zombie(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(is_zombie(pid));
+        assert!(!is_pid_alive(pid));
+        child.wait().unwrap();
     }
 
     #[test]
