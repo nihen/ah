@@ -1262,6 +1262,8 @@ fn empty_positional_session_is_an_error() {
     }
 }
 
+// Shared-stdin tests need `sh` and the unbuffered Unix stdin reader.
+#[cfg(unix)]
 #[test]
 fn overlong_stdin_line_is_rejected_and_fully_consumed() {
     let (_tmp, session_path) = codex_session_copy();
@@ -1285,6 +1287,17 @@ fn overlong_stdin_line_is_rejected_and_fully_consumed() {
 }
 
 #[test]
+fn long_trailing_columns_do_not_count_against_the_ref_limit() {
+    let (_tmp, session_path) = codex_session_copy();
+    let transcript = "t".repeat(200 * 1024);
+    ah().args(["show", "-o", "path"])
+        .write_stdin(format!("{session_path}\t{transcript}\n"))
+        .assert()
+        .success()
+        .stdout(format!("{session_path}\n"));
+}
+
+#[test]
 fn invalid_utf8_stdin_is_rejected() {
     ah().args(["resume", "--print", "-"])
         .write_stdin(b"/tmp/rollout-\xff.jsonl\n".to_vec())
@@ -1293,6 +1306,7 @@ fn invalid_utf8_stdin_is_rejected() {
         .stderr(predicate::str::contains("not valid UTF-8"));
 }
 
+#[cfg(unix)]
 #[test]
 fn piped_session_ref_consumes_only_the_first_line() {
     let (_tmp1, first) = codex_session_copy();

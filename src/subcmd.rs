@@ -145,62 +145,126 @@ pub fn read_session_ref(session: Option<&str>) -> Result<Option<String>, String>
 }
 
 fn read_stdin_session_ref() -> Result<Option<String>, String> {
-    let bytes = read_stdin_line().map_err(|e| format!("Failed to read stdin: {e}"))?;
-    let line = String::from_utf8(bytes)
-        .map_err(|_| "Session reference on stdin is not valid UTF-8".to_string())?;
-    let line = line.trim();
-    let first_field = line.split('\t').next().unwrap_or(line);
-    Ok(Some(normalize_session_ref(first_field)).filter(|s| !s.is_empty()))
+    let field = read_stdin_first_field().map_err(|e| format!("Failed to read stdin: {e}"))?;
+    stdin_field_to_session_ref(field)
 }
 
-/// Longest stdin line accepted as a session reference.
-const MAX_STDIN_LINE: usize = 64 * 1024;
+fn stdin_field_to_session_ref(field: StdinField) -> Result<Option<String>, String> {
+    let text = String::from_utf8(field.bytes)
+        .map_err(|_| "Session reference on stdin is not valid UTF-8".to_string())?;
+    // Match `line.trim().split('\t').next()`: whitespace before a tab stays
+    // in the field when a non-blank column follows (so `path: \ttail` is
+    // still an empty LTSV value); otherwise `trim` also strips the tab and
+    // the field loses its trailing whitespace.
+    let text = if field.ended_by_tab {
+        text.trim_start()
+    } else {
+        text.trim()
+    };
+    Ok(Some(normalize_session_ref(text)).filter(|s| !s.is_empty()))
+}
 
-/// Read one line from stdin without consuming anything after its newline,
-/// so the rest of a shared stdin (e.g. `{ ah show; ah show; } < refs`) stays
-/// available to the next reader. A line longer than `MAX_STDIN_LINE` is
-/// consumed through its newline and rejected.
+/// Longest session reference (first TSV field) accepted on stdin.
+const MAX_SESSION_REF_LEN: usize = 64 * 1024;
+
+#[derive(Debug)]
+struct StdinField {
+    bytes: Vec<u8>,
+    /// The field ended at a tab followed by a non-blank column.
+    ended_by_tab: bool,
+}
+
+/// Collects the first TSV field of one stdin line. Leading ASCII whitespace
+/// (including tabs) is skipped, everything after the first tab is only
+/// drained, and the field is capped at `MAX_SESSION_REF_LEN` so that long
+/// trailing columns (e.g. `-o path,transcript`) do not matter.
+#[derive(Default)]
+struct FirstField {
+    buf: Vec<u8>,
+    done: bool,
+    ended_by_tab: bool,
+    tail_nonblank: bool,
+    too_long: bool,
+}
+
+impl FirstField {
+    fn push(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.done {
+                if self.ended_by_tab && !self.tail_nonblank && !b.is_ascii_whitespace() {
+                    self.tail_nonblank = true;
+                }
+                if self.tail_nonblank || !self.ended_by_tab {
+                    return;
+                }
+                continue;
+            }
+            if self.buf.is_empty() && b.is_ascii_whitespace() {
+                continue;
+            }
+            if b == b'\t' {
+                self.done = true;
+                self.ended_by_tab = true;
+            } else if self.buf.len() < MAX_SESSION_REF_LEN {
+                self.buf.push(b);
+            } else {
+                self.too_long = true;
+                self.done = true;
+            }
+        }
+    }
+
+    fn finish(self) -> std::io::Result<StdinField> {
+        if self.too_long {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("session reference longer than {MAX_SESSION_REF_LEN} bytes"),
+            ));
+        }
+        Ok(StdinField {
+            bytes: self.buf,
+            ended_by_tab: self.ended_by_tab && self.tail_nonblank,
+        })
+    }
+}
+
+/// Read the first field of one stdin line without consuming anything after
+/// its newline, so the rest of a shared stdin (e.g.
+/// `{ ah show; ah show; } < refs`) stays available to the next reader.
 #[cfg(unix)]
-fn read_stdin_line() -> std::io::Result<Vec<u8>> {
+fn read_stdin_first_field() -> std::io::Result<StdinField> {
     use std::io::Read;
     use std::os::unix::io::FromRawFd;
 
     // Bypass std's buffered stdin, which reads ahead past the newline.
     // ManuallyDrop keeps fd 0 open when the File goes out of scope.
     let mut stdin = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) });
-    let mut buf = Vec::new();
-    let mut too_long = false;
+    let mut field = FirstField::default();
     let mut byte = [0u8; 1];
     loop {
         match stdin.read(&mut byte) {
             Ok(0) => break,
             Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) if buf.len() < MAX_STDIN_LINE => buf.push(byte[0]),
-            Ok(_) => too_long = true,
+            Ok(_) => field.push(&byte),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }
-    if too_long {
-        return Err(line_too_long());
-    }
-    Ok(buf)
+    field.finish()
 }
 
 /// Non-Unix fallback: std's buffered stdin may read past the first line, so
 /// a stdin shared by several `ah` invocations is not supported here.
 #[cfg(not(unix))]
-fn read_stdin_line() -> std::io::Result<Vec<u8>> {
-    read_bounded_line(&mut std::io::stdin().lock())
+fn read_stdin_first_field() -> std::io::Result<StdinField> {
+    read_first_field(&mut std::io::stdin().lock())
 }
 
-/// Read one line (without its newline) from a buffered reader, keeping at
-/// most `MAX_STDIN_LINE` bytes; a longer line is consumed through its
-/// newline and rejected.
+/// Read the first field of one line from a buffered reader, consuming the
+/// line through its newline.
 #[cfg_attr(unix, allow(dead_code))]
-fn read_bounded_line(reader: &mut impl std::io::BufRead) -> std::io::Result<Vec<u8>> {
-    let mut line = Vec::new();
-    let mut too_long = false;
+fn read_first_field(reader: &mut impl std::io::BufRead) -> std::io::Result<StdinField> {
+    let mut field = FirstField::default();
     loop {
         let buf = match reader.fill_buf() {
             Ok(buf) => buf,
@@ -211,29 +275,14 @@ fn read_bounded_line(reader: &mut impl std::io::BufRead) -> std::io::Result<Vec<
             break;
         }
         let newline = buf.iter().position(|&b| b == b'\n');
-        let body = &buf[..newline.unwrap_or(buf.len())];
-        let room = MAX_STDIN_LINE - line.len();
-        if body.len() > room {
-            too_long = true;
-        }
-        line.extend_from_slice(&body[..body.len().min(room)]);
+        field.push(&buf[..newline.unwrap_or(buf.len())]);
         let used = newline.map_or(buf.len(), |i| i + 1);
         reader.consume(used);
         if newline.is_some() {
             break;
         }
     }
-    if too_long {
-        return Err(line_too_long());
-    }
-    Ok(line)
-}
-
-fn line_too_long() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        format!("line longer than {MAX_STDIN_LINE} bytes"),
-    )
+    field.finish()
 }
 
 /// Resolve a session reference: try as file path first, then as session ID.
@@ -374,21 +423,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bounded_line_reader_keeps_the_rest_and_rejects_overlong_lines() {
+    fn first_field_reader_keeps_the_rest_and_bounds_only_the_first_field() {
         // A tiny buffer forces lines to span several fill_buf() calls.
-        let exact = "a".repeat(MAX_STDIN_LINE);
-        let over = "b".repeat(MAX_STDIN_LINE + 1);
-        let input = format!("{exact}\n{over}\nnext\nlast");
+        let exact = "a".repeat(MAX_SESSION_REF_LEN);
+        let over = "b".repeat(MAX_SESSION_REF_LEN + 1);
+        let long_tail = "t".repeat(MAX_SESSION_REF_LEN * 2);
+        let input = format!("{exact}\n{over}\n \tref\t{long_tail}\nlast");
         let mut reader = std::io::BufReader::with_capacity(7, input.as_bytes());
 
-        assert_eq!(read_bounded_line(&mut reader).unwrap(), exact.as_bytes());
-        assert_eq!(
-            read_bounded_line(&mut reader).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData
-        );
-        assert_eq!(read_bounded_line(&mut reader).unwrap(), b"next");
-        assert_eq!(read_bounded_line(&mut reader).unwrap(), b"last");
-        assert_eq!(read_bounded_line(&mut reader).unwrap(), b"");
+        let mut next = || read_first_field(&mut reader);
+        let field = next().unwrap();
+        assert_eq!(field.bytes, exact.as_bytes());
+        assert!(!field.ended_by_tab);
+        assert_eq!(next().unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        // Leading whitespace is skipped; a long trailing column is drained.
+        let field = next().unwrap();
+        assert_eq!(field.bytes, b"ref");
+        assert!(field.ended_by_tab);
+        assert_eq!(next().unwrap().bytes, b"last");
+        assert_eq!(next().unwrap().bytes, b"");
+    }
+
+    #[test]
+    fn stdin_field_trimming_matches_line_trim_then_split() {
+        // normalize_session_ref consults configured remotes.
+        crate::config::init(&crate::agents::common::canonical_home());
+        // Old behavior: normalize(line.trim().split('\t').next()).
+        let old = |line: &str| {
+            let first = line.trim().split('\t').next().unwrap_or("");
+            Some(normalize_session_ref(first)).filter(|s| !s.is_empty())
+        };
+        let new = |line: &str| {
+            let mut reader = std::io::BufReader::new(line.as_bytes());
+            stdin_field_to_session_ref(read_first_field(&mut reader).unwrap()).unwrap()
+        };
+        for line in [
+            "/a/b.jsonl",
+            "  /a/b.jsonl  \r\n",
+            " \t/a/b.jsonl\tx",
+            "/a/b.jsonl \tx",
+            "path:/a/b.jsonl\tx",
+            "path: \ttail",
+            "path: \t",
+            "path: \t\n",
+            "path: \t \r\n",
+            "path: \t \t x",
+            "path: ",
+            "path:",
+            "/a/b.jsonl\t\t",
+            "",
+            "\t\t",
+        ] {
+            assert_eq!(new(line), old(line), "{line:?}");
+        }
     }
 
     #[test]
