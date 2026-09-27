@@ -664,6 +664,67 @@ fn resume_print_appends_extra_args() {
         ));
 }
 
+/// Cursor's project directory name for `path`: runs of non-alphanumerics
+/// become one `-`, with leading and trailing dashes trimmed.
+fn cursor_slug(path: &std::path::Path) -> String {
+    let mut out = String::new();
+    for c in path.to_string_lossy().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+#[test]
+fn cursor_session_matches_cwd_filter_and_resumes_interactively() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let project = home.join("work/my_proj.v2");
+    fs::create_dir_all(&project).unwrap();
+    let transcripts = home
+        .join(".cursor/projects")
+        .join(cursor_slug(&project))
+        .join("agent-transcripts/sess-1");
+    fs::create_dir_all(&transcripts).unwrap();
+    fs::copy(
+        fixture_path("cursor_session.jsonl"),
+        transcripts.join("sess-1.jsonl"),
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| {
+        let assert = ah()
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", "/nonexistent")
+            .env("CODEX_HOME", "/nonexistent")
+            .env("GEMINI_CLI_HOME", "/nonexistent")
+            .env("COPILOT_HOME", "/nonexistent")
+            .env("CURSOR_CONFIG_DIR", home.join(".cursor"))
+            .env_remove("XDG_DATA_HOME")
+            .args(args)
+            .write_stdin("")
+            .assert()
+            .success();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    };
+
+    assert_eq!(
+        run(&["log", "-o", "agent,project,id", "--tsv"]),
+        "cursor\tmy_proj.v2\tsess-1\n"
+    );
+    assert_eq!(
+        run(&["resume", "--print"]),
+        format!(
+            "cd '{}' && 'cursor-agent' '--resume' 'sess-1'\n",
+            project.display()
+        )
+    );
+}
+
 #[test]
 fn log_invalid_regex() {
     ah().args(["log", "-a", "-q", "[invalid"])
@@ -953,4 +1014,204 @@ fn custom_agent_with_home_wide_marker_keeps_default_agent_sessions() {
         .assert()
         .success()
         .stdout("rollout-2026-03-24T20-43-12-codex-sess-001\n");
+}
+
+// ─── Copilot ───────────────────────────────────────────────────────
+
+#[test]
+fn copilot_title_time_and_resume() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let state = home.join(".copilot/session-state");
+    let named = state.join("cp-named");
+    fs::create_dir_all(&named).unwrap();
+    fs::copy(
+        fixture_path("copilot_workspace.yaml"),
+        named.join("workspace.yaml"),
+    )
+    .unwrap();
+    fs::copy(
+        fixture_path("copilot_events.jsonl"),
+        named.join("events.jsonl"),
+    )
+    .unwrap();
+    // A session that was opened but never got an events.jsonl.
+    let empty = state.join("cp-empty");
+    fs::create_dir_all(&empty).unwrap();
+    fs::write(
+        empty.join("workspace.yaml"),
+        "id: cp-empty\ncwd: /nonexistent/proj\ncreated_at: 2026-09-27T02:00:00.000Z\n",
+    )
+    .unwrap();
+    // workspace.yaml stops changing early; events.jsonl carries the last activity.
+    let at = |rfc3339: &str| -> std::time::SystemTime {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .into()
+    };
+    let set_mtime = |path: &Path, t| {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap()
+    };
+    set_mtime(&named.join("workspace.yaml"), at("2026-09-27T02:34:46Z"));
+    set_mtime(&named.join("events.jsonl"), at("2026-09-27T03:10:00Z"));
+    set_mtime(&empty.join("workspace.yaml"), at("2026-09-27T02:00:05Z"));
+
+    let run = || {
+        let mut cmd = ah_opencode(&home);
+        cmd.env_remove("COPILOT_HOME").env("TZ", "Asia/Tokyo");
+        cmd
+    };
+
+    // created_at is UTC in workspace.yaml and shown in local time.
+    run()
+        .args([
+            "log",
+            "-a",
+            "-o",
+            "id,title,created_at,modified_at",
+            "-S",
+            "id",
+            "--asc",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            "cp-empty\tcp-empty\t2026-09-27 11:00\t2026-09-27 11:00\n\
+             cp-named\tFix the 'parser'\t2026-09-27 11:34\t2026-09-27 12:10\n",
+        );
+
+    run()
+        .args(["log", "-a", "-q", "copilot-needle", "-o", "id"])
+        .assert()
+        .success()
+        .stdout("cp-named\n");
+
+    // Tool-call-only assistant turns (empty content) are not shown.
+    run()
+        .args(["show", "--json", "cp-named"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("please fix the parser"))
+        .stdout(predicate::str::contains(r#""role":"assistant""#).count(1));
+
+    run()
+        .args(["resume", "--print", "cp-named"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("cd '/nonexistent/proj' && 'copilot' '--resume=cp-named'\n");
+}
+
+/// A Gemini session resumed from a legacy `.json` file: Gemini CLI writes the
+/// conversation to a sibling `.jsonl` and leaves the `.json` behind.
+fn gemini_migrated_session(chats: &Path) -> (String, String) {
+    fs::create_dir_all(chats).unwrap();
+    let stem = chats.join("session-2026-06-11T20-44-gemmig01");
+    let json = format!("{}.json", stem.display());
+    let jsonl = format!("{}.jsonl", stem.display());
+    fs::write(
+        &json,
+        r#"{"sessionId":"gemmig01-0000","projectHash":"h","messages":[{"id":"u1","type":"user","content":[{"text":"legacy prompt"}]}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        &jsonl,
+        concat!(
+            r#"{"sessionId":"gemmig01-0000","projectHash":"h","startTime":"2026-06-11T20:44:00.000Z","lastUpdated":"2026-06-11T20:45:00.000Z","kind":"main"}"#,
+            "\n",
+            r#"{"id":"u1","type":"user","content":[{"text":"legacy prompt"}]}"#,
+            "\n",
+            r#"{"id":"u2","type":"user","content":[{"text":"resumed prompt"}]}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    (json, jsonl)
+}
+
+#[test]
+fn gemini_lists_migrated_jsonl_once_with_utc_file_time() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let (_, jsonl) = gemini_migrated_session(&home.join(".gemini/tmp/proj/chats"));
+    ah_opencode(&home)
+        .env_remove("GEMINI_CLI_HOME")
+        .env("TZ", "Asia/Tokyo")
+        .args(["log", "-a", "-o", "path,modified_at,id,turns"])
+        .assert()
+        .success()
+        .stdout(format!("{jsonl}\t2026-06-12 05:44\tgemmig01-0000\t2\n"));
+    ah_opencode(&home)
+        .env_remove("GEMINI_CLI_HOME")
+        .args(["show", "-o", "path", "gemmig01"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout(format!("{jsonl}\n"));
+}
+
+#[test]
+fn gemini_custom_agent_globbing_only_json_keeps_legacy_file() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let (json, _) = gemini_migrated_session(&home.join("gemarchive/proj/chats"));
+    fs::write(
+        home.join(".ahrc"),
+        "[agents.gemarch]\nplugin = \"gemini\"\nfile_patterns = [\"~/gemarchive/*/chats/session-*.json\"]\n",
+    )
+    .unwrap();
+    ah_opencode(&home)
+        .args(["log", "-a", "-o", "agent,path"])
+        .assert()
+        .success()
+        .stdout(format!("gemarch\t{json}\n"));
+}
+
+#[test]
+fn gemini_unreadable_jsonl_keeps_legacy_file() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let (json, jsonl) = gemini_migrated_session(&home.join(".gemini/tmp/proj/chats"));
+    for broken in [
+        "",
+        "not json\n",
+        // Lines that mention "sessionId" but are not a usable metadata line
+        "{\"id\":\"u1\",\"type\":\"user\",\"content\":\"x\",\"sessionId\":\"s\",\"projectHash\":\"h\"}\n",
+        "{\"sessionId\":\"\",\"projectHash\":\"h\"}\n",
+        "{\"sessionId\":\"s\"}\n",
+    ] {
+        fs::write(&jsonl, broken).unwrap();
+        ah_opencode(&home)
+            .env_remove("GEMINI_CLI_HOME")
+            .args(["log", "-a", "-o", "path"])
+            .assert()
+            .success()
+            .stdout(format!("{json}\n"));
+    }
+}
+
+#[test]
+fn gemini_disabled_agent_owning_jsonl_keeps_legacy_file() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let (json, jsonl) = gemini_migrated_session(&home.join(".gemini/tmp/proj/chats"));
+    fs::write(
+        home.join(".ahrc"),
+        format!(
+            "[agents.off]\nplugin = \"gemini\"\nfile_patterns = [\"{jsonl}\"]\ndisabled = true\n"
+        ),
+    )
+    .unwrap();
+    ah_opencode(&home)
+        .env_remove("GEMINI_CLI_HOME")
+        .args(["log", "-a", "-o", "agent,path"])
+        .assert()
+        .success()
+        .stdout(format!("gemini\t{json}\n"));
 }

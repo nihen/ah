@@ -1,0 +1,13 @@
+id: cp-named
+cwd: /nonexistent/proj
+git_root: /nonexistent/proj
+branch: main
+client_name: github/cli
+name: 'Fix the ''parser'''
+user_named: false
+summary: |-
+  old summary
+  more
+summary_count: 0
+created_at: 2026-09-27T02:34:43.613Z
+updated_at: 2026-09-27T02:34:46.023Z

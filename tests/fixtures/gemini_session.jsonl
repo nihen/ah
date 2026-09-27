@@ -1,0 +1,16 @@
+{"sessionId":"gemini-jsonl-001","projectHash":"abc123","startTime":"2026-06-01T00:00:00.000Z","lastUpdated":"2026-06-01T00:00:00.000Z","kind":"main"}
+{"$set":{"messages":[{"id":"ctx","timestamp":"2026-06-01T00:00:00.000Z","type":"user","content":[{"text":"<session_context>\nsetup\n</session_context>"}]}]}}
+{"id":"u1","timestamp":"2026-06-01T00:00:01.000Z","type":"user","content":[{"text":"draft the migration plan"}]}
+{"$set":{"lastUpdated":"2026-06-01T00:00:01.000Z"}}
+{"id":"g1","timestamp":"2026-06-01T00:00:02.000Z","type":"gemini","content":"","toolCalls":[]}
+{"id":"g1","timestamp":"2026-06-01T00:00:03.000Z","type":"gemini","content":"Here is the plan."}
+{"id":"u2","timestamp":"2026-06-01T00:00:04.000Z","type":"user","content":[{"text":"discarded question"}]}
+{"id":"g2","timestamp":"2026-06-01T00:00:05.000Z","type":"gemini","content":"discarded answer"}
+{"$rewindTo":"u2"}
+{"id":"u3","timestamp":"2026-06-01T00:00:06.000Z","type":"user","content":[{"text":"add a rollback step"}]}
+{"id":"g3","timestamp":"2026-06-01T00:00:07.000Z","type":"gemini","content":"Rollback step added."}
+{"id":"g4","timestamp":"2026-06-01T00:00:07.500Z","type":"gemini","content":"","toolCalls":[{"id":"t1","name":"read_file","args":{},"status":"success"}]}
+{"id":"g5","timestamp":"2026-06-01T00:00:07.600Z","type":"gemini","content":[{"text":"weighing options","thought":true},{"functionCall":{"name":"read_file","args":{}}}]}
+{"id":"g6","timestamp":"2026-06-01T00:00:07.700Z","type":"gemini","content":[{"text":"checking the answer","thought":true},{"text":"Final answer."}]}
+{"id":"i1","timestamp":"2026-06-01T00:00:08.000Z","type":"info","content":"Request cancelled."}
+{"$set":{"lastUpdated":"2026-06-01T00:00:08.000Z"}}
