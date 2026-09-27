@@ -1,0 +1,5 @@
+{"type":"session.start","data":{"sessionId":"cp-named","context":{"cwd":"/nonexistent/proj"}}}
+{"type":"user.message","data":{"content":"please fix the parser","transformedContent":"<current_datetime>x</current_datetime>\n\nplease fix the parser"}}
+{"type":"assistant.message","data":{"content":"","toolRequests":[{"name":"view"}]}}
+{"type":"tool.execution_complete","data":{"result":"copilot-needle"}}
+{"type":"assistant.message","data":{"content":"done"}}
