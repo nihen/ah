@@ -151,11 +151,14 @@ fn encode_path_for_claude(path: &str) -> String {
         .collect()
 }
 
+/// Session files tried, newest first, when looking for a project's cwd.
+const PROJECT_CWD_SCAN_LIMIT: usize = 20;
 /// Working directory recorded by the newest Claude session in a project
-/// directory. Used to name the project and to match the current directory
-/// when the encoded directory name alone does not (e.g. a truncated name).
+/// directory that has one. Used to name the project and to match the current
+/// directory when the encoded directory name alone does not (e.g. a
+/// truncated name). Sessions without a readable cwd are skipped.
 fn claude_project_cwd(project_dir: &Path, home: &Path) -> Option<String> {
-    let newest = fs::read_dir(project_dir)
+    let mut sessions: Vec<(SystemTime, PathBuf)> = fs::read_dir(project_dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
@@ -164,10 +167,12 @@ fn claude_project_cwd(project_dir: &Path, home: &Path) -> Option<String> {
             let mtime = fs::metadata(&p).and_then(|m| m.modified()).ok()?;
             Some((mtime, p))
         })
-        .max()?
-        .1;
-    agents::claude::PLUGIN
-        .resolve_cwd(&newest, home)
+        .collect();
+    sessions.sort_unstable_by(|a, b| b.cmp(a));
+    sessions
+        .iter()
+        .take(PROJECT_CWD_SCAN_LIMIT)
+        .find_map(|(_, p)| agents::claude::PLUGIN.resolve_cwd(p, home))
         .map(|c| canonicalize_if_exists(&c))
 }
 
@@ -213,9 +218,25 @@ fn collect_claude_memory_files(all: bool, cwd: &str) -> Vec<MemoryEntry> {
 
     let pattern = format!("{}/*/memory/*.md", projects_dir.display());
     let mut results = Vec::new();
-    let mut project_cwds: HashMap<PathBuf, Option<String>> = HashMap::new();
+    let memory_files: Vec<PathBuf> = glob::glob(&pattern)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+    // Resolve each project directory's session cwd once, in parallel.
+    let project_dirs: HashSet<PathBuf> = memory_files
+        .iter()
+        .filter_map(|f| f.parent()?.parent().map(Path::to_path_buf))
+        .collect();
+    let project_cwds: HashMap<PathBuf, Option<String>> = project_dirs
+        .into_par_iter()
+        .map(|dir| {
+            let cwd = claude_project_cwd(&dir, &home);
+            (dir, cwd)
+        })
+        .collect();
 
-    for entry in glob::glob(&pattern).into_iter().flatten().flatten() {
+    for entry in memory_files {
         // Skip MEMORY.md (index file)
         if entry
             .file_name()
@@ -231,12 +252,7 @@ fn collect_claude_memory_files(all: bool, cwd: &str) -> Vec<MemoryEntry> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let session_cwd = project_dir.and_then(|dir| {
-            project_cwds
-                .entry(dir.to_path_buf())
-                .or_insert_with(|| claude_project_cwd(dir, &home))
-                .clone()
-        });
+        let session_cwd = project_dir.and_then(|dir| project_cwds.get(dir).cloned().flatten());
 
         if let Some(ref filter) = encoded_cwd {
             if encoded_name != *filter && session_cwd.as_deref() != Some(cwd) {
@@ -397,13 +413,12 @@ pub fn build_memory_records(
     // 1. Claude memory files
     entries.extend(collect_claude_memory_files(filter.all, &cwd));
 
-    // 2. Global instruction files
-    entries.extend(collect_global_instructions());
-
-    // 3. Project instruction files
+    // 2. Project instruction files (before global ones, so that a project
+    //    file symlinked to/from a global one keeps its project attribution)
     if filter.all {
-        // Scan known project cwds
-        let cwds = collect_known_project_cwds();
+        // Scan known project cwds (sorted so duplicate resolution is stable)
+        let mut cwds = collect_known_project_cwds();
+        cwds.sort_unstable();
         let home = canonical_home();
         let mut seen = HashSet::new();
         for dir in &cwds {
@@ -425,15 +440,8 @@ pub fn build_memory_records(
         entries.extend(collect_project_instructions(Path::new(&cwd)));
     }
 
-    // The same file can be reached twice for one agent (e.g. through a
-    // symlinked project path). Keep the first occurrence. One file shared by
-    // several agents (e.g. ~/.codex/AGENTS.md -> ~/AGENTS.md) stays listed
-    // once per agent, since each agent reads it.
-    let mut seen_paths = HashSet::new();
-    entries.retain(|e| {
-        let key = fs::canonicalize(&e.path).unwrap_or_else(|_| e.path.clone());
-        seen_paths.insert((key, e.agent))
-    });
+    // 3. Global instruction files
+    entries.extend(collect_global_instructions());
 
     if entries.is_empty() {
         return Err("No memory files found.".to_string());
@@ -452,6 +460,12 @@ pub fn build_memory_records(
 
     let home = canonical_home();
     let home_str = home.to_string_lossy().to_string();
+
+    // The same file can be reached twice for one agent (e.g. through a
+    // symlinked project path). After filtering, keep the first occurrence
+    // (project before global). One file shared by several agents (e.g.
+    // ~/.codex/AGENTS.md -> ~/AGENTS.md) stays listed once per agent.
+    let mut seen_paths = HashSet::new();
 
     let mut records: Vec<BTreeMap<MemoryField, String>> = entries
         .into_iter()
@@ -515,6 +529,11 @@ pub fn build_memory_records(
             } else {
                 String::new()
             };
+
+            let key = fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
+            if !seen_paths.insert((key, entry.agent)) {
+                return None;
+            }
 
             let resolve = |field: &MemoryField| -> String {
                 match field {

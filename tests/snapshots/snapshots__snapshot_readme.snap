@@ -434,6 +434,8 @@ Options:
 Default output (when no format flag is given):
   Aligned table with auto-pager on TTY, plain TSV when piped
 
+A project-level AGENTS.md is listed as agent `shared` and matches any --agent filter.
+
 Interactive mode:
   -i, --interactive       Browse memory files via fuzzy finder
   -s <CMD>                Selector command (default: $AH_SELECTOR or fzf)
