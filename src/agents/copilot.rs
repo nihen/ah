@@ -9,7 +9,8 @@ use regex::Regex;
 use super::AgentPlugin;
 use super::Message;
 use super::common::{
-    for_each_jsonl_value, format_mtime, is_pid_alive, process_start_time, strip_home,
+    for_each_jsonl_value, for_each_jsonl_value_bytes, format_mtime, is_pid_alive,
+    process_start_time, strip_home, visit_string_values, visit_tool_call,
 };
 use super::{MemoryKind, MemorySource};
 
@@ -209,6 +210,12 @@ impl AgentPlugin for CopilotPlugin {
     fn prompts_in_session_json(&self) -> bool {
         true
     }
+    fn search_texts_in_session_json(&self) -> bool {
+        true
+    }
+    fn search_texts_per_jsonl_line(&self) -> bool {
+        true
+    }
 
     fn can_detect_running(&self) -> bool {
         // Needs a pid liveness check, which is only implemented on Unix.
@@ -302,6 +309,39 @@ impl AgentPlugin for CopilotPlugin {
                 (Some("assistant.message"), Some(text)) => {
                     visit(Message::assistant(text.to_string()))
                 }
+                _ => true,
+            }
+        });
+    }
+
+    /// Messages plus tool calls (`tool.execution_start`: tool name and
+    /// arguments) and tool results (`tool.execution_complete`).
+    fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
+        if let Some(bytes) = self.session_bytes(path) {
+            self.iter_search_texts_from_bytes(path, &bytes, visit);
+        }
+    }
+
+    /// `data` is `session_bytes`, i.e. `events.jsonl`.
+    fn iter_search_texts_from_bytes(
+        &self,
+        _path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(&str) -> bool,
+    ) {
+        for_each_jsonl_value_bytes(data, |val| {
+            let data = val.get("data");
+            match val.get("type").and_then(|v| v.as_str()) {
+                Some("user.message" | "assistant.message") => data
+                    .and_then(|d| d.get("content"))
+                    .and_then(|v| v.as_str())
+                    .filter(|text| !text.trim().is_empty())
+                    .is_none_or(&mut *visit),
+                Some("tool.execution_start") => data
+                    .is_none_or(|d| visit_tool_call(d.get("toolName"), d.get("arguments"), visit)),
+                Some("tool.execution_complete") => data
+                    .and_then(|d| d.get("result"))
+                    .is_none_or(|v| visit_string_values(v, visit)),
                 _ => true,
             }
         });

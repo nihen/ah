@@ -12,6 +12,7 @@ use super::Message;
 use super::common::format_mtime;
 use super::common::mmap_file;
 use super::common::strip_home;
+use super::common::{visit_string_values, visit_tool_call};
 use super::{MemoryKind, MemorySource};
 
 static RE_CODEX_SESSIONS: LazyLock<Regex> =
@@ -118,12 +119,6 @@ fn latest_thread_name_in(
 /// before JSON parsing. This matters when the title falls back to the first
 /// prompt: sessions without a real user prompt are scanned to the end.
 fn for_each_message(data: &[u8], visit: &mut dyn FnMut(Message) -> bool) {
-    use memchr::memmem::Finder;
-    static RESPONSE_ITEM: LazyLock<Finder<'static>> =
-        LazyLock::new(|| Finder::new(b"\"response_item\""));
-    static USER: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\"user\""));
-    static ASSISTANT: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\"assistant\""));
-
     for line in data.split(|&b| b == b'\n') {
         if RESPONSE_ITEM.find(line).is_none()
             || (USER.find(line).is_none() && ASSISTANT.find(line).is_none())
@@ -136,6 +131,97 @@ fn for_each_message(data: &[u8], visit: &mut dyn FnMut(Message) -> bool) {
         if !visit_message_value(&val, visit) {
             return;
         }
+    }
+}
+
+static RESPONSE_ITEM: LazyLock<memchr::memmem::Finder<'static>> =
+    LazyLock::new(|| memchr::memmem::Finder::new(b"\"response_item\""));
+static USER: LazyLock<memchr::memmem::Finder<'static>> =
+    LazyLock::new(|| memchr::memmem::Finder::new(b"\"user\""));
+static ASSISTANT: LazyLock<memchr::memmem::Finder<'static>> =
+    LazyLock::new(|| memchr::memmem::Finder::new(b"\"assistant\""));
+
+/// Visit the search texts of a rollout: messages, tool calls and tool
+/// outputs, all of which live in `response_item` lines.
+fn for_each_search_text(data: &[u8], visit: &mut dyn FnMut(&str) -> bool) {
+    for line in data.split(|&b| b == b'\n') {
+        if !may_hold_search_text(line) {
+            continue;
+        }
+        let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if !visit_search_value(&val, visit) {
+            return;
+        }
+    }
+}
+
+/// Cheap check that rules out lines without search texts before JSON
+/// parsing: lines other than `response_item`, developer instructions,
+/// encrypted reasoning, and user messages whose every text is injected
+/// context (starting with `<` or `# `, which `visit_message_value` skips).
+/// Keys are compared in their serialized form; inside a JSON string these
+/// quotes would be escaped, so a match is always a real key. The line and
+/// payload types are looked up in the line's head only (rollouts write
+/// `timestamp`, `type`, then `payload` with its `type` and `role` first);
+/// when the head does not identify the line, it is kept.
+fn may_hold_search_text(line: &[u8]) -> bool {
+    use memchr::memmem::Finder;
+    static TYPE_KEY: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\"type\":\""));
+    static DEVELOPER: LazyLock<Finder<'static>> =
+        LazyLock::new(|| Finder::new(b"\"role\":\"developer\""));
+    static REASONING: LazyLock<Finder<'static>> =
+        LazyLock::new(|| Finder::new(b"\"payload\":{\"type\":\"reasoning\""));
+    static USER_ROLE: LazyLock<Finder<'static>> =
+        LazyLock::new(|| Finder::new(b"\"role\":\"user\""));
+    static TEXT_KEY: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\"text\":\""));
+    const HEAD: usize = 512;
+    let head = &line[..line.len().min(HEAD)];
+    let Some(at) = TYPE_KEY.find(head) else {
+        return true;
+    };
+    if !head[at..].starts_with(b"\"type\":\"response_item\"") {
+        return false;
+    }
+    if DEVELOPER.find(head).is_some() || REASONING.find(head).is_some() {
+        return false;
+    }
+    if USER_ROLE.find(head).is_none() {
+        return true;
+    }
+    TEXT_KEY.find_iter(line).any(|at| {
+        let text = &line[at + b"\"text\":\"".len()..];
+        !(text.starts_with(b"<") || text.starts_with(b"# "))
+    })
+}
+
+/// Search texts of one rollout line: its messages, the name and input of a
+/// `*_call` item, or the output of a `*_call_output` item.
+fn visit_search_value(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
+    if !visit_message_value(val, &mut |message| visit(&message.text)) {
+        return false;
+    }
+    if val.get("type").and_then(|v| v.as_str()) != Some("response_item") {
+        return true;
+    }
+    let Some(payload) = val.get("payload") else {
+        return true;
+    };
+    let kind = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if kind.ends_with("_call") {
+        visit_tool_call(payload.get("name"), None, visit)
+            && ["arguments", "input", "action"].iter().all(|key| {
+                payload
+                    .get(key)
+                    .is_none_or(|v| visit_string_values(v, visit))
+            })
+    } else if kind.ends_with("_call_output") {
+        payload
+            .get("output")
+            .is_none_or(|v| visit_string_values(v, visit))
+    } else {
+        true
     }
 }
 
@@ -257,6 +343,12 @@ impl AgentPlugin for CodexPlugin {
     fn prompts_per_jsonl_line(&self) -> bool {
         true
     }
+    fn search_texts_in_session_json(&self) -> bool {
+        true
+    }
+    fn search_texts_per_jsonl_line(&self) -> bool {
+        true
+    }
 
     fn can_detect_running(&self) -> bool {
         // Needs the kernel lock table (`/proc/locks`).
@@ -314,6 +406,25 @@ impl AgentPlugin for CodexPlugin {
         visit: &mut dyn FnMut(Message) -> bool,
     ) {
         for_each_message(data, visit);
+    }
+
+    fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
+        if let Some(mmap) = mmap_file(path) {
+            for_each_search_text(&mmap, visit);
+        }
+    }
+
+    fn iter_search_texts_from_bytes(
+        &self,
+        _path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(&str) -> bool,
+    ) {
+        for_each_search_text(data, visit);
+    }
+
+    fn line_may_hold_search_texts(&self, line: &[u8]) -> bool {
+        may_hold_search_text(line)
     }
 
     fn resolve_project(&self, path: &Path, home: &Path) -> Option<String> {

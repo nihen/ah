@@ -125,6 +125,48 @@ pub fn first_text_part(val: &serde_json::Value) -> Option<&str> {
         })
 }
 
+/// Keys of tool payloads that hold identifiers, type tags or encoded data
+/// (images, signatures) rather than searchable text.
+const OPAQUE_KEYS: &[&str] = &[
+    "type",
+    "id",
+    "call_id",
+    "tool_use_id",
+    "tool_call_id",
+    "toolCallId",
+    "signature",
+    "encrypted_content",
+    "source",
+    "image_url",
+    "inlineData",
+    "mimeType",
+    "media_type",
+];
+
+/// Visit the string values of a tool call's input or a tool's output,
+/// skipping `OPAQUE_KEYS`. Returns `false` when `visit` stops.
+pub fn visit_string_values(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
+    match val {
+        serde_json::Value::String(s) => visit(s),
+        serde_json::Value::Array(items) => items.iter().all(|v| visit_string_values(v, visit)),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .filter(|(key, _)| !OPAQUE_KEYS.contains(&key.as_str()))
+            .all(|(_, v)| visit_string_values(v, visit)),
+        _ => true,
+    }
+}
+
+/// Visit a tool call's `name` and the string values of `payload`.
+pub fn visit_tool_call(
+    name: Option<&serde_json::Value>,
+    payload: Option<&serde_json::Value>,
+    visit: &mut dyn FnMut(&str) -> bool,
+) -> bool {
+    name.and_then(|v| v.as_str()).is_none_or(&mut *visit)
+        && payload.is_none_or(|v| visit_string_values(v, visit))
+}
+
 /// Extract the body wrapped in `<tag>…</tag>` from a raw user message.
 /// Several agents wrap the real user text in a tag (Cursor: `user_query`,
 /// Grok: `user_query`, Antigravity: `USER_REQUEST`) and append metadata

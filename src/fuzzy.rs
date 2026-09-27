@@ -30,12 +30,14 @@ fn print_session_fields(
 ) -> Result<(), String> {
     if !query.is_empty() && fields.contains(&Field::Matched) {
         match search_mode {
-            crate::cli::SearchMode::All => regex::bytes::Regex::new(&format!("(?iu){}", query))
+            crate::cli::SearchMode::Raw => regex::bytes::Regex::new(&format!("(?iu){}", query))
                 .map(drop)
                 .map_err(|e| format!("Invalid regex '{}': {}", query, e))?,
-            crate::cli::SearchMode::Prompt => regex::Regex::new(&format!("(?i){}", query))
-                .map(drop)
-                .map_err(|e| format!("Invalid regex '{}': {}", query, e))?,
+            crate::cli::SearchMode::Text | crate::cli::SearchMode::Prompt => {
+                regex::Regex::new(&format!("(?i){}", query))
+                    .map(drop)
+                    .map_err(|e| format!("Invalid regex '{}': {}", query, e))?
+            }
         }
     }
     let pb = std::path::PathBuf::from(path);

@@ -116,8 +116,8 @@ fn resolve_resume_command(
     }
 }
 
-/// Resolve Matched field. In All mode, searches raw file via mmap.
-/// In Prompt mode, falls back to iterating user messages only.
+/// Resolve Matched field. In Raw mode, searches the raw file via mmap;
+/// otherwise iterates the search texts (user messages only in Prompt mode).
 fn resolve_matched(
     path: &Path,
     plugin: &dyn AgentPlugin,
@@ -125,7 +125,7 @@ fn resolve_matched(
     preloaded_mmap: Option<&[u8]>,
 ) -> String {
     match opts.search_mode {
-        SearchMode::All => {
+        SearchMode::Raw => {
             let Some(bytes_re) = &opts.bytes_query_re else {
                 return String::new();
             };
@@ -137,11 +137,16 @@ fn resolve_matched(
                 opts.literal_needle.as_deref(),
             )
         }
-        SearchMode::Prompt => {
+        SearchMode::Text | SearchMode::Prompt => {
             let Some(re) = &opts.query_re else {
                 return String::new();
             };
-            resolve_matched_prompts(path, plugin, re)
+            let found = if opts.search_mode == SearchMode::Prompt {
+                crate::search::search_prompts(path, plugin, re, None)
+            } else {
+                crate::search::search_texts(path, plugin, re, None)
+            };
+            found.unwrap_or_default()
         }
     }
 }
@@ -260,27 +265,15 @@ fn extract_context_from_bytes(data: &[u8], start: usize, end: usize, max_context
     extract_match_context(text, rel_start, rel_end, max_context)
 }
 
-/// Slow path: search only user prompt messages.
-fn resolve_matched_prompts(path: &Path, plugin: &dyn AgentPlugin, re: &Regex) -> String {
-    let mut result = String::new();
-    plugin.iter_messages(path, &mut |message| {
-        if message.role != MessageRole::User {
-            return true;
-        }
-        let text = &message.text;
-        if let Some(mat) = re.find(text) {
-            result = extract_match_context(text, mat.start(), mat.end(), 30);
-            return false;
-        }
-        true
-    });
-    result
-}
-
 /// Extract a snippet around a match, keeping total ~max_context chars.
 /// Tries to split context evenly before/after the match.
 /// Only examines bytes near the match position — O(max_context), not O(file_size).
-fn extract_match_context(text: &str, start: usize, end: usize, max_context: usize) -> String {
+pub(crate) fn extract_match_context(
+    text: &str,
+    start: usize,
+    end: usize,
+    max_context: usize,
+) -> String {
     // Validate that start/end are within bounds and on UTF-8 char boundaries
     if start > end
         || end > text.len()
@@ -456,7 +449,7 @@ impl ResolveOpts {
             title_limit,
             query_re,
             bytes_query_re,
-            search_mode: SearchMode::All,
+            search_mode: SearchMode::Text,
             literal_needle,
         }
     }
@@ -503,7 +496,7 @@ impl Default for ResolveOpts {
             title_limit: 0,
             query_re: None,
             bytes_query_re: None,
-            search_mode: SearchMode::All,
+            search_mode: SearchMode::Text,
             literal_needle: None,
         }
     }
@@ -1107,7 +1100,7 @@ mod tests {
         let path = fixture_path("claude_session.jsonl");
         let plugin = find_plugin("claude").unwrap();
         let re = Regex::new("(?i)auth").unwrap();
-        let result = resolve_matched_prompts(&path, plugin, &re);
+        let result = crate::search::search_prompts(&path, plugin, &re, None).unwrap_or_default();
         assert!(result.contains("auth"));
     }
 
@@ -1117,7 +1110,7 @@ mod tests {
         let path = fixture_path("claude_session.jsonl");
         let plugin = find_plugin("claude").unwrap();
         let re = Regex::new("(?i)fix that").unwrap();
-        let result = resolve_matched_prompts(&path, plugin, &re);
+        let result = crate::search::search_prompts(&path, plugin, &re, None).unwrap_or_default();
         // Should NOT match since it's in assistant text, not user prompt
         assert!(result.is_empty());
     }

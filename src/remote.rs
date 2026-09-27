@@ -38,6 +38,9 @@ fn build_remote_args(remote: &RemoteDef, fields: &[Field], filter: &FilterArgs) 
     if filter.prompt_only {
         args.push("-p".to_string());
     }
+    if filter.raw_search {
+        args.push("--raw-search".to_string());
+    }
     if let Some(ref a) = filter.agent {
         args.push("--agent".to_string());
         args.push(a.clone());
@@ -359,6 +362,9 @@ pub fn exec_remote_show(
     if filter.prompt_only {
         ah_args.push("--prompt-only".to_string());
     }
+    if filter.raw_search {
+        ah_args.push("--raw-search".to_string());
+    }
     if let Some(n) = args.head {
         ah_args.push("--head".to_string());
         ah_args.push(n.to_string());
@@ -411,6 +417,9 @@ pub fn run_remote_show_meta(
     }
     if filter.prompt_only {
         ah_args.push("--prompt-only".to_string());
+    }
+    if filter.raw_search {
+        ah_args.push("--raw-search".to_string());
     }
     ah_args.push("--no-color".to_string());
     ah_args.push("--no-pager".to_string());
@@ -1070,6 +1079,7 @@ mod tests {
             all_remote: false,
             query: None,
             prompt_only: false,
+            raw_search: false,
             limit: 0,
             since: None,
             until: None,
@@ -1111,6 +1121,7 @@ mod tests {
             all_remote: false,
             query: Some("auth".to_string()),
             prompt_only: false,
+            raw_search: false,
             limit: 10,
             since: Some("3d".to_string()),
             until: None,

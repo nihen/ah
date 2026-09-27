@@ -52,7 +52,7 @@ Or browse and filter sessions with `-i` (via [fzf](https://github.com/junegunn/f
 $ ah resume -i
 ```
 
-Full-text search across all directories (piped output is plain TSV):
+Full-text search across all directories (piped output is plain TSV). `-q` searches the conversation — user and assistant messages plus tool calls (commands, arguments, file paths) and tool output — not JSON keys or injected instructions. Use `-p` to search only your prompts, or `--raw-search` to match the raw session files including metadata:
 
 ```console
 $ ah log -a -q "OAuth" | head -3
@@ -237,8 +237,9 @@ Global options:
   --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
   --project <NAME>        Filter by project name
   -d, --dir <PATH>        Filter by working directory (default: current directory)
-  -q, --query <REGEX>     Full-text search query (regex, case-insensitive)
+  -q, --query <REGEX>     Search messages and tool input/output (regex, case-insensitive)
   -p, --prompt-only       Search only user prompts (use with -q)
+  --raw-search            Search raw session files incl. metadata (use with -q)
   -n, --limit N           Max session files to scan (default: 0, no limit)
   -i, --interactive       Interactive mode via fuzzy finder (fzf/sk)
   -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)

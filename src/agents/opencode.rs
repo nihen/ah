@@ -457,6 +457,47 @@ fn text_messages(db: &Path, id: &str) -> Result<Vec<Message>, String> {
     })
 }
 
+/// Search texts of an exported session (`export_session`): each text part
+/// of a conversation message, and the tool name, input, output and error of
+/// tool parts. Compaction summaries are skipped like in `message_from_parts`.
+fn search_texts_of_export(data: &[u8], visit: &mut dyn FnMut(&str) -> bool) {
+    super::common::for_each_jsonl_value_bytes(data, |line| {
+        if line.pointer("/info/summary").and_then(|v| v.as_bool()) == Some(true) {
+            return true;
+        }
+        let Some(parts) = line.get("parts").and_then(|v| v.as_array()) else {
+            return true;
+        };
+        parts
+            .iter()
+            .all(|part| match part.get("type").and_then(|v| v.as_str()) {
+                Some("text") => {
+                    let injected = ["synthetic", "ignored"]
+                        .iter()
+                        .any(|key| part.get(*key).and_then(|v| v.as_bool()) == Some(true));
+                    injected
+                        || part
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .is_none_or(&mut *visit)
+                }
+                Some("tool") => {
+                    let state = part.get("state");
+                    super::common::visit_tool_call(
+                        part.get("tool"),
+                        state.and_then(|s| s.get("input")),
+                        visit,
+                    ) && ["output", "error"].iter().all(|key| {
+                        state
+                            .and_then(|s| s.get(*key))
+                            .is_none_or(|v| super::common::visit_string_values(v, visit))
+                    })
+                }
+                _ => true,
+            })
+    });
+}
+
 /// Text of a message: its non-synthetic, non-ignored text parts joined.
 /// Compaction summaries (`summary: true`) are not part of the conversation.
 fn message_from_parts(info: &serde_json::Value, parts: &[serde_json::Value]) -> Option<Message> {
@@ -622,6 +663,21 @@ impl AgentPlugin for OpencodePlugin {
             }
             Err(e) => warn_once(db, &e),
         }
+    }
+
+    fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
+        if let Some(bytes) = self.session_bytes(path) {
+            search_texts_of_export(&bytes, visit);
+        }
+    }
+
+    fn iter_search_texts_from_bytes(
+        &self,
+        _path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(&str) -> bool,
+    ) {
+        search_texts_of_export(data, visit);
     }
 
     /// Preloaded bytes are the full export including tool output; the text

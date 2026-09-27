@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use super::common::{
     RE_HOME_PREFIX, canonicalize_if_exists, decode_claude_project, for_each_jsonl_value,
     for_each_jsonl_value_bytes, is_pid_alive, json_pid, mmap_file, process_start_ticks,
+    visit_string_values, visit_tool_call,
 };
 use super::{AgentMemoryFile, AgentPlugin, MemoryKind, MemorySource, Message};
 
@@ -133,6 +134,38 @@ impl ClaudePlugin {
     }
 }
 
+impl ClaudePlugin {
+    /// Search texts of one record: its messages, then `tool_use` inputs and
+    /// `tool_result` contents. Returns `false` when `visit` stops.
+    fn visit_search_texts(
+        &self,
+        val: &serde_json::Value,
+        visit: &mut dyn FnMut(&str) -> bool,
+    ) -> bool {
+        if !self
+            .messages_from_value(val)
+            .iter()
+            .all(|message| visit(&message.text))
+        {
+            return false;
+        }
+        let Some(items) = val.pointer("/message/content").and_then(|v| v.as_array()) else {
+            return true;
+        };
+        items
+            .iter()
+            .all(|item| match item.get("type").and_then(|v| v.as_str()) {
+                Some("tool_use" | "server_tool_use") => {
+                    visit_tool_call(item.get("name"), item.get("input"), visit)
+                }
+                Some("tool_result") => item
+                    .get("content")
+                    .is_none_or(|content| visit_string_values(content, visit)),
+                _ => true,
+            })
+    }
+}
+
 impl AgentPlugin for ClaudePlugin {
     fn id(&self) -> &'static str {
         "claude"
@@ -149,6 +182,12 @@ impl AgentPlugin for ClaudePlugin {
         true
     }
     fn prompts_per_jsonl_line(&self) -> bool {
+        true
+    }
+    fn search_texts_in_session_json(&self) -> bool {
+        true
+    }
+    fn search_texts_per_jsonl_line(&self) -> bool {
         true
     }
     fn can_detect_running(&self) -> bool {
@@ -198,6 +237,29 @@ impl AgentPlugin for ClaudePlugin {
             }
             true
         });
+    }
+
+    fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
+        for_each_jsonl_value(path, |val| self.visit_search_texts(val, visit));
+    }
+
+    /// Only `user` and `assistant` records hold search texts. A quoted
+    /// `"type":"user"` outside a JSON string is always a real key.
+    fn line_may_hold_search_texts(&self, line: &[u8]) -> bool {
+        static USER: std::sync::LazyLock<memmem::Finder<'static>> =
+            std::sync::LazyLock::new(|| memmem::Finder::new(b"\"type\":\"user\""));
+        static ASSISTANT: std::sync::LazyLock<memmem::Finder<'static>> =
+            std::sync::LazyLock::new(|| memmem::Finder::new(b"\"type\":\"assistant\""));
+        USER.find(line).is_some() || ASSISTANT.find(line).is_some()
+    }
+
+    fn iter_search_texts_from_bytes(
+        &self,
+        _path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(&str) -> bool,
+    ) {
+        for_each_jsonl_value_bytes(data, |val| self.visit_search_texts(val, visit));
     }
 
     fn messages_from_value(&self, val: &serde_json::Value) -> Vec<Message> {

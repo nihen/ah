@@ -14,6 +14,7 @@ use super::MessageRole;
 use super::common::first_text_part;
 use super::common::format_mtime;
 use super::common::mmap_file;
+use super::common::{visit_string_values, visit_tool_call};
 use super::{MemoryKind, MemorySource};
 
 /// Project directory of a session file: `tmp/{project}/chats/session-*` or
@@ -293,6 +294,45 @@ fn visit_message(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -> bool
     true
 }
 
+/// Search texts of one Gemini message record: the user prompt, each answer
+/// part of a turn (visited separately, so each is one JSON string), and its
+/// tool calls with their arguments and results. Returns `false` to stop.
+fn visit_search_record(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
+    match val.get("type").and_then(|v| v.as_str()) {
+        Some("user") => visit_message(val, &mut |message| visit(&message.text)),
+        Some("gemini") => {
+            let content_ok = match val.get("content") {
+                Some(serde_json::Value::String(text)) => visit(text),
+                Some(serde_json::Value::Array(parts)) => parts.iter().all(|part| {
+                    if part.get("thought").and_then(|v| v.as_bool()) == Some(true) {
+                        return true;
+                    }
+                    part.get("text")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(&mut *visit)
+                        && ["functionCall", "functionResponse"]
+                            .iter()
+                            .all(|key| part.get(key).is_none_or(|v| visit_string_values(v, visit)))
+                }),
+                _ => true,
+            };
+            content_ok
+                && val
+                    .get("toolCalls")
+                    .and_then(|v| v.as_array())
+                    .is_none_or(|calls| {
+                        calls.iter().all(|call| {
+                            visit_tool_call(call.get("name"), call.get("args"), visit)
+                                && call
+                                    .get("result")
+                                    .is_none_or(|v| visit_string_values(v, visit))
+                        })
+                    })
+        }
+        _ => true,
+    }
+}
+
 /// Answer text of a Gemini turn. `content` is a string, or (after a
 /// `$set.messages` checkpoint) a Parts array mixing thought summaries
 /// (`"thought": true`), function calls and answer text; only the answer
@@ -503,6 +543,23 @@ impl AgentPlugin for GeminiPlugin {
         visit: &mut dyn FnMut(Message) -> bool,
     ) {
         Self::for_each_root_message_bytes(path, data, |val| visit_message(val, visit));
+    }
+
+    fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
+        Self::for_each_root_message(path, |val| visit_search_record(val, visit));
+    }
+
+    fn iter_search_texts_from_bytes(
+        &self,
+        path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(&str) -> bool,
+    ) {
+        Self::for_each_root_message_bytes(path, data, |val| visit_search_record(val, visit));
+    }
+
+    fn search_texts_in_session_json(&self) -> bool {
+        true
     }
 
     fn resolve_project(&self, path: &Path, _home: &Path) -> Option<String> {

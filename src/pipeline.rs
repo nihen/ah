@@ -65,18 +65,25 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
     }
 
     let has_query = !params.query.is_empty();
-    let bytes_pattern = if has_query && params.search_mode == SearchMode::All {
+    let raw_search = params.search_mode == SearchMode::Raw;
+    let bytes_pattern = if has_query && raw_search {
         Some(compile_bytes_regex(&params.query)?)
     } else {
         None
     };
-    let text_pattern = if has_query && params.search_mode == SearchMode::Prompt {
+    let text_pattern = if has_query && !raw_search {
         Some(compile_text_regex(&params.query)?)
     } else {
         None
     };
-    let prompt_prefilter = if has_query && params.search_mode == SearchMode::Prompt {
-        search::PromptPrefilter::new(&params.query)
+    let query_prefilter = if has_query && !raw_search {
+        search::QueryPrefilter::new(&params.query)
+    } else {
+        None
+    };
+    let prompt_only = params.search_mode == SearchMode::Prompt;
+    let line_check = if has_query && !raw_search && !prompt_only {
+        search::LineCheck::new(&params.query)
     } else {
         None
     };
@@ -89,6 +96,12 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
         resolve_fields.push(Field::Id);
     }
     FieldFilter::ensure_fields(&params.filters, &mut resolve_fields);
+    let wants_matched = resolve_fields.contains(&Field::Matched);
+    let resolve_fields_but_matched: Vec<Field> = resolve_fields
+        .iter()
+        .copied()
+        .filter(|f| *f != Field::Matched)
+        .collect();
 
     // Split filters into early (cheap) and late (need full resolution).
     // Cwd and Agent can be resolved cheaply without full field resolution.
@@ -113,7 +126,7 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
     // Pre-compute fast literal needle for ASCII queries without regex metacharacters.
     // Uses memchr SIMD search instead of regex for massive speedup.
     let fast_needle: Option<Vec<u8>> = if has_query
-        && params.search_mode == SearchMode::All
+        && raw_search
         && params.query.is_ascii()
         && !params.query.chars().any(|c| {
             matches!(
@@ -186,41 +199,16 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
                 }
             }
 
-            if mmap.is_none()
-                && has_query
-                && params.search_mode == SearchMode::All
-                && !plugin.cheap_session_bytes()
-            {
+            if mmap.is_none() && has_query && raw_search && !plugin.cheap_session_bytes() {
                 mmap = plugin.session_bytes(path);
             }
 
-            // Query search using pre-loaded mmap
+            // Query search using pre-loaded mmap. Message search yields the
+            // match context, reused as the `matched` field.
+            let mut matched = None;
             if has_query {
-                let matches = match params.search_mode {
-                    SearchMode::Prompt => text_pattern.as_ref().is_some_and(|re| {
-                        if let (Some(prefilter), Some(m)) = (&prompt_prefilter, mmap.as_deref()) {
-                            if plugin.prompts_per_jsonl_line() && is_session_file {
-                                return prefilter.candidate_lines(m).is_some_and(|lines| {
-                                    search::search_prompts_matches(
-                                        path,
-                                        plugin,
-                                        re,
-                                        Some(lines.as_ref()),
-                                    )
-                                });
-                            }
-                            if plugin.prompts_in_session_json() && !prefilter.may_match(m) {
-                                return false;
-                            }
-                        }
-                        let data = if is_session_file {
-                            mmap.as_deref()
-                        } else {
-                            None
-                        };
-                        search::search_prompts_matches(path, plugin, re, data)
-                    }),
-                    SearchMode::All => match &mmap {
+                let matches = if raw_search {
+                    match &mmap {
                         Some(m) => {
                             if let Some(needle) = &fast_needle {
                                 ascii_case_insensitive_contains(m, needle)
@@ -229,7 +217,56 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
                             }
                         }
                         None => false,
-                    },
+                    }
+                } else {
+                    matched = text_pattern.as_ref().and_then(|re| {
+                        let data = if is_session_file {
+                            mmap.as_deref()
+                        } else {
+                            None
+                        };
+                        if prompt_only {
+                            if let (Some(prefilter), Some(m)) = (&query_prefilter, mmap.as_deref())
+                            {
+                                if plugin.prompts_per_jsonl_line() && is_session_file {
+                                    let lines = prefilter.candidate_lines(m)?;
+                                    return search::search_prompts(
+                                        path,
+                                        plugin,
+                                        re,
+                                        Some(lines.as_ref()),
+                                    );
+                                }
+                                if plugin.prompts_in_session_json() && !prefilter.may_match(m) {
+                                    return None;
+                                }
+                            }
+                            return search::search_prompts(path, plugin, re, data);
+                        }
+                        // Search texts are read from `session_bytes`, loaded
+                        // here as `mmap` when cheap.
+                        if let (Some(prefilter), Some(m)) = (&query_prefilter, mmap.as_deref()) {
+                            if plugin.search_texts_per_jsonl_line() {
+                                // Parse candidate lines one at a time and stop
+                                // at the first match.
+                                let mut found = None;
+                                let keep = |line: &[u8]| plugin.line_may_hold_search_texts(line);
+                                prefilter.for_each_candidate_line(m, keep, |line| {
+                                    if line_check.as_ref().is_some_and(|c| !c.may_match(line)) {
+                                        return true;
+                                    }
+                                    found = search::search_texts(path, plugin, re, Some(line));
+                                    found.is_none()
+                                });
+                                return found;
+                            }
+                            if plugin.search_texts_in_session_json() && !prefilter.may_match(m) {
+                                return None;
+                            }
+                        }
+                        search::search_texts(path, plugin, re, mmap.as_deref())
+                    });
+                    matched.is_some()
                 };
                 if !matches {
                     return None;
@@ -242,15 +279,24 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
             } else {
                 None
             };
-            let fields = resolver::resolve_fields_with_mmap(
+            let mut fields = resolver::resolve_fields_with_mmap(
                 path,
                 plugin,
                 *mtime,
                 &home,
-                &resolve_fields,
+                if matched.is_some() {
+                    &resolve_fields_but_matched
+                } else {
+                    &resolve_fields
+                },
                 &params.resolve_opts,
                 session_mmap,
             );
+            if let Some(matched) = matched {
+                if wants_matched {
+                    fields.insert(Field::Matched, matched);
+                }
+            }
 
             // Skip if Matched was requested but is empty
             if has_query

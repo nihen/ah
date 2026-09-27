@@ -12,7 +12,28 @@ use super::common::for_each_jsonl_value_bytes;
 use super::common::is_safe_cli_id;
 use super::common::mmap_file;
 use super::common::tagged_user_body;
+use super::common::visit_tool_call;
 use super::{MemoryKind, MemorySource};
+
+/// Visit the message of one transcript line; `false` stops the iteration.
+fn visit_message_value(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -> bool) -> bool {
+    match val.get("role").and_then(|v| v.as_str()) {
+        Some("user") => {
+            if let Some(raw) = val.get("message").and_then(first_text_part) {
+                if let Some(text) = cursor_user_body(raw) {
+                    return visit(Message::user(text.to_string()));
+                }
+            }
+        }
+        Some("assistant") => {
+            if let Some(text) = val.get("message").and_then(first_text_part) {
+                return visit(Message::assistant(text.to_string()));
+            }
+        }
+        _ => {}
+    }
+    true
+}
 
 static RE_CURSOR_PROJECTS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r".*/projects/([^/]+)/.*").unwrap());
@@ -278,6 +299,12 @@ impl AgentPlugin for CursorPlugin {
     fn prompts_per_jsonl_line(&self) -> bool {
         true
     }
+    fn search_texts_in_session_json(&self) -> bool {
+        true
+    }
+    fn search_texts_per_jsonl_line(&self) -> bool {
+        true
+    }
 
     fn can_memory(&self) -> bool {
         true
@@ -327,23 +354,34 @@ impl AgentPlugin for CursorPlugin {
         data: &[u8],
         visit: &mut dyn FnMut(Message) -> bool,
     ) {
+        for_each_jsonl_value_bytes(data, |val| visit_message_value(val, visit));
+    }
+
+    fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
+        if let Some(mmap) = mmap_file(path) {
+            self.iter_search_texts_from_bytes(path, &mmap, visit);
+        }
+    }
+
+    /// Messages plus `tool_use` names and inputs. Transcripts do not record
+    /// tool results.
+    fn iter_search_texts_from_bytes(
+        &self,
+        _path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(&str) -> bool,
+    ) {
         for_each_jsonl_value_bytes(data, |val| {
-            match val.get("role").and_then(|v| v.as_str()) {
-                Some("user") => {
-                    if let Some(raw) = val.get("message").and_then(first_text_part) {
-                        if let Some(text) = cursor_user_body(raw) {
-                            return visit(Message::user(text.to_string()));
-                        }
-                    }
-                }
-                Some("assistant") => {
-                    if let Some(text) = val.get("message").and_then(first_text_part) {
-                        return visit(Message::assistant(text.to_string()));
-                    }
-                }
-                _ => {}
-            }
-            true
+            visit_message_value(val, &mut |message| visit(&message.text))
+                && val
+                    .pointer("/message/content")
+                    .and_then(|v| v.as_array())
+                    .is_none_or(|items| {
+                        items.iter().all(|item| {
+                            item.get("type").and_then(|v| v.as_str()) != Some("tool_use")
+                                || visit_tool_call(item.get("name"), item.get("input"), visit)
+                        })
+                    })
         });
     }
 
