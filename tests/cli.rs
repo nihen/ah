@@ -954,3 +954,88 @@ fn custom_agent_with_home_wide_marker_keeps_default_agent_sessions() {
         .success()
         .stdout("rollout-2026-03-24T20-43-12-codex-sess-001\n");
 }
+
+/// A Gemini session resumed from a legacy `.json` file: Gemini CLI writes the
+/// conversation to a sibling `.jsonl` and leaves the `.json` behind.
+fn gemini_migrated_session(chats: &Path) -> (String, String) {
+    fs::create_dir_all(chats).unwrap();
+    let stem = chats.join("session-2026-06-11T20-44-gemmig01");
+    let json = format!("{}.json", stem.display());
+    let jsonl = format!("{}.jsonl", stem.display());
+    fs::write(
+        &json,
+        r#"{"sessionId":"gemmig01-0000","projectHash":"h","messages":[{"id":"u1","type":"user","content":[{"text":"legacy prompt"}]}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        &jsonl,
+        concat!(
+            r#"{"sessionId":"gemmig01-0000","projectHash":"h","startTime":"2026-06-11T20:44:00.000Z","lastUpdated":"2026-06-11T20:45:00.000Z","kind":"main"}"#,
+            "\n",
+            r#"{"id":"u1","type":"user","content":[{"text":"legacy prompt"}]}"#,
+            "\n",
+            r#"{"id":"u2","type":"user","content":[{"text":"resumed prompt"}]}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    (json, jsonl)
+}
+
+#[test]
+fn gemini_lists_migrated_jsonl_once_with_utc_file_time() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let (_, jsonl) = gemini_migrated_session(&home.join(".gemini/tmp/proj/chats"));
+    ah_opencode(&home)
+        .env_remove("GEMINI_CLI_HOME")
+        .env("TZ", "Asia/Tokyo")
+        .args(["log", "-a", "-o", "path,modified_at,id,turns"])
+        .assert()
+        .success()
+        .stdout(format!("{jsonl}\t2026-06-12 05:44\tgemmig01-0000\t2\n"));
+    ah_opencode(&home)
+        .env_remove("GEMINI_CLI_HOME")
+        .args(["show", "-o", "path", "gemmig01"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout(format!("{jsonl}\n"));
+}
+
+#[test]
+fn gemini_custom_agent_globbing_only_json_keeps_legacy_file() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let (json, _) = gemini_migrated_session(&home.join("gemarchive/proj/chats"));
+    fs::write(
+        home.join(".ahrc"),
+        "[agents.gemarch]\nplugin = \"gemini\"\nfile_patterns = [\"~/gemarchive/*/chats/session-*.json\"]\n",
+    )
+    .unwrap();
+    ah_opencode(&home)
+        .args(["log", "-a", "-o", "agent,path"])
+        .assert()
+        .success()
+        .stdout(format!("gemarch\t{json}\n"));
+}
+
+#[test]
+fn gemini_disabled_agent_owning_jsonl_keeps_legacy_file() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let (json, jsonl) = gemini_migrated_session(&home.join(".gemini/tmp/proj/chats"));
+    fs::write(
+        home.join(".ahrc"),
+        format!(
+            "[agents.off]\nplugin = \"gemini\"\nfile_patterns = [\"{jsonl}\"]\ndisabled = true\n"
+        ),
+    )
+    .unwrap();
+    ah_opencode(&home)
+        .env_remove("GEMINI_CLI_HOME")
+        .args(["log", "-a", "-o", "agent,path"])
+        .assert()
+        .success()
+        .stdout(format!("gemini\t{json}\n"));
+}

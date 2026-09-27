@@ -9,5 +9,8 @@
 {"$rewindTo":"u2"}
 {"id":"u3","timestamp":"2026-06-01T00:00:06.000Z","type":"user","content":[{"text":"add a rollback step"}]}
 {"id":"g3","timestamp":"2026-06-01T00:00:07.000Z","type":"gemini","content":"Rollback step added."}
+{"id":"g4","timestamp":"2026-06-01T00:00:07.500Z","type":"gemini","content":"","toolCalls":[{"id":"t1","name":"read_file","args":{},"status":"success"}]}
+{"id":"g5","timestamp":"2026-06-01T00:00:07.600Z","type":"gemini","content":[{"text":"weighing options","thought":true},{"functionCall":{"name":"read_file","args":{}}}]}
+{"id":"g6","timestamp":"2026-06-01T00:00:07.700Z","type":"gemini","content":[{"text":"checking the answer","thought":true},{"text":"Final answer."}]}
 {"id":"i1","timestamp":"2026-06-01T00:00:08.000Z","type":"info","content":"Request cancelled."}
 {"$set":{"lastUpdated":"2026-06-01T00:00:08.000Z"}}

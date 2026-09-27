@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 
 use super::AgentPlugin;
 use super::Message;
+use super::MessageRole;
 use super::common::first_text_part;
 use super::common::format_mtime;
 use super::common::mmap_file;
@@ -24,6 +25,26 @@ static RE_GEMINI_TMP: LazyLock<Regex> =
 static RE_GEMINI_DATE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"session-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2})(?:-[^/]*)?\.jsonl?$").unwrap()
 });
+
+/// Whether `path` is listed as a Gemini session on its own: it is attributed
+/// to an active agent parsed by this plugin, and such an agent globs it. A
+/// custom agent whose patterns only match `session-*.json` keeps its legacy
+/// files instead. Patterns are compared as written, so non-canonical
+/// spellings such as `//` or `/./` are not recognised.
+fn collected_as_gemini(path: &Path) -> bool {
+    if crate::config::find_plugin_for_path(path).id() != PLUGIN.id() {
+        return false;
+    }
+    let options = glob::MatchOptions {
+        require_literal_separator: true,
+        ..glob::MatchOptions::new()
+    };
+    crate::config::active_agents()
+        .filter(|agent| agent.plugin.id() == PLUGIN.id())
+        .flat_map(|agent| &agent.glob_patterns)
+        .filter_map(|pattern| glob::Pattern::new(pattern).ok())
+        .any(|pattern| pattern.matches_path_with(path, options))
+}
 
 fn is_jsonl(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("jsonl")
@@ -41,7 +62,14 @@ fn resolve_cwd_from_projects_json(gemini_base: &Path, project: &str) -> Option<S
         .map(|(cwd, _)| cwd.clone())
 }
 
-/// Messages and session id reconstructed from a `session-*.jsonl` file.
+/// The session metadata line (also the whole record in the one-line legacy
+/// form), as recognised by Gemini CLI.
+fn is_metadata_record(record: &serde_json::Value) -> bool {
+    record.get("sessionId").is_some_and(|v| v.is_string())
+        && record.get("projectHash").is_some_and(|v| v.is_string())
+}
+
+/// Messages reconstructed from a `session-*.jsonl` file.
 ///
 /// The file is an append-only log: the first line holds session metadata,
 /// message records are upserted by `id`, `{"$set": {...}}` updates metadata
@@ -49,7 +77,6 @@ fn resolve_cwd_from_projects_json(gemini_base: &Path, project: &str) -> Option<S
 /// `{"$rewindTo": "<id>"}` drops that message and everything after it.
 #[derive(Default)]
 struct JsonlSession {
-    session_id: Option<String>,
     messages: Vec<serde_json::Value>,
     index: HashMap<String, usize>,
 }
@@ -93,17 +120,11 @@ impl JsonlSession {
             } else if record.get("id").is_some_and(|v| v.is_string()) {
                 session.upsert(record);
             } else if let Some(set) = record.get_mut("$set").and_then(|v| v.as_object_mut()) {
-                if let Some(id) = set.get("sessionId").and_then(|v| v.as_str()) {
-                    session.session_id = Some(id.to_string());
-                }
                 if let Some(serde_json::Value::Array(messages)) = set.remove("messages") {
                     session.clear();
                     messages.into_iter().for_each(|m| session.upsert(m));
                 }
-            } else if record.get("projectHash").is_some_and(|v| v.is_string()) {
-                if let Some(id) = record.get("sessionId").and_then(|v| v.as_str()) {
-                    session.session_id = Some(id.to_string());
-                }
+            } else if is_metadata_record(&record) {
                 if let Some(serde_json::Value::Array(messages)) =
                     record.as_object_mut().and_then(|o| o.remove("messages"))
                 {
@@ -116,24 +137,28 @@ impl JsonlSession {
 }
 
 /// Session id of a `session-*.jsonl` file without replaying its messages:
-/// the metadata line, overridden by any `$set.sessionId`.
+/// the last metadata line or `$set` that carries a `sessionId`, classified
+/// the same way as `JsonlSession::replay`. Only lines mentioning
+/// `"sessionId"` are parsed, so large message records are skipped cheaply.
 fn jsonl_session_id(data: &[u8]) -> Option<String> {
     let mut session_id = None;
-    for (n, line) in data.split(|&b| b == b'\n').enumerate() {
-        let is_set = line.starts_with(b"{\"$set\"");
-        if n > 0 && !is_set {
-            continue;
-        }
-        if is_set && memchr::memmem::find(line, b"\"sessionId\"").is_none() {
+    for line in data.split(|&b| b == b'\n') {
+        if memchr::memmem::find(line, b"\"sessionId\"").is_none() {
             continue;
         }
         let Ok(record) = serde_json::from_slice::<serde_json::Value>(line) else {
             continue;
         };
-        let meta = if is_set {
-            record.get("$set")
-        } else {
+        let meta = if record.get("$rewindTo").is_some_and(|v| v.is_string())
+            || record.get("id").is_some_and(|v| v.is_string())
+        {
+            None
+        } else if let Some(set) = record.get("$set").filter(|v| v.is_object()) {
+            Some(set)
+        } else if is_metadata_record(&record) {
             Some(&record)
+        } else {
+            None
         };
         if let Some(id) = meta
             .and_then(|m| m.get("sessionId"))
@@ -212,18 +237,88 @@ fn visit_message(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -> bool
             }
         }
         Some("gemini") => {
-            // Tool-call-only turns carry an empty "content"
-            if let Some(text) = val
-                .get("content")
-                .and_then(first_text_part)
-                .filter(|t| !t.is_empty())
-            {
-                return visit(Message::assistant(text.to_string()));
+            if let Some(text) = val.get("content").and_then(assistant_text) {
+                return visit(Message::assistant(text));
             }
         }
         _ => {}
     }
     true
+}
+
+/// Answer text of a Gemini turn. `content` is a string, or (after a
+/// `$set.messages` checkpoint) a Parts array mixing thought summaries
+/// (`"thought": true`), function calls and answer text; only the answer
+/// text is kept. Tool-call-only and thought-only turns yield `None`.
+fn assistant_text(content: &serde_json::Value) -> Option<String> {
+    let text: String = match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter(|p| p.get("thought").and_then(|v| v.as_bool()) != Some(true))
+            .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+            .collect(),
+        _ => return None,
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Local time of a session file name's UTC start time (`2026-06-11T02-44`).
+fn file_time_in<Tz: TimeZone>(utc: &str, tz: &Tz) -> Option<String>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let utc = NaiveDateTime::parse_from_str(utc, "%Y-%m-%dT%H-%M").ok()?;
+    Some(
+        Utc.from_utc_datetime(&utc)
+            .with_timezone(tz)
+            .format("%Y-%m-%d %H:%M")
+            .to_string(),
+    )
+}
+
+/// Title of a `session-*.jsonl` file: the first user prompt as Gemini CLI
+/// computes it while streaming the log, which stops reading early instead
+/// of replaying large logs.
+fn jsonl_first_prompt(data: &[u8]) -> Option<String> {
+    let mut first = None;
+    for line in data.split(|&b| b == b'\n') {
+        if memchr::memmem::find(line, b"\"user\"").is_none() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        let candidates: Vec<&serde_json::Value> =
+            if record.get("$rewindTo").is_some_and(|v| v.is_string()) {
+                Vec::new()
+            } else if record.get("id").is_some_and(|v| v.is_string()) {
+                vec![&record]
+            } else {
+                record
+                    .get("$set")
+                    .filter(|v| v.is_object())
+                    .or_else(|| is_metadata_record(&record).then_some(&record))
+                    .and_then(|m| m.get("messages"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().collect())
+                    .unwrap_or_default()
+            };
+        for message in candidates {
+            if message.get("id").is_some_and(|v| v.is_string()) {
+                visit_message(message, &mut |m| {
+                    if m.role == MessageRole::User {
+                        first = Some(m.text);
+                    }
+                    first.is_none()
+                });
+            }
+            if first.is_some() {
+                return first;
+            }
+        }
+    }
+    None
 }
 
 pub static PLUGIN: GeminiPlugin = GeminiPlugin;
@@ -304,6 +399,21 @@ impl AgentPlugin for GeminiPlugin {
         &["/.gemini/"]
     }
 
+    /// Resuming a legacy `session-*.json` makes Gemini CLI write the whole
+    /// conversation to a sibling `session-*.jsonl` and leave the `.json`
+    /// behind; list only the `.jsonl` copy.
+    fn expand_sessions(&self, file: &Path) -> Option<Vec<(PathBuf, SystemTime)>> {
+        let name = file.file_name()?.to_str()?;
+        if !name.starts_with("session-") || !name.ends_with(".json") {
+            return None;
+        }
+        let jsonl = file.with_file_name(format!("{name}l"));
+        if jsonl.is_file() && collected_as_gemini(&jsonl) {
+            return Some(Vec::new());
+        }
+        None
+    }
+
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
         Self::for_each_root_message(path, |val| visit_message(val, visit));
     }
@@ -327,14 +437,25 @@ impl AgentPlugin for GeminiPlugin {
     fn resolve_date(&self, path: &Path, mtime: SystemTime) -> Option<String> {
         RE_GEMINI_DATE
             .captures(&path.to_string_lossy())
-            .and_then(|caps| NaiveDateTime::parse_from_str(&caps[1], "%Y-%m-%dT%H-%M").ok())
-            .map(|utc| {
-                Utc.from_utc_datetime(&utc)
-                    .with_timezone(&Local)
-                    .format("%Y-%m-%d %H:%M")
-                    .to_string()
-            })
+            .and_then(|caps| file_time_in(&caps[1], &Local))
             .or_else(|| Some(format_mtime(mtime)))
+    }
+
+    fn resolve_title(&self, path: &Path, home: &Path) -> Option<String> {
+        if !is_jsonl(path) {
+            return None;
+        }
+        self.resolve_title_from_mmap(path, home, &mmap_file(path)?)
+    }
+
+    fn resolve_title_from_mmap(&self, path: &Path, _home: &Path, mmap: &[u8]) -> Option<String> {
+        // A rewound log may have dropped its first prompt; leave the title to
+        // the replayed first prompt so that title and transcript agree.
+        if !is_jsonl(path) || memchr::memmem::find(mmap, b"\"$rewindTo\"").is_some() {
+            return None;
+        }
+        // Same shape as the first-prompt fallback: first line only
+        jsonl_first_prompt(mmap).map(|p| p.lines().next().unwrap_or_default().to_string())
     }
 
     fn resolve_cwd(&self, path: &Path, home: &Path) -> Option<String> {
@@ -415,9 +536,7 @@ impl AgentPlugin for GeminiPlugin {
 
 #[cfg(test)]
 mod tests {
-    use super::super::MessageRole;
     use super::*;
-    use std::path::PathBuf;
 
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -444,8 +563,18 @@ mod tests {
                 (Assistant, "Here is the plan.".to_string()),
                 (User, "add a rollback step".to_string()),
                 (Assistant, "Rollback step added.".to_string()),
+                (Assistant, "Final answer.".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn jsonl_title_only_for_jsonl_without_rewind() {
+        // The fixture contains a `$rewindTo`, so the title comes from replay
+        let path = fixture_path("gemini_session.jsonl");
+        assert_eq!(PLUGIN.resolve_title(&path, Path::new("/")), None);
+        let legacy = fixture_path("gemini_session.json");
+        assert_eq!(PLUGIN.resolve_title(&legacy, Path::new("/")), None);
     }
 
     #[test]
@@ -483,6 +612,44 @@ mod tests {
 {"$set":{"sessionId":"second"}}
 "#;
         assert_eq!(jsonl_session_id(data).as_deref(), Some("second"));
+        // Blank or corrupt leading lines and whitespace inside records
+        let data = b"\n{broken\n { \"sessionId\" : \"late\", \"projectHash\": \"h\" }\n";
+        assert_eq!(jsonl_session_id(data).as_deref(), Some("late"));
+        let data =
+            b"{\"sessionId\":\"a\",\"projectHash\":\"h\"}\n { \"$set\": {\"sessionId\":\"b\"}}\n";
+        assert_eq!(jsonl_session_id(data).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn jsonl_title_defers_to_replay_after_rewind() {
+        let data = br#"{"sessionId":"s","projectHash":"h"}
+{"id":"u1","type":"user","content":[{"text":"typo promt"}]}
+{"id":"g1","type":"gemini","content":"?"}
+{"$rewindTo":"u1"}
+{"id":"u2","type":"user","content":[{"text":"corrected prompt\nsecond line"}]}
+"#;
+        let path = Path::new("/h/.gemini/tmp/p/chats/session-2026-06-01T00-00-abcd1234.jsonl");
+        assert_eq!(
+            PLUGIN.resolve_title_from_mmap(path, Path::new("/"), data),
+            None
+        );
+        let first_prompt = JsonlSession::replay(data)
+            .messages
+            .iter()
+            .find_map(|m| m["content"][0]["text"].as_str().map(str::to_string));
+        assert_eq!(
+            first_prompt.as_deref(),
+            Some("corrected prompt\nsecond line")
+        );
+        let clean = br#"{"sessionId":"s","projectHash":"h"}
+{"id":"u1","type":"user","content":[{"text":"first line\nsecond line"}]}
+"#;
+        assert_eq!(
+            PLUGIN
+                .resolve_title_from_mmap(path, Path::new("/"), clean)
+                .as_deref(),
+            Some("first line")
+        );
     }
 
     #[test]
@@ -520,11 +687,14 @@ mod tests {
 
     #[test]
     fn file_name_time_is_utc() {
-        let utc = NaiveDateTime::parse_from_str("2026-06-11T02-44", "%Y-%m-%dT%H-%M").unwrap();
-        let expected = Local
-            .from_utc_datetime(&utc)
-            .format("%Y-%m-%d %H:%M")
-            .to_string();
+        let jst = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+        assert_eq!(
+            file_time_in("2026-06-11T20-44", &jst).as_deref(),
+            Some("2026-06-12 05:44")
+        );
+        assert_eq!(file_time_in("2026-13-01T00-00", &jst), None);
+
+        let expected = file_time_in("2026-06-11T02-44", &Local).unwrap();
         for name in [
             "session-2026-06-11T02-44-acc93477.jsonl",
             "session-2026-06-11T02-44-1-acc93477.jsonl",
