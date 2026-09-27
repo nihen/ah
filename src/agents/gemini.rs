@@ -429,6 +429,9 @@ impl AgentPlugin for GeminiPlugin {
     fn can_resume(&self) -> bool {
         true
     }
+    fn prompts_in_session_json(&self) -> bool {
+        true
+    }
 
     fn can_memory(&self) -> bool {
         true

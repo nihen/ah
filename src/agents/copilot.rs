@@ -206,6 +206,9 @@ impl AgentPlugin for CopilotPlugin {
     fn can_resume(&self) -> bool {
         true
     }
+    fn prompts_in_session_json(&self) -> bool {
+        true
+    }
 
     fn can_detect_running(&self) -> bool {
         // Needs a pid liveness check, which is only implemented on Unix.

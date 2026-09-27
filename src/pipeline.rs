@@ -75,6 +75,11 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
     } else {
         None
     };
+    let prompt_prefilter = if has_query && params.search_mode == SearchMode::Prompt {
+        search::PromptPrefilter::new(&params.query)
+    } else {
+        None
+    };
 
     let mut resolve_fields = params.resolve_fields.clone();
     if !resolve_fields.contains(&Field::ModifiedAt) {
@@ -192,9 +197,29 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
             // Query search using pre-loaded mmap
             if has_query {
                 let matches = match params.search_mode {
-                    SearchMode::Prompt => text_pattern
-                        .as_ref()
-                        .is_some_and(|re| search::search_prompts_matches(path, plugin, re)),
+                    SearchMode::Prompt => text_pattern.as_ref().is_some_and(|re| {
+                        if let (Some(prefilter), Some(m)) = (&prompt_prefilter, mmap.as_deref()) {
+                            if plugin.prompts_per_jsonl_line() && is_session_file {
+                                return prefilter.candidate_lines(m).is_some_and(|lines| {
+                                    search::search_prompts_matches(
+                                        path,
+                                        plugin,
+                                        re,
+                                        Some(lines.as_ref()),
+                                    )
+                                });
+                            }
+                            if plugin.prompts_in_session_json() && !prefilter.may_match(m) {
+                                return false;
+                            }
+                        }
+                        let data = if is_session_file {
+                            mmap.as_deref()
+                        } else {
+                            None
+                        };
+                        search::search_prompts_matches(path, plugin, re, data)
+                    }),
                     SearchMode::All => match &mmap {
                         Some(m) => {
                             if let Some(needle) = &fast_needle {

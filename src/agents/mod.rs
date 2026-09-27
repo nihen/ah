@@ -146,6 +146,22 @@ pub trait AgentPlugin: Sync {
         true
     }
 
+    /// Whether every user message from `iter_messages` is a substring of one
+    /// JSON string value in `session_bytes`. Prompt-only search then skips
+    /// JSON parsing for sessions whose raw bytes cannot contain the query.
+    fn prompts_in_session_json(&self) -> bool {
+        false
+    }
+
+    /// Stronger form of `prompts_in_session_json` for JSONL sessions: each
+    /// user message comes from one line, independent of the other lines, so
+    /// `iter_messages_from_bytes` yields the same prompts from any subset of
+    /// lines that contains theirs. Prompt-only search then parses only the
+    /// lines that may match.
+    fn prompts_per_jsonl_line(&self) -> bool {
+        false
+    }
+
     /// Raw session content for `ah show -f raw`.
     fn raw_content(&self, path: &Path) -> Option<String> {
         fs::read_to_string(path).ok()
