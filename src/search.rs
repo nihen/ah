@@ -62,7 +62,10 @@ pub fn search_texts(
     data: Option<&[u8]>,
 ) -> Option<String> {
     let mut found = None;
-    let mut visit = |text: &str| match pattern.find(text) {
+    // Empty values (e.g. the `content` of a tool-call-only turn) are
+    // skipped: a pattern matching the empty string would otherwise stop
+    // at them with an empty excerpt, which drops the session.
+    let mut visit = |text: &str| match pattern.find(text).filter(|_| !text.is_empty()) {
         Some(m) => {
             found = Some(extract_match_context(text, m.start(), m.end(), 30));
             false
@@ -938,6 +941,25 @@ mod tests {
             return None;
         }
         search_texts(path, plugin, &pattern, Some(&raw))
+    }
+
+    #[test]
+    fn empty_texts_do_not_end_the_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session-2026-06-11T02-44-empty.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"sessionId":"g-empty","projectHash":"x","startTime":"2026-06-11T02:44:54.529Z","lastUpdated":"2026-06-11T02:44:54.529Z","kind":"main"}"#,
+                r#"{"id":"m1","type":"gemini","content":"","toolCalls":[{"id":"c1","name":"run","args":{"command":"ls"}}]}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        for query in [".*", "x*"] {
+            let found = pipeline_search("gemini", &path, query);
+            assert!(found.is_some_and(|m| !m.is_empty()), "{query}");
+        }
     }
 
     #[test]
