@@ -108,6 +108,13 @@ jobs:
           # shellcheck disable=SC2016 # envsubst takes the variable list literally
           envsubst '${VERSION} ${BASE_URL} ${SHA_DARWIN_ARM64} ${SHA_DARWIN_X86_64} ${SHA_LINUX_ARM64} ${SHA_LINUX_X86_64}' \
             < .github/formula.rb.tmpl > ah.rb
+          # A template from an older tag (manual dispatch) may use other
+          # placeholders; refuse to publish a formula with any left over.
+          # shellcheck disable=SC2016 # literal "${" is the search pattern
+          if grep -nF '${' ah.rb; then
+            echo "::error::formula template has unexpanded placeholders"
+            exit 1
+          fi
 
           git clone "https://x-access-token:${GH_TOKEN}@github.com/nihen/homebrew-tap.git"
           mkdir -p homebrew-tap/Formula
