@@ -144,10 +144,14 @@ pub fn visit_all_strings(val: &serde_json::Value, visit: &mut dyn FnMut(&str) ->
     }
 }
 
+/// Keys that hold encoded data in any tool output object: Gemini media
+/// parts and encrypted server-tool results.
+const OPAQUE_OUTPUT_KEYS: &[&str] = &["inlineData", "encrypted_content"];
+
 /// Visit the strings of a tool's output. Known content parts are reduced to
 /// their text (`{"type":"text","text":...}`) or skipped when they carry
-/// media (`{"type":"image","source":{...}}`, Gemini `inlineData`); any other
-/// object is the tool's own data and is visited in full.
+/// media (`{"type":"image","source":{...}}`); `OPAQUE_OUTPUT_KEYS` are
+/// skipped; any other object is the tool's own data and is visited in full.
 pub fn visit_tool_output(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
     match val {
         serde_json::Value::String(s) => visit(s),
@@ -161,7 +165,7 @@ pub fn visit_tool_output(val: &serde_json::Value, visit: &mut dyn FnMut(&str) ->
                 return true;
             }
             map.iter()
-                .filter(|(key, _)| key.as_str() != "inlineData")
+                .filter(|(key, _)| !OPAQUE_OUTPUT_KEYS.contains(&key.as_str()))
                 .all(|(_, v)| visit_tool_output(v, visit))
         }
         _ => true,

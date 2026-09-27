@@ -674,6 +674,7 @@ mod tests {
                     r#"{"type":"assistant","message":{"content":[{"type":"text","text":"running"},{"type":"tool_use","id":"toolu_secret_id","name":"Bash","input":{"command":"cargo test tool-arg-needle"}}]}}"#,
                     r#"{"type":"user","message":{"content":[{"tool_use_id":"toolu_secret_id","type":"tool_result","content":"ok tool-out-needle"}]}}"#,
                     r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_x","content":[{"type":"text","text":"done"}]}]}}"#,
+                    r#"{"type":"assistant","message":{"content":[{"type":"web_search_tool_result","tool_use_id":"s2","content":[{"type":"web_search_result","url":"u","encrypted_content":"ENCRYPTEDBLOB"}]}]}}"#,
                     r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_y","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAA"}}]}]}}"#,
                 ],
             ),
@@ -877,6 +878,7 @@ mod tests {
                 }
             }
             for noise in [
+                "ENCRYPTEDBLOB",
                 "iVBORw0KGgo",
                 "tool_use_id",
                 "call_id",
@@ -1028,6 +1030,17 @@ mod tests {
                     ],
                 ),
                 "needle",
+            ),
+            // server-tool results
+            (
+                "claude",
+                write(
+                    "server_tool.jsonl",
+                    &[
+                        r#"{"type":"assistant","message":{"content":[{"type":"server_tool_use","id":"s1","name":"web_search","input":{"query":"q"}},{"type":"web_search_tool_result","tool_use_id":"s1","content":[{"type":"web_search_result","url":"https://example.com/needle-page","title":"t","encrypted_content":"ENCRYPTEDBLOB"}]}]}}"#,
+                    ],
+                ),
+                "needle-page",
             ),
             // a tool's own data with a `type` field is not a content part
             (

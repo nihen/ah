@@ -205,7 +205,9 @@ impl ClaudePlugin {
                 Some("tool_use" | "server_tool_use") => {
                     visit_tool_call(item.get("name"), item.get("input"), visit)
                 }
-                Some("tool_result") => item
+                // `tool_result`, and server-tool results such as
+                // `web_search_tool_result`
+                Some(kind) if kind.ends_with("tool_result") => item
                     .get("content")
                     .is_none_or(|content| visit_tool_output(content, visit)),
                 _ => true,
