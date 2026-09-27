@@ -136,6 +136,21 @@ impl JsonlSession {
     }
 }
 
+/// Whether a `session-*.jsonl` file has a session metadata line with a
+/// non-empty id. Stops at the first one (normally the first line).
+fn has_metadata_line(data: &[u8]) -> bool {
+    data.split(|&b| b == b'\n')
+        .filter(|line| memchr::memmem::find(line, b"\"sessionId\"").is_some())
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .any(|record| {
+            is_metadata_record(&record)
+                && record.get("id").is_none()
+                && record["sessionId"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty())
+        })
+}
+
 /// Session id of a `session-*.jsonl` file without replaying its messages:
 /// the last metadata line or `$set` that carries a `sessionId`, classified
 /// the same way as `JsonlSession::replay`. Only lines mentioning
@@ -408,7 +423,9 @@ impl AgentPlugin for GeminiPlugin {
             return None;
         }
         let jsonl = file.with_file_name(format!("{name}l"));
-        if jsonl.is_file() && collected_as_gemini(&jsonl) {
+        // An empty or unparseable copy must not hide the legacy session.
+        let jsonl_readable = || mmap_file(&jsonl).is_some_and(|data| has_metadata_line(&data));
+        if jsonl.is_file() && collected_as_gemini(&jsonl) && jsonl_readable() {
             return Some(Vec::new());
         }
         None
@@ -451,6 +468,9 @@ impl AgentPlugin for GeminiPlugin {
     fn resolve_title_from_mmap(&self, path: &Path, _home: &Path, mmap: &[u8]) -> Option<String> {
         // A rewound log may have dropped its first prompt; leave the title to
         // the replayed first prompt so that title and transcript agree.
+        // `$set.messages` checkpoints are not excluded: they are in about half
+        // of all logs and normally rebuild the same history, and Gemini CLI itself
+        // titles sessions with the first prompt seen while streaming.
         if !is_jsonl(path) || memchr::memmem::find(mmap, b"\"$rewindTo\"").is_some() {
             return None;
         }

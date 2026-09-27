@@ -1021,6 +1021,29 @@ fn gemini_custom_agent_globbing_only_json_keeps_legacy_file() {
 }
 
 #[test]
+fn gemini_unreadable_jsonl_keeps_legacy_file() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let (json, jsonl) = gemini_migrated_session(&home.join(".gemini/tmp/proj/chats"));
+    for broken in [
+        "",
+        "not json\n",
+        // Lines that mention "sessionId" but are not a usable metadata line
+        "{\"id\":\"u1\",\"type\":\"user\",\"content\":\"x\",\"sessionId\":\"s\",\"projectHash\":\"h\"}\n",
+        "{\"sessionId\":\"\",\"projectHash\":\"h\"}\n",
+        "{\"sessionId\":\"s\"}\n",
+    ] {
+        fs::write(&jsonl, broken).unwrap();
+        ah_opencode(&home)
+            .env_remove("GEMINI_CLI_HOME")
+            .args(["log", "-a", "-o", "path"])
+            .assert()
+            .success()
+            .stdout(format!("{json}\n"));
+    }
+}
+
+#[test]
 fn gemini_disabled_agent_owning_jsonl_keeps_legacy_file() {
     let tmp = TempDir::new().unwrap();
     let home = fs::canonicalize(tmp.path()).unwrap();
