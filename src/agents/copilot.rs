@@ -229,6 +229,15 @@ impl AgentPlugin for CopilotPlugin {
         yaml.max(events).or_else(|| mtime(path))
     }
 
+    /// Size of the session data: `events.jsonl` holds the conversation,
+    /// `workspace.yaml` only metadata.
+    fn session_size(&self, path: &Path) -> Option<u64> {
+        let size = |p: &Path| fs::metadata(p).map(|m| m.len()).ok();
+        Self::events_path(path)
+            .and_then(|p| size(&p))
+            .or_else(|| size(path))
+    }
+
     fn session_created(&self, path: &Path) -> Option<SystemTime> {
         Self::workspace_time(path, "created_at").or_else(|| {
             fs::metadata(Self::workspace_path(path))

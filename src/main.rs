@@ -62,6 +62,7 @@ fn main() {
     let ia = cli.ia;
     color::init_color(filter.color, filter.no_color);
     color::init_debug(filter.debug);
+    collector::init_exclude_archived(filter.no_archived);
 
     // --interactive-display only applies to `log -i` and `show -i`. Reject
     // it on commands that ignore it so users find out about the typo

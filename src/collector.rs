@@ -2,18 +2,42 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ffi::OsString;
-use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Instant, SystemTime};
 
 use rayon::prelude::*;
 
-use crate::agents::AgentPlugin;
+use crate::agents::{self, AgentPlugin};
 use crate::color;
 use crate::config;
 
+static EXCLUDE_ARCHIVED: AtomicBool = AtomicBool::new(false);
+
+/// Hide archived sessions from listings (`--no-archived`).
+pub fn init_exclude_archived(exclude: bool) {
+    EXCLUDE_ARCHIVED.store(exclude, AtomicOrdering::Relaxed);
+}
+
 /// Collect session files, sorted by mtime descending, limited to top N.
+/// Archived sessions are skipped when `--no-archived` is set.
 pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
+    collect(limit, EXCLUDE_ARCHIVED.load(AtomicOrdering::Relaxed))
+}
+
+/// Like `collect_files`, but always includes archived sessions (for lookups
+/// of an explicit session reference).
+pub fn collect_all_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
+    collect(limit, false)
+}
+
+/// Newest first; equal mtimes by path descending, so the order (and the copy
+/// an id lookup picks) is stable across runs.
+fn newest_first(a: &(PathBuf, SystemTime), b: &(PathBuf, SystemTime)) -> Ordering {
+    b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0))
+}
+
+fn collect(limit: usize, exclude_archived: bool) -> Vec<(PathBuf, SystemTime)> {
     let debug = color::is_debug();
     let t0 = if debug { Some(Instant::now()) } else { None };
 
@@ -69,7 +93,9 @@ pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
                     Some(sessions) => {
                         for (session, mtime) in sessions {
                             // An unowned copy must not win over a good one.
-                            if !owned(&session) {
+                            if !owned(&session)
+                                || (exclude_archived && plugin.is_archived(&session))
+                            {
                                 continue;
                             }
                             let key = (
@@ -99,13 +125,22 @@ pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
     let all_paths: HashSet<PathBuf> = per_pattern.into_iter().flatten().collect();
     let unique_count = all_paths.len();
 
-    // Parallel stat
+    // Parallel stat. The plugin the file is attributed to decides the
+    // session's mtime (e.g. Copilot's events.jsonl is newer than the
+    // workspace.yaml the glob matched), so time filters, `-n` and project
+    // dates agree with `modified_at`.
     let mut entries: Vec<(PathBuf, SystemTime)> = all_paths
         .into_par_iter()
         .filter_map(|path| {
-            fs::metadata(&path)
-                .ok()
-                .and_then(|meta| meta.modified().ok().map(|mtime| (path, mtime)))
+            let plugin = config::find_plugin_for_path(&path);
+            // No active owner (e.g. a file attributed to a disabled agent):
+            // it could not be parsed, and disabled agents stay hidden.
+            if plugin.id() == agents::unknown_plugin().id()
+                || (exclude_archived && plugin.is_archived(&path))
+            {
+                return None;
+            }
+            plugin.session_mtime(&path).map(|mtime| (path, mtime))
         })
         .collect();
     let mut virtual_entries: Vec<_> = virtual_entries.into_values().collect();
@@ -129,7 +164,7 @@ pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
     // No limit: sort and return all
     if limit == 0 || limit >= entries.len() {
         let mut sorted = entries;
-        sorted.sort_by_key(|e| std::cmp::Reverse(e.1));
+        sorted.sort_by(newest_first);
         return sorted;
     }
 
@@ -167,6 +202,6 @@ pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
     }
 
     let mut result: Vec<_> = heap.into_iter().map(|e| (e.path, e.mtime)).collect();
-    result.sort_by_key(|e| std::cmp::Reverse(e.1));
+    result.sort_by(newest_first);
     result
 }
