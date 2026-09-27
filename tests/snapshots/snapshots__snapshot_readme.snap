@@ -121,7 +121,7 @@ gemini           5  2026-03-21 10:50
 | Grok | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | opencode | ✓ | ✓ | ✓ | ✓ | | |
 
-Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.json` (checking `procStart` so a reused PID is not reported), Grok's `active_sessions.json`, Copilot's `session-state/<id>/inuse.<pid>.lock`, and Codex's `thread-writer-locks/<id>.lock`. ¹ Codex is detected on Linux only, from the kernel lock table (`/proc/locks`); its PID is the lock holder, which for the interactive TUI is the Codex app-server.
+Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.json` (checking `procStart` so a reused PID is not reported), Grok's `active_sessions.json`, Copilot's `session-state/<id>/inuse.<pid>.lock`, and Codex's `thread-writer-locks/<id>.lock`. ¹ Codex is detected on Linux only, from the kernel lock table (`/proc/locks`); its PID is the lock holder, which for the interactive TUI is the Codex app-server. Running detection needs a PID liveness check, which is not implemented on Windows.
 
 ## Features
 

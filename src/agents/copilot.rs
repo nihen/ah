@@ -207,7 +207,8 @@ impl AgentPlugin for CopilotPlugin {
     }
 
     fn can_detect_running(&self) -> bool {
-        true
+        // Needs a pid liveness check, which is only implemented on Unix.
+        cfg!(unix)
     }
 
     fn project_desc(&self) -> &'static str {
