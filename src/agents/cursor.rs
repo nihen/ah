@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use regex::Regex;
 
@@ -8,12 +9,20 @@ use super::AgentPlugin;
 use super::Message;
 use super::common::first_text_part;
 use super::common::for_each_jsonl_value;
+use super::common::is_safe_cli_id;
 use super::common::tagged_user_body;
 
 static RE_CURSOR_PROJECTS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r".*/projects/([^/]+)/.*").unwrap());
 
 static DECODE_CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Child names per directory, shared by every decode in this process so that
+/// common ancestors (`/`, the home directory, ...) are listed only once.
+/// `None` records a directory that could not be listed.
+type DirListing = Option<Arc<Vec<OsString>>>;
+static LISTING_CACHE: LazyLock<Mutex<HashMap<PathBuf, DirListing>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Decode Cursor's dash-encoded directory name to an actual filesystem path.
@@ -35,7 +44,7 @@ fn decode_cursor_path(encoded: &str) -> Option<String> {
 /// Encode one path component the way Cursor does: every run of characters
 /// other than ASCII letters and digits becomes a single `-`, and leading or
 /// trailing dashes are dropped (so `.claude` → `claude`, `pce_flutter` →
-/// `pce-flutter`).
+/// `pce-flutter`, `日本語` → ``).
 fn encode_cursor_component(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
@@ -56,69 +65,181 @@ fn encode_cursor_component(name: &str) -> String {
 /// The encoding is lossy (`/`, `.`, `_` and `-` all become `-`), so the path
 /// is rebuilt by walking the filesystem: at each level, a child directory
 /// whose encoded name is a dash-bounded prefix of the remaining string is
-/// descended into, backtracking on dead ends. When the directory no longer
-/// exists (e.g. a removed worktree), the deepest existing ancestor is kept
-/// and the undecodable rest is appended as a single component so that the
-/// project name stays readable.
+/// descended into, backtracking on dead ends. The longest match is tried
+/// first, so when both `foo-bar` and `foo/bar` exist as complete matches,
+/// `foo-bar` wins; the encoding cannot tell them apart.
+///
+/// When the directory no longer exists (e.g. a removed worktree), the deepest
+/// existing ancestor is kept and the undecodable rest is appended as a single
+/// component so that the project name stays readable. When not even the first
+/// component exists (a tree from another machine), every `-` is read as `/`.
 fn decode_cursor_path_inner(root: &Path, encoded: &str) -> Option<String> {
     let encoded = encoded.trim_matches('-');
     if encoded.is_empty() {
         return None;
     }
-    let mut best: (usize, PathBuf) = (0, root.to_path_buf());
-    if let Some(found) = walk_encoded(root, encoded, encoded.len(), &mut best, 0) {
-        // Resolve symlinks (e.g. `/home/user` → `/data/home/user`) so the
-        // result matches the canonicalized cwd filter.
-        let found = std::fs::canonicalize(&found).unwrap_or(found);
-        return Some(found.to_string_lossy().into_owned());
+    let mut best = (0, root.to_path_buf());
+    // Names that encode to nothing can hide a large subtree, so they are
+    // only entered when the ordinary walk finds nothing.
+    for zero_width in [false, true] {
+        let mut walk = Walk {
+            total: encoded.len(),
+            best,
+            seen: HashMap::new(),
+            budget: MAX_DECODE_VISITS,
+            zero_width,
+        };
+        if let Some(found) = walk.descend(root, encoded, 0) {
+            // Resolve symlinks (e.g. `/home/user` → `/data/home/user`) so the
+            // result matches the canonicalized cwd filter.
+            let found = std::fs::canonicalize(&found).unwrap_or(found);
+            return Some(found.to_string_lossy().into_owned());
+        }
+        best = walk.best;
     }
     let (consumed, dir) = best;
+    if consumed == 0 {
+        return Some(
+            root.join(encoded.replace('-', "/"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
     let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
     let rest = encoded[consumed..].trim_start_matches('-');
     Some(dir.join(rest).to_string_lossy().into_owned())
 }
 
-const MAX_DECODE_DEPTH: usize = 32;
+/// Guard against runaway recursion through components that consume no input
+/// (names without ASCII alphanumerics); ordinary components always consume.
+const MAX_DECODE_DEPTH: usize = 256;
+/// Upper bound on directories entered per decode.
+const MAX_DECODE_VISITS: usize = 10_000;
+/// Components probed per level when a directory cannot be listed.
+const MAX_PROBE_TOKENS: usize = 6;
 
-fn walk_encoded(
-    dir: &Path,
-    rest: &str,
+struct Walk {
     total: usize,
-    best: &mut (usize, PathBuf),
-    depth: usize,
-) -> Option<PathBuf> {
-    if depth >= MAX_DECODE_DEPTH {
-        return None;
-    }
-    let mut candidates: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .filter_map(|e| {
-            let enc = encode_cursor_component(&e.file_name().to_string_lossy());
-            let matches = !enc.is_empty()
-                && rest.starts_with(&enc)
-                && matches!(rest.as_bytes().get(enc.len()), None | Some(b'-'));
-            // `Path::is_dir` follows symlinks, so `/home` → `/data/home` counts.
-            (matches && e.path().is_dir()).then(|| (enc, e.path()))
-        })
-        .collect();
-    // Prefer the longest match (fewest components); ties broken by path for
-    // deterministic output.
-    candidates.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.1.cmp(&b.1)));
-    for (enc, path) in candidates {
-        let remaining = rest[enc.len()..].trim_start_matches('-');
-        if remaining.is_empty() {
-            return Some(path);
-        }
-        let consumed = total - remaining.len();
-        if consumed > best.0 {
-            *best = (consumed, path.clone());
-        }
-        if let Some(found) = walk_encoded(&path, remaining, total, best, depth + 1) {
-            return Some(found);
+    /// Deepest existing directory reached: (bytes of input consumed, path).
+    best: (usize, PathBuf),
+    /// (directory identity, remaining length) states already explored, with
+    /// the shallowest depth they were entered from.
+    seen: HashMap<(DirId, usize), usize>,
+    budget: usize,
+    /// Whether names without ASCII alphanumerics may be entered.
+    zero_width: bool,
+}
+
+#[cfg(unix)]
+type DirId = (u64, u64);
+#[cfg(not(unix))]
+type DirId = PathBuf;
+
+#[cfg(unix)]
+fn dir_id(_path: &Path, meta: &std::fs::Metadata) -> Option<DirId> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn dir_id(path: &Path, _meta: &std::fs::Metadata) -> Option<DirId> {
+    std::fs::canonicalize(path).ok()
+}
+
+fn list_dir(dir: &Path) -> DirListing {
+    if let Ok(cache) = LISTING_CACHE.lock() {
+        if let Some(listing) = cache.get(dir) {
+            return listing.clone();
         }
     }
-    None
+    let listing = std::fs::read_dir(dir)
+        .ok()
+        .map(|entries| Arc::new(entries.flatten().map(|e| e.file_name()).collect()));
+    if let Ok(mut cache) = LISTING_CACHE.lock() {
+        cache.insert(dir.to_path_buf(), listing.clone());
+    }
+    listing
+}
+
+/// Candidate names for a directory that can be searched but not listed
+/// (mode `--x`): the next few tokens joined by every combination of the
+/// separators Cursor folds into `-`, with and without a leading `.`.
+fn probe_names(rest: &str) -> Vec<OsString> {
+    let tokens: Vec<&str> = rest.split('-').take(MAX_PROBE_TOKENS).collect();
+    let mut names = Vec::new();
+    let mut prefixes = vec![tokens[0].to_string()];
+    for (i, token) in tokens.iter().enumerate() {
+        if i > 0 {
+            prefixes = prefixes
+                .iter()
+                .flat_map(|p| ["-", "_", "."].map(|sep| format!("{p}{sep}{token}")))
+                .collect();
+        }
+        for name in &prefixes {
+            names.push(OsString::from(format!(".{name}")));
+            names.push(OsString::from(name));
+        }
+    }
+    names
+}
+
+impl Walk {
+    fn descend(&mut self, dir: &Path, rest: &str, depth: usize) -> Option<PathBuf> {
+        if depth >= MAX_DECODE_DEPTH || self.budget == 0 {
+            return None;
+        }
+        self.budget -= 1;
+        let names = list_dir(dir).unwrap_or_else(|| Arc::new(probe_names(rest)));
+        let mut candidates: Vec<(String, PathBuf, Option<DirId>)> = names
+            .iter()
+            .filter_map(|name| {
+                let enc = encode_cursor_component(&name.to_string_lossy());
+                // A name without ASCII alphanumerics (`日本語`, `_`) leaves no
+                // trace in the encoding: it consumes nothing.
+                let matches = (enc.is_empty() && self.zero_width)
+                    || (!enc.is_empty()
+                        && rest.starts_with(&enc)
+                        && matches!(rest.as_bytes().get(enc.len()), None | Some(b'-')));
+                if !matches {
+                    return None;
+                }
+                // `metadata` follows symlinks, so `/home/user` → `/data/home/user`
+                // counts. Continue from the resolved path so that chains of
+                // symlinks never pile up (and hit the kernel's loop limit).
+                let path = dir.join(name);
+                let meta = std::fs::metadata(&path).ok().filter(|m| m.is_dir())?;
+                let path = std::fs::canonicalize(&path).unwrap_or(path);
+                let id = dir_id(&path, &meta);
+                Some((enc, path, id))
+            })
+            .collect();
+        // Longest match first (fewest components), zero-width names last;
+        // ties broken by path for deterministic output.
+        candidates.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.1.cmp(&b.1)));
+        for (enc, path, id) in candidates {
+            let remaining = rest[enc.len()..].trim_start_matches('-');
+            if remaining.is_empty() && !enc.is_empty() {
+                return Some(path);
+            }
+            // A state explored before has failed (success returns at once),
+            // unless the depth limit cut that attempt shorter than this one.
+            if let Some(id) = id {
+                let depth_seen = self.seen.entry((id, remaining.len())).or_insert(usize::MAX);
+                if *depth_seen <= depth {
+                    continue;
+                }
+                *depth_seen = depth;
+            }
+            let consumed = self.total - remaining.len();
+            if consumed > self.best.0 {
+                self.best = (consumed, path.clone());
+            }
+            if let Some(found) = self.descend(&path, remaining, depth + 1) {
+                return Some(found);
+            }
+        }
+        None
+    }
 }
 
 pub static PLUGIN: CursorPlugin = CursorPlugin;
@@ -196,6 +317,7 @@ impl AgentPlugin for CursorPlugin {
     fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
         path.file_stem()
             .map(|stem| stem.to_string_lossy().to_string())
+            .filter(|id| is_safe_cli_id(id))
     }
 
     fn resume_args(&self, path: &Path, home: &Path) -> Option<Vec<String>> {
@@ -300,5 +422,132 @@ mod tests {
             )
             .unwrap();
         assert_eq!(args, ["cursor-agent", "--resume", "abc"]);
+    }
+
+    #[test]
+    fn resume_id_rejects_option_like_stems() {
+        let path = Path::new("/h/.cursor/projects/p/agent-transcripts/--yolo.jsonl");
+        assert_eq!(PLUGIN.resolve_resume_id(path, Path::new("/h")), None);
+    }
+
+    #[test]
+    fn decode_empty_is_none() {
+        let (_tmp, root) = temp_root();
+        assert_eq!(decode_cursor_path_inner(&root, ""), None);
+        assert_eq!(decode_cursor_path_inner(&root, "---"), None);
+    }
+
+    #[test]
+    fn decode_unknown_tree_reads_dashes_as_slashes() {
+        let (_tmp, root) = temp_root();
+        assert_eq!(
+            decode(&root, "Users-u-src-ah"),
+            root.join("Users/u/src/ah").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn decode_prefers_longest_component_on_ambiguous_leaf() {
+        let (_tmp, root) = temp_root();
+        mkdirs(&root, &["p/foo/bar", "p/foo-bar"]);
+        assert_eq!(
+            decode(&root, "p-foo-bar"),
+            root.join("p/foo-bar").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn decode_descends_through_dirs_without_ascii_alphanumerics() {
+        let (_tmp, root) = temp_root();
+        mkdirs(&root, &["Users/u/日本語/深い/leaf", "a/_/b"]);
+        assert_eq!(
+            decode(&root, "Users-u-leaf"),
+            root.join("Users/u/日本語/深い/leaf").to_string_lossy()
+        );
+        assert_eq!(decode(&root, "a-b"), root.join("a/_/b").to_string_lossy());
+    }
+
+    #[test]
+    fn decode_prefers_paths_without_zero_width_names() {
+        let (_tmp, root) = temp_root();
+        mkdirs(&root, &["p-foo/日本/bar", "p/foo/bar"]);
+        assert_eq!(
+            decode(&root, "p-foo-bar"),
+            root.join("p/foo/bar").to_string_lossy()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decode_probes_through_unlistable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, root) = temp_root();
+        mkdirs(&root, &["locked/my_proj.v2/.hidden"]);
+        let locked = root.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let got = decode(&root, "locked-my-proj-v2-hidden");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            got,
+            root.join("locked/my_proj.v2/.hidden").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn decode_handles_deep_paths() {
+        let (_tmp, root) = temp_root();
+        let rel = vec!["a"; 40].join("/");
+        mkdirs(&root, &[rel.as_str()]);
+        assert_eq!(
+            decode(&root, &vec!["a"; 40].join("-")),
+            root.join(&rel).to_string_lossy()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decode_does_not_re_explore_symlink_cycles() {
+        let (_tmp, root) = temp_root();
+        mkdirs(&root, &["P"]);
+        // `a` and `a_` both encode to `a` and lead back to `P`.
+        std::os::unix::fs::symlink(root.join("P"), root.join("P/a")).unwrap();
+        std::os::unix::fs::symlink(root.join("P"), root.join("P/a_")).unwrap();
+        let started = std::time::Instant::now();
+        let got = decode(&root, &format!("P-{}missing", "a-".repeat(24)));
+        assert!(got.ends_with("missing"), "{got}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decode_reenters_states_cut_short_by_the_depth_limit() {
+        let (_tmp, root) = temp_root();
+        mkdirs(&root, &["p/x/日本/leaf"]);
+        let mut chain = root.join("p-x");
+        std::fs::create_dir(&chain).unwrap();
+        for _ in 0..253 {
+            chain.push("_");
+            std::fs::create_dir(&chain).unwrap();
+        }
+        std::os::unix::fs::symlink(root.join("p/x"), chain.join("_")).unwrap();
+        assert_eq!(
+            decode(&root, "p-x-leaf"),
+            root.join("p/x/日本/leaf").to_string_lossy()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decode_follows_long_symlink_chains() {
+        let (_tmp, root) = temp_root();
+        mkdirs(&root, &["P/leaf"]);
+        // `a_` points back to `P`; `a` points to `a_`. Following either many
+        // times would exceed the kernel's symlink limit on an unresolved path.
+        std::os::unix::fs::symlink(".", root.join("P/a_")).unwrap();
+        std::os::unix::fs::symlink("a_", root.join("P/a")).unwrap();
+        assert_eq!(
+            decode(&root, &format!("P-{}leaf", "a-".repeat(45))),
+            root.join("P/leaf").to_string_lossy()
+        );
     }
 }
