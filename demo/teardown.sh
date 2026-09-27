@@ -8,6 +8,6 @@ unset CLAUDE_CONFIG_DIR
 unset CODEX_HOME
 unset GEMINI_CLI_HOME
 unset COPILOT_HOME
-unset CURSOR_CONFIG_DIR
+unset CURSOR_DATA_DIR
 
 echo "Demo data removed and env vars unset."

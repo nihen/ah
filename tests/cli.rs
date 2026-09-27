@@ -364,7 +364,7 @@ fn log_interactive_with_o_emits_field_tsv_after_selection() {
         .env("CLAUDE_CONFIG_DIR", "/nonexistent")
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
-        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env("CURSOR_DATA_DIR", "/nonexistent")
         .env_remove("XDG_DATA_HOME")
         .args([
             "log",
@@ -498,7 +498,7 @@ fn log_interactive_display_overrides_picker_columns() {
         .env("CLAUDE_CONFIG_DIR", "/nonexistent")
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
-        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env("CURSOR_DATA_DIR", "/nonexistent")
         .env_remove("XDG_DATA_HOME")
         .args([
             "log",
@@ -550,7 +550,7 @@ fn show_interactive_display_allows_matched() {
         .env("CLAUDE_CONFIG_DIR", "/nonexistent")
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
-        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env("CURSOR_DATA_DIR", "/nonexistent")
         .env_remove("XDG_DATA_HOME")
         .args([
             "show",
@@ -621,7 +621,7 @@ fn show_interactive_with_o_emits_field_tsv_after_selection() {
         .env("CLAUDE_CONFIG_DIR", "/nonexistent")
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
-        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env("CURSOR_DATA_DIR", "/nonexistent")
         .env_remove("XDG_DATA_HOME")
         .args([
             "show",
@@ -703,7 +703,7 @@ fn cursor_session_matches_cwd_filter_and_resumes_interactively() {
             .env("CODEX_HOME", "/nonexistent")
             .env("GEMINI_CLI_HOME", "/nonexistent")
             .env("COPILOT_HOME", "/nonexistent")
-            .env("CURSOR_CONFIG_DIR", home.join(".cursor"))
+            .env("CURSOR_DATA_DIR", home.join(".cursor"))
             .env_remove("XDG_DATA_HOME")
             .args(args)
             .write_stdin("")
@@ -722,6 +722,51 @@ fn cursor_session_matches_cwd_filter_and_resumes_interactively() {
             "cd '{}' && 'cursor-agent' '--resume' 'sess-1'\n",
             project.display()
         )
+    );
+}
+
+#[test]
+fn cursor_sessions_follow_cursor_data_dir_not_config_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let project = home.join("work/app");
+    fs::create_dir_all(&project).unwrap();
+    let place = |base: &std::path::Path, id: &str| {
+        let dir = base
+            .join("projects")
+            .join(cursor_slug(&project))
+            .join("agent-transcripts")
+            .join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::copy(
+            fixture_path("cursor_session.jsonl"),
+            dir.join(format!("{id}.jsonl")),
+        )
+        .unwrap();
+    };
+    let data_dir = home.join("cursor-data");
+    let config_dir = home.join("cursor-config");
+    place(&data_dir, "in-data-dir");
+    place(&config_dir, "in-config-dir");
+    place(&home.join(".cursor"), "in-default-dir");
+
+    let assert = ah()
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("CLAUDE_CONFIG_DIR", "/nonexistent")
+        .env("CODEX_HOME", "/nonexistent")
+        .env("GEMINI_CLI_HOME", "/nonexistent")
+        .env("COPILOT_HOME", "/nonexistent")
+        .env("CURSOR_DATA_DIR", &data_dir)
+        .env("CURSOR_CONFIG_DIR", &config_dir)
+        .env_remove("XDG_DATA_HOME")
+        .args(["log", "-o", "agent,id", "--tsv"])
+        .write_stdin("")
+        .assert()
+        .success();
+    assert_eq!(
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap(),
+        "cursor\tin-data-dir\n"
     );
 }
 
@@ -806,7 +851,7 @@ fn ah_opencode(home: &Path) -> Command {
         .env("CODEX_HOME", "/nonexistent")
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
-        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env("CURSOR_DATA_DIR", "/nonexistent")
         .env("GROK_HOME", "/nonexistent");
     cmd
 }
@@ -1623,4 +1668,218 @@ fn no_archived_uses_the_attributed_agent() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("No sessions found"));
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_matches_underscore_cwd_dedups_and_lists_shared_agents_md() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let project = home.join("work/my_app");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("AGENTS.md"), "shared rules\n").unwrap();
+    // Another path to the same project, even with a different basename, must
+    // match through its session's cwd and not list the project twice.
+    let link = home.join("alias_app");
+    std::os::unix::fs::symlink(&project, &link).unwrap();
+
+    let claude = home.join(".claude");
+    let encode = |p: &Path| {
+        p.to_string_lossy()
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+    };
+    let encoded_dir = claude.join("projects").join(encode(&project));
+    let link_dir = claude.join("projects").join(encode(&link));
+    for (dir, cwd) in [(&encoded_dir, &project), (&link_dir, &link)] {
+        fs::create_dir_all(dir.join("memory")).unwrap();
+        fs::write(
+            dir.join("s.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+    }
+    fs::write(
+        encoded_dir.join("memory/note.md"),
+        "---\nname: \"note\"\ndescription: \"quoted desc\"\ntype: feedback\n---\nbody\n",
+    )
+    .unwrap();
+    fs::write(
+        link_dir.join("memory/other.md"),
+        "---\nname: other\ndescription: 'it''s'\ntype: project\n---\nbody\n",
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| {
+        let assert = ah()
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("CODEX_HOME", "/nonexistent")
+            .env("GEMINI_CLI_HOME", "/nonexistent")
+            .env("COPILOT_HOME", "/nonexistent")
+            .env("CURSOR_CONFIG_DIR", "/nonexistent")
+            .env_remove("XDG_DATA_HOME")
+            .args(args)
+            .write_stdin("")
+            .assert()
+            .success();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    };
+
+    let mut rows: Vec<String> = run(&["memory", "--tsv", "-o", "agent,project,name,description"])
+        .lines()
+        .map(String::from)
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            "claude\tmy_app\tnote\tquoted desc",
+            "claude\tmy_app\tother\tit's",
+            "shared\tmy_app\tAGENTS.md\t",
+        ]
+    );
+
+    let all = run(&["memory", "-a", "--tsv", "-o", "agent,name"]);
+    assert_eq!(all.matches("AGENTS.md").count(), 1, "{all}");
+
+    assert_eq!(
+        run(&["memory", "--agent", "codex", "--tsv", "-o", "agent,name"]),
+        "shared\tAGENTS.md\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_keeps_project_attribution_for_symlinked_files() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let claude = home.join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    let a = home.join("work/project_a");
+    let b = home.join("work/project_b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    // Project CLAUDE.md is a symlink to the global one.
+    fs::write(claude.join("CLAUDE.md"), "global rules\n").unwrap();
+    std::os::unix::fs::symlink(claude.join("CLAUDE.md"), a.join("CLAUDE.md")).unwrap();
+    // Two projects share one real AGENTS.md.
+    fs::write(home.join("AGENTS.md"), "shared rules\n").unwrap();
+    std::os::unix::fs::symlink(home.join("AGENTS.md"), a.join("AGENTS.md")).unwrap();
+    std::os::unix::fs::symlink(home.join("AGENTS.md"), b.join("AGENTS.md")).unwrap();
+    // Sessions so that -a discovers both projects.
+    for (i, p) in [&a, &b].into_iter().enumerate() {
+        let dir = claude.join(format!("projects/p{i}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("s.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n",
+                p.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    let run = |dir: &Path, args: &[&str]| {
+        let assert = ah()
+            .current_dir(dir)
+            .env("HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("CODEX_HOME", "/nonexistent")
+            .env("GEMINI_CLI_HOME", "/nonexistent")
+            .env("COPILOT_HOME", "/nonexistent")
+            .env("CURSOR_CONFIG_DIR", "/nonexistent")
+            .env_remove("XDG_DATA_HOME")
+            .args(args)
+            .write_stdin("")
+            .assert()
+            .success();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    };
+
+    let mut rows: Vec<String> = run(&a, &["memory", "--tsv", "-o", "agent,project,name"])
+        .lines()
+        .map(String::from)
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            "claude\tproject_a\tCLAUDE.md",
+            "shared\tproject_a\tAGENTS.md"
+        ]
+    );
+    // Stable across runs: each project keeps its own AGENTS.md row.
+    for _ in 0..5 {
+        assert_eq!(
+            run(
+                &a,
+                &[
+                    "memory",
+                    "-a",
+                    "--project",
+                    "project_b",
+                    "--tsv",
+                    "-o",
+                    "name"
+                ]
+            ),
+            "AGENTS.md\n"
+        );
+    }
+}
+
+#[test]
+fn memory_project_cwd_skips_sessions_without_cwd() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    // Long enough for Claude Code to truncate the encoded name and add a hash.
+    let project = home.join(format!("work/{}/my_app", "d".repeat(220)));
+    fs::create_dir_all(&project).unwrap();
+    let claude = home.join(".claude");
+    let encoded: String = project
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let dir = claude
+        .join("projects")
+        .join(format!("{}-1a2b3c", &encoded[..200]));
+    fs::create_dir_all(dir.join("memory")).unwrap();
+    fs::write(
+        dir.join("old.jsonl"),
+        format!(
+            "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n",
+            project.display()
+        ),
+    )
+    .unwrap();
+    // A newer session without a cwd (e.g. still being written).
+    fs::write(dir.join("new.jsonl"), "{\"type\":\"summary\"}\n").unwrap();
+    let old = fs::File::open(dir.join("old.jsonl")).unwrap();
+    old.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+        .unwrap();
+    fs::write(
+        dir.join("memory/note.md"),
+        "---\nname: note\ntype: feedback\n---\nbody\n",
+    )
+    .unwrap();
+
+    ah().current_dir(&project)
+        .env("HOME", &home)
+        .env("CLAUDE_CONFIG_DIR", &claude)
+        .env("CODEX_HOME", "/nonexistent")
+        .env("GEMINI_CLI_HOME", "/nonexistent")
+        .env("COPILOT_HOME", "/nonexistent")
+        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env_remove("XDG_DATA_HOME")
+        .args(["memory", "--tsv", "-o", "project,name"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("my_app\tnote\n");
 }

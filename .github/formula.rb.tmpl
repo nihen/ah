@@ -7,14 +7,22 @@ class Ah < Formula
   on_macos do
     on_arm do
       url "${BASE_URL}/ah-darwin-arm64"
-      sha256 "${SHA_DARWIN}"
+      sha256 "${SHA_DARWIN_ARM64}"
+    end
+    on_intel do
+      url "${BASE_URL}/ah-darwin-x86_64"
+      sha256 "${SHA_DARWIN_X86_64}"
     end
   end
 
   on_linux do
+    on_arm do
+      url "${BASE_URL}/ah-linux-arm64"
+      sha256 "${SHA_LINUX_ARM64}"
+    end
     on_intel do
       url "${BASE_URL}/ah-linux-x86_64"
-      sha256 "${SHA_LINUX}"
+      sha256 "${SHA_LINUX_X86_64}"
     end
   end
 

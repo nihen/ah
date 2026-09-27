@@ -17,7 +17,7 @@ export CLAUDE_CONFIG_DIR="$DEMO_ROOT/.claude"
 export CODEX_HOME="$DEMO_ROOT/.codex"
 export GEMINI_CLI_HOME="$DEMO_ROOT/.gemini"
 export COPILOT_HOME="$DEMO_ROOT/.copilot"
-export CURSOR_CONFIG_DIR="$DEMO_ROOT/.cursor"
+export CURSOR_DATA_DIR="$DEMO_ROOT/.cursor"
 
 # Pre-configure Claude Code to skip first-run setup
 mkdir -p "$CLAUDE_CONFIG_DIR"
@@ -466,7 +466,7 @@ for i in $(seq 0 $(( ${#CURSOR_DATA[@]} - 1 ))); do
   uuid="${UUIDS[$i]}"
   ts=$(make_ts "$S_DAYS" "$S_HOUR" "$S_MIN")
 
-  proj_dir="$CURSOR_CONFIG_DIR/projects/${PROJECT_ENCODED[$S_PROJ]}/agent-transcripts"
+  proj_dir="$CURSOR_DATA_DIR/projects/${PROJECT_ENCODED[$S_PROJ]}/agent-transcripts"
   mkdir -p "$proj_dir"
   file="$proj_dir/${uuid}.jsonl"
 
@@ -481,7 +481,7 @@ echo "  Claude:  $(find "$CLAUDE_CONFIG_DIR" -name '*.jsonl' | wc -l | tr -d ' '
 echo "  Codex:   $(find "$CODEX_HOME/sessions" -name '*.jsonl' | wc -l | tr -d ' ') sessions" >&2
 echo "  Gemini:  $(find "$GEMINI_CLI_HOME" -name '*.json' | wc -l | tr -d ' ') sessions" >&2
 echo "  Copilot: $(find "$COPILOT_HOME" -name 'workspace.yaml' | wc -l | tr -d ' ') sessions" >&2
-echo "  Cursor:  $(find "$CURSOR_CONFIG_DIR" -name '*.jsonl' | wc -l | tr -d ' ') sessions" >&2
+echo "  Cursor:  $(find "$CURSOR_DATA_DIR" -name '*.jsonl' | wc -l | tr -d ' ') sessions" >&2
 echo ""
 
 # When run with bash (not sourced), print export commands for eval
@@ -491,7 +491,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   echo "export CODEX_HOME=$CODEX_HOME"
   echo "export GEMINI_CLI_HOME=$GEMINI_CLI_HOME"
   echo "export COPILOT_HOME=$COPILOT_HOME"
-  echo "export CURSOR_CONFIG_DIR=$CURSOR_CONFIG_DIR"
+  echo "export CURSOR_DATA_DIR=$CURSOR_DATA_DIR"
   echo "export AH_COLOR=1"
 fi
 echo "Run 'ah log -a' to verify." >&2
