@@ -664,6 +664,67 @@ fn resume_print_appends_extra_args() {
         ));
 }
 
+/// Cursor's project directory name for `path`: runs of non-alphanumerics
+/// become one `-`, with leading and trailing dashes trimmed.
+fn cursor_slug(path: &std::path::Path) -> String {
+    let mut out = String::new();
+    for c in path.to_string_lossy().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+#[test]
+fn cursor_session_matches_cwd_filter_and_resumes_interactively() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let project = home.join("work/my_proj.v2");
+    fs::create_dir_all(&project).unwrap();
+    let transcripts = home
+        .join(".cursor/projects")
+        .join(cursor_slug(&project))
+        .join("agent-transcripts/sess-1");
+    fs::create_dir_all(&transcripts).unwrap();
+    fs::copy(
+        fixture_path("cursor_session.jsonl"),
+        transcripts.join("sess-1.jsonl"),
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| {
+        let assert = ah()
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", "/nonexistent")
+            .env("CODEX_HOME", "/nonexistent")
+            .env("GEMINI_CLI_HOME", "/nonexistent")
+            .env("COPILOT_HOME", "/nonexistent")
+            .env("CURSOR_CONFIG_DIR", home.join(".cursor"))
+            .env_remove("XDG_DATA_HOME")
+            .args(args)
+            .write_stdin("")
+            .assert()
+            .success();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    };
+
+    assert_eq!(
+        run(&["log", "-o", "agent,project,id", "--tsv"]),
+        "cursor\tmy_proj.v2\tsess-1\n"
+    );
+    assert_eq!(
+        run(&["resume", "--print"]),
+        format!(
+            "cd '{}' && 'cursor-agent' '--resume' 'sess-1'\n",
+            project.display()
+        )
+    );
+}
+
 #[test]
 fn log_invalid_regex() {
     ah().args(["log", "-a", "-q", "[invalid"])
