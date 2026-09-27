@@ -954,3 +954,78 @@ fn custom_agent_with_home_wide_marker_keeps_default_agent_sessions() {
         .success()
         .stdout("rollout-2026-03-24T20-43-12-codex-sess-001\n");
 }
+
+// ─── Copilot ───────────────────────────────────────────────────────
+
+#[test]
+fn copilot_title_time_and_resume() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let state = home.join(".copilot/session-state");
+    let named = state.join("cp-named");
+    fs::create_dir_all(&named).unwrap();
+    fs::copy(
+        fixture_path("copilot_workspace.yaml"),
+        named.join("workspace.yaml"),
+    )
+    .unwrap();
+    fs::copy(
+        fixture_path("copilot_events.jsonl"),
+        named.join("events.jsonl"),
+    )
+    .unwrap();
+    // A session that was opened but never got an events.jsonl.
+    let empty = state.join("cp-empty");
+    fs::create_dir_all(&empty).unwrap();
+    fs::write(
+        empty.join("workspace.yaml"),
+        "id: cp-empty\ncwd: /nonexistent/proj\ncreated_at: 2026-09-27T02:00:00.000Z\n",
+    )
+    .unwrap();
+
+    let run = || {
+        let mut cmd = ah_opencode(&home);
+        cmd.env_remove("COPILOT_HOME").env("TZ", "Asia/Tokyo");
+        cmd
+    };
+
+    // created_at is UTC in workspace.yaml and shown in local time.
+    run()
+        .args([
+            "log",
+            "-a",
+            "-o",
+            "id,title,created_at",
+            "-S",
+            "id",
+            "--asc",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            "cp-empty\tcp-empty\t2026-09-27 11:00\n\
+             cp-named\tFix the 'parser'\t2026-09-27 11:34\n",
+        );
+
+    run()
+        .args(["log", "-a", "-q", "copilot-needle", "-o", "id"])
+        .assert()
+        .success()
+        .stdout("cp-named\n");
+
+    // Tool-call-only assistant turns (empty content) are not shown.
+    run()
+        .args(["show", "--json", "cp-named"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("please fix the parser"))
+        .stdout(predicate::str::contains(r#""role":"assistant""#).count(1));
+
+    run()
+        .args(["resume", "--print", "cp-named"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("cd '/nonexistent/proj' && 'copilot' '--resume=cp-named'\n");
+}
