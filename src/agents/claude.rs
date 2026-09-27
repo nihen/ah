@@ -41,49 +41,53 @@ impl ClaudePlugin {
         None
     }
 
+    /// Value of `field` in the latest `record_type` record within the tail of
+    /// the session, or `None` when that record is missing or its value is
+    /// empty. Title records always start a line with their `type` key, so
+    /// anchoring the needle there never matches message text.
+    fn latest_record_value(data: &[u8], record_type: &str, field: &str) -> Option<String> {
+        let needle = format!("\n{{\"type\":\"{record_type}\"");
+        let finder = memmem::FinderRev::new(needle.as_bytes());
+        let tail_start = data.len().saturating_sub(TITLE_SCAN_TAIL_BYTES);
+        // Start one byte early so a line beginning exactly at `tail_start`
+        // still has its preceding newline inside the searched range.
+        let search_start = tail_start.saturating_sub(1);
+        let mut end = data.len();
+        let mut line_starts = std::iter::from_fn(|| {
+            let rel_pos = finder.rfind(&data[search_start..end])?;
+            end = search_start + rel_pos;
+            Some(end + 1)
+        })
+        .chain((tail_start == 0 && data.starts_with(&needle.as_bytes()[1..])).then_some(0));
+        line_starts.find_map(|line_start| {
+            let line_end = memchr::memchr(b'\n', &data[line_start..])
+                .map(|idx| line_start + idx)
+                .unwrap_or(data.len());
+            // A line that fails to parse (e.g. still being appended) is
+            // skipped in favor of the previous record.
+            let val =
+                serde_json::from_slice::<serde_json::Value>(&data[line_start..line_end]).ok()?;
+            if val.get("type").and_then(|v| v.as_str()) != Some(record_type) {
+                return None;
+            }
+            Some(
+                val.get(field)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            )
+        })?
+    }
+
     /// Title priority: user-set custom title, then the title Claude Code
     /// generates, then the first user prompt. Claude Code re-appends title
-    /// records after each turn, so the last one of each kind is current and
-    /// sits near the end of the file; one backward pass over the tail finds
-    /// both.
+    /// records after each turn, so the latest one of each kind is current
+    /// and sits near the end of the file.
     fn extract_title_from_bytes(data: &[u8]) -> Option<String> {
-        let finder = memmem::FinderRev::new(b"-title\"");
-        let tail_start = data.len().saturating_sub(TITLE_SCAN_TAIL_BYTES);
-        let mut end = data.len();
-        let mut ai_title = None;
-        while let Some(rel_pos) = finder.rfind(&data[tail_start..end]) {
-            let pos = tail_start + rel_pos;
-            let line_start = memchr::memrchr(b'\n', &data[..pos])
-                .map(|idx| idx + 1)
-                .unwrap_or(0);
-            let line_end = memchr::memchr(b'\n', &data[pos..])
-                .map(|idx| pos + idx)
-                .unwrap_or(data.len());
-            // Skip the rest of this line; it cannot hold another record.
-            end = line_start.max(tail_start);
-            let Ok(val) = serde_json::from_slice::<serde_json::Value>(&data[line_start..line_end])
-            else {
-                continue;
-            };
-            let field = match val.get("type").and_then(|v| v.as_str()) {
-                Some("custom-title") => "customTitle",
-                Some("ai-title") if ai_title.is_none() => "aiTitle",
-                _ => continue,
-            };
-            let Some(title) = val
-                .get(field)
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            else {
-                continue;
-            };
-            if field == "customTitle" {
-                return Some(title.to_string());
-            }
-            ai_title = Some(title.to_string());
-        }
-        ai_title.or_else(|| Self::first_user_prompt_from_mmap(data))
+        Self::latest_record_value(data, "custom-title", "customTitle")
+            .or_else(|| Self::latest_record_value(data, "ai-title", "aiTitle"))
+            .or_else(|| Self::first_user_prompt_from_mmap(data))
     }
 
     pub(crate) fn first_user_prompt_from_mmap(mmap: &[u8]) -> Option<String> {
@@ -322,6 +326,64 @@ mod tests {
         assert_eq!(
             ClaudePlugin::extract_title_from_bytes(data.as_bytes()).as_deref(),
             Some("my-name")
+        );
+    }
+
+    fn padded_session(title_line: &str, padding: usize) -> Vec<u8> {
+        let mut data =
+            b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"prompt\"}}\n"
+                .to_vec();
+        data.extend_from_slice(title_line.as_bytes());
+        data.push(b'\n');
+        let filler =
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"";
+        let fill_len = padding.saturating_sub(filler.len() + "\"}]}}\n".len());
+        data.extend_from_slice(filler.as_bytes());
+        data.extend(std::iter::repeat_n(b'x', fill_len));
+        data.extend_from_slice(b"\"}]}}\n");
+        data
+    }
+
+    #[test]
+    fn title_starting_at_tail_window_start_is_found() {
+        let title = "{\"type\":\"custom-title\",\"customTitle\":\"in-window\"}";
+        // The title line starts exactly TITLE_SCAN_TAIL_BYTES before the end.
+        let data = padded_session(title, TITLE_SCAN_TAIL_BYTES - title.len() - 1);
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(&data).as_deref(),
+            Some("in-window")
+        );
+    }
+
+    #[test]
+    fn title_outside_tail_window_falls_back_to_first_prompt() {
+        let title = "{\"type\":\"ai-title\",\"aiTitle\":\"too-far\"}";
+        // The title line starts one byte before the window.
+        let data = padded_session(title, TITLE_SCAN_TAIL_BYTES - title.len());
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(&data).as_deref(),
+            Some("prompt")
+        );
+    }
+
+    #[test]
+    fn empty_latest_custom_title_does_not_revive_older_one() {
+        let data = b"{\"type\":\"custom-title\",\"customTitle\":\"old\"}\n\
+{\"type\":\"ai-title\",\"aiTitle\":\"generated\"}\n\
+{\"type\":\"custom-title\",\"customTitle\":\"\"}\n";
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(data).as_deref(),
+            Some("generated")
+        );
+    }
+
+    #[test]
+    fn message_text_ending_in_title_is_not_a_record() {
+        let data = b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n\
+{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"x\\n{\\\"type\\\":\\\"ai-title\\\",\\\"aiTitle\\\":\\\"fake\\\"}\"}]}}\n";
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(data).as_deref(),
+            Some("hello")
         );
     }
 
