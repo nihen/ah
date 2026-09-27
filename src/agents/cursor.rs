@@ -111,8 +111,9 @@ fn decode_cursor_path_inner(root: &Path, encoded: &str) -> Option<String> {
 }
 
 /// Guard against runaway recursion through components that consume no input
-/// (names without ASCII alphanumerics); ordinary components always consume.
-const MAX_DECODE_DEPTH: usize = 256;
+/// (names without ASCII alphanumerics). Ordinary components always consume
+/// input, so their depth is bounded by the slug length.
+const MAX_ZERO_WIDTH_DEPTH: usize = 256;
 /// Upper bound on directories entered per decode.
 const MAX_DECODE_VISITS: usize = 10_000;
 /// Tokens probed per level when a directory cannot be listed (640 names).
@@ -123,7 +124,7 @@ struct Walk {
     /// Deepest existing directory reached: (bytes of input consumed, path).
     best: (usize, PathBuf),
     /// (directory identity, remaining length) states already explored, with
-    /// the shallowest depth they were entered from.
+    /// the fewest zero-width components they were entered through.
     seen: HashMap<(DirId, usize), usize>,
     budget: usize,
     /// Whether names without ASCII alphanumerics may be entered.
@@ -189,8 +190,8 @@ fn probe_names(rest: &str) -> Vec<OsString> {
 }
 
 impl Walk {
-    fn descend(&mut self, dir: &Path, rest: &str, depth: usize) -> Option<PathBuf> {
-        if depth >= MAX_DECODE_DEPTH || self.budget == 0 {
+    fn descend(&mut self, dir: &Path, rest: &str, zero_width_depth: usize) -> Option<PathBuf> {
+        if zero_width_depth >= MAX_ZERO_WIDTH_DEPTH || self.budget == 0 {
             return None;
         }
         self.budget -= 1;
@@ -226,20 +227,21 @@ impl Walk {
             if remaining.is_empty() && !enc.is_empty() {
                 return Some(path);
             }
+            let zero_width_depth = zero_width_depth + usize::from(enc.is_empty());
             // A state explored before has failed (success returns at once),
-            // unless the depth limit cut that attempt shorter than this one.
+            // unless the zero-width depth limit cut that attempt shorter.
             if let Some(id) = id {
-                let depth_seen = self.seen.entry((id, remaining.len())).or_insert(usize::MAX);
-                if *depth_seen <= depth {
+                let seen = self.seen.entry((id, remaining.len())).or_insert(usize::MAX);
+                if *seen <= zero_width_depth {
                     continue;
                 }
-                *depth_seen = depth;
+                *seen = zero_width_depth;
             }
             let consumed = self.total - remaining.len();
             if consumed > self.best.0 {
                 self.best = (consumed, path.clone());
             }
-            if let Some(found) = self.descend(&path, remaining, depth + 1) {
+            if let Some(found) = self.descend(&path, remaining, zero_width_depth) {
                 return Some(found);
             }
         }
@@ -517,10 +519,10 @@ mod tests {
     #[test]
     fn decode_handles_deep_paths() {
         let (_tmp, root) = temp_root();
-        let rel = vec!["a"; 40].join("/");
+        let rel = vec!["a"; 300].join("/");
         mkdirs(&root, &[rel.as_str()]);
         assert_eq!(
-            decode(&root, &vec!["a"; 40].join("-")),
+            decode(&root, &vec!["a"; 300].join("-")),
             root.join(&rel).to_string_lossy()
         );
     }
@@ -546,7 +548,7 @@ mod tests {
         mkdirs(&root, &["p/x/日本/leaf"]);
         let mut chain = root.join("p-x");
         std::fs::create_dir(&chain).unwrap();
-        for _ in 0..253 {
+        for _ in 0..MAX_ZERO_WIDTH_DEPTH - 2 {
             chain.push("_");
             std::fs::create_dir(&chain).unwrap();
         }
