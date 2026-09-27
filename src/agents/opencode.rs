@@ -218,7 +218,7 @@ fn split_virtual_path(path: &Path) -> Option<(&Path, &str)> {
 }
 
 /// Percent-encode a filesystem path for a SQLite `file:` URI.
-fn uri_path(path: &Path) -> String {
+pub(super) fn uri_path(path: &Path) -> String {
     let mut out = String::new();
     for &b in path.to_string_lossy().as_bytes() {
         if b.is_ascii_alphanumeric() || b"/-_.~".contains(&b) {

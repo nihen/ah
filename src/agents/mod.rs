@@ -201,9 +201,9 @@ pub trait AgentPlugin: Sync {
     }
 
     /// Memory the agent writes itself under its own data directory, keyed by
-    /// project (e.g. Claude auto memory). With `cwd`, only files for that
-    /// project and global ones are returned.
-    fn agent_memory_files(&self, _home: &Path, _cwd: Option<&str>) -> Vec<AgentMemoryFile> {
+    /// project (e.g. Claude auto memory). With `cwds`, only files for one of
+    /// those project directories and global ones are returned.
+    fn agent_memory_files(&self, _home: &Path, _cwds: Option<&[String]>) -> Vec<AgentMemoryFile> {
         Vec::new()
     }
 }

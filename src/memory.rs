@@ -270,12 +270,7 @@ fn expand_sources(
         if source.kind == MemoryKind::Skill && !with_skills {
             continue;
         }
-        let mut paths: Vec<PathBuf> = glob::glob(&source.pattern())
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|p| p.is_file())
-            .collect();
+        let mut paths = glob_files(&source.pattern());
         paths.sort();
         entries.extend(
             paths
@@ -284,6 +279,110 @@ fn expand_sources(
         );
     }
     entries
+}
+
+/// Deepest directory level a recursive (`**`) memory pattern descends to.
+const RECURSIVE_GLOB_MAX_DEPTH: usize = 16;
+
+/// Files matching `pattern`. The `glob` crate follows directory symlinks
+/// without cycle detection, so recursive patterns are walked here instead,
+/// skipping directories already visited (by canonical path).
+fn glob_files(pattern: &str) -> Vec<PathBuf> {
+    // `.`/`..` components need the glob crate's component-wise handling.
+    let dot_components = pattern.split('/').any(|c| c == "." || c == "..");
+    if !pattern.contains("**") || dot_components {
+        return glob::glob(pattern)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|p| p.is_file())
+            .collect();
+    }
+    let Ok(matcher) = glob::Pattern::new(pattern) else {
+        return Vec::new();
+    };
+    let options = glob::MatchOptions {
+        require_literal_separator: true,
+        ..glob::MatchOptions::new()
+    };
+    // Walk from the literal directory prefix (up to the first wildcard).
+    let wildcard = first_wildcard(pattern);
+    let root = match pattern[..wildcard].rfind('/') {
+        Some(0) => PathBuf::from("/"),
+        Some(i) => PathBuf::from(unescape_glob(&pattern[..i])),
+        None => return Vec::new(),
+    };
+    let mut files = Vec::new();
+    // Each entry carries the canonical directories on its own path from the
+    // root, so only a symlink back into that chain (a cycle) is cut; the same
+    // directory reached along another path is still walked there.
+    let mut stack: Vec<(PathBuf, Vec<PathBuf>)> = vec![(root, Vec::new())];
+    while let Some((dir, mut chain)) = stack.pop() {
+        let Ok(canonical) = fs::canonicalize(&dir) else {
+            continue;
+        };
+        if chain.contains(&canonical) {
+            continue;
+        }
+        chain.push(canonical);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if chain.len() <= RECURSIVE_GLOB_MAX_DEPTH {
+                    stack.push((path, chain.clone()));
+                }
+            } else if path.is_file() && matcher.matches_path_with(&path, options) {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// Byte offset of the first wildcard in `pattern`, skipping characters
+/// escaped by `glob::Pattern::escape` (`[*]`, `[?]`, `[[]`, `[]]`).
+fn first_wildcard(pattern: &str) -> usize {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'*' | b'?' => return i,
+            b'[' if i + 2 < bytes.len()
+                && bytes[i + 2] == b']'
+                && matches!(bytes[i + 1], b'*' | b'?' | b'[' | b']') =>
+            {
+                i += 3;
+            }
+            b'[' => return i,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Undo `glob::Pattern::escape` (`[*]` → `*`) on a literal pattern prefix.
+fn unescape_glob(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('[') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        match tail.char_indices().nth(2) {
+            Some((end, ']')) => {
+                out.push_str(&tail[1..end]);
+                rest = &tail[end + 1..];
+            }
+            _ => {
+                out.push('[');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Project-level memory and instruction files in one directory.
@@ -313,17 +412,30 @@ fn collect_project_files(
     entries
 }
 
-/// Directories whose project files apply to `cwd`: the directory itself and
-/// its git root, where agents also look for instruction files.
+/// Where a file sits: its canonical parent directory plus its own name.
+/// Aliases of the directory (a symlinked home) compare equal; a file that
+/// is itself a symlink keeps its own location.
+fn location_key(path: &Path) -> PathBuf {
+    match (path.parent().map(fs::canonicalize), path.file_name()) {
+        (Some(Ok(dir)), Some(name)) => dir.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Directories whose project files apply to `cwd`: inside a git repository,
+/// every level from `cwd` up to the repository root (agents load
+/// instructions from each of them); otherwise `cwd` alone.
 fn current_project_dirs(cwd: &str) -> Vec<PathBuf> {
     let dir = PathBuf::from(cwd);
-    let mut dirs = vec![dir.clone()];
-    if let Some(root) = dir.ancestors().find(|d| d.join(".git").exists()) {
-        if root != dir {
-            dirs.push(root.to_path_buf());
-        }
+    match dir.ancestors().position(|d| d.join(".git").exists()) {
+        // Every level from the directory up to the repository root.
+        Some(root) => dir
+            .ancestors()
+            .take(root + 1)
+            .map(Path::to_path_buf)
+            .collect(),
+        None => vec![dir],
     }
-    dirs
 }
 
 /// Collect known project cwds from session files (for -a mode).
@@ -375,26 +487,23 @@ pub fn build_memory_records(
     let mut entries: Vec<MemoryEntry> = Vec::new();
 
     // 1. Memory the agents keep per project (e.g. Claude auto memory). Agents
-    //    key it by the directory they started in or by its repository root.
+    //    key it by the directory they started in, which may be any level up
+    //    to the repository root.
     let current_dirs = current_project_dirs(&cwd);
-    let cwd_filters: Vec<Option<String>> = if filter.all {
-        vec![None]
-    } else {
+    let cwd_filter: Option<Vec<String>> = (!filter.all).then(|| {
         current_dirs
             .iter()
-            .map(|d| Some(d.to_string_lossy().to_string()))
+            .map(|d| d.to_string_lossy().to_string())
             .collect()
-    };
+    });
     for plugin in &plugins {
-        for cwd_filter in &cwd_filters {
-            for file in plugin.agent_memory_files(&home, cwd_filter.as_deref()) {
-                entries.extend(read_entry(
-                    file.path,
-                    plugin.id(),
-                    &file.project,
-                    MemoryKind::Memory,
-                ));
-            }
+        for file in plugin.agent_memory_files(&home, cwd_filter.as_deref()) {
+            entries.extend(read_entry(
+                file.path,
+                plugin.id(),
+                &file.project,
+                MemoryKind::Memory,
+            ));
         }
     }
 
@@ -416,21 +525,24 @@ pub fn build_memory_records(
     ));
     // A project scan of the home directory itself reaches global files
     // (e.g. `~/.claude/CLAUDE.md` as `<dir>/.claude/CLAUDE.md`); those stay
-    // global. Only the literal path counts, so a project file symlinked
-    // to/from a global one keeps its project attribution.
+    // global. Files are compared by their resolved directory and own name,
+    // so a project file that is itself a symlink to/from a global one keeps
+    // its project attribution.
     let global_paths: HashSet<(PathBuf, &'static str)> = global_entries
         .iter()
-        .map(|e| (e.path.clone(), e.agent))
+        .map(|e| (location_key(&e.path), e.agent))
         .collect();
 
     // 3. Project files (listed before global ones, see dedup below)
     let project_dirs: Vec<PathBuf> = if filter.all {
-        // Scan known project cwds (sorted so duplicate resolution is stable)
+        // Scan known project cwds and their repository roots (sorted so
+        // duplicate resolution is stable)
         let mut cwds = collect_known_project_cwds();
         cwds.sort_unstable();
         let mut seen = HashSet::new();
         cwds.iter()
             .filter_map(|dir| fs::canonicalize(dir).ok()) // skip non-existent dirs
+            .flat_map(|dir| current_project_dirs(&dir.to_string_lossy()))
             // Only collect from dirs under home
             .filter(|c| c.starts_with(&home) && c.is_dir())
             .filter(|c| seen.insert(c.clone()))
@@ -446,7 +558,7 @@ pub fn build_memory_records(
         project_entries
             .into_iter()
             .flatten()
-            .filter(|e| !global_paths.contains(&(e.path.clone(), e.agent))),
+            .filter(|e| !global_paths.contains(&(location_key(&e.path), e.agent))),
     );
     entries.extend(global_entries);
 
@@ -744,5 +856,53 @@ mod tests {
     #[test]
     fn test_decode_project_name_home_prefix() {
         assert_eq!(decode_claude_project("-home-user-projects-myapp"), "myapp");
+    }
+
+    #[test]
+    fn escaped_prefix_is_literal() {
+        let pattern = format!("{}/rules/**/*.md", glob::Pattern::escape("/tmp/a[b]*c?/d"));
+        let wildcard = first_wildcard(&pattern);
+        assert_eq!(&pattern[wildcard..], "**/*.md");
+        let dir = &pattern[..pattern[..wildcard].rfind('/').unwrap()];
+        assert_eq!(unescape_glob(dir), "/tmp/a[b]*c?/d/rules");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_glob_walks_a_directory_reached_through_another_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        fs::create_dir_all(base.join("actual/rules")).unwrap();
+        fs::write(base.join("actual/rules/r.md"), "x").unwrap();
+        // `alias` sorts first and resolves to the same directory, but only
+        // the `actual/rules` path matches the pattern.
+        std::os::unix::fs::symlink(base.join("actual/rules"), base.join("alias")).unwrap();
+        let pattern = format!(
+            "{}/**/rules/*.md",
+            glob::Pattern::escape(&base.to_string_lossy())
+        );
+        let found = glob_files(&pattern);
+        assert!(found.contains(&base.join("actual/rules/r.md")), "{found:?}");
+    }
+
+    #[test]
+    fn recursive_glob_matches_nested_files_only_under_the_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("we[ird]*");
+        fs::create_dir_all(base.join("rules/a/b")).unwrap();
+        fs::write(base.join("rules/top.md"), "x").unwrap();
+        fs::write(base.join("rules/a/b/deep.md"), "x").unwrap();
+        fs::write(base.join("rules/a/skip.txt"), "x").unwrap();
+        fs::write(base.join("other.md"), "x").unwrap();
+        let pattern = format!(
+            "{}/rules/**/*.md",
+            glob::Pattern::escape(&base.to_string_lossy())
+        );
+        let mut found: Vec<String> = glob_files(&pattern)
+            .iter()
+            .map(|p| p.strip_prefix(&base).unwrap().to_string_lossy().to_string())
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["rules/a/b/deep.md", "rules/top.md"]);
     }
 }

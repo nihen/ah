@@ -94,7 +94,7 @@ shared  my-webapp  instruction  AGENTS.md         2026-03-21 15:30
 
 A project-level `AGENTS.md` is read by several agents, so it is listed as `shared` and matches any `--agent` filter.
 
-Files listed per agent (global paths honor each agent's env var; project paths are looked up in the current directory and its git root, or in every known project with `-a`):
+Files listed per agent (global paths honor each agent's env var; project paths are looked up in the current directory and, inside a git repository, every directory up to its root; `-a` does this for every known project):
 
 | Agent | Global | Project |
 |-------|--------|---------|
@@ -102,9 +102,9 @@ Files listed per agent (global paths honor each agent's env var; project paths a
 | Codex | `~/.codex/AGENTS.md`, `AGENTS.override.md`, `memories/**/*.md` | `AGENTS.override.md` |
 | Gemini | `~/.gemini/GEMINI.md` (or `context.fileName` in `settings.json`) | same file names |
 | Copilot | `~/.copilot/copilot-instructions.md` | `.github/copilot-instructions.md`, `.github/instructions/**/*.instructions.md` |
-| Cursor | `~/.cursor/rules/*.mdc` | `.cursorrules`, `.cursor/rules/**/*.mdc` |
+| Cursor | `~/.cursor/rules/**/*.mdc` | `.cursorrules`, `.cursor/rules/**/*.mdc` |
 | Antigravity (agy) | `~/.gemini/config/rules/*.md` | `.agents/rules/*.md`, `.agent/rules/*.md` |
-| Grok | `~/.grok/AGENTS.md`, memory topics `memory-v2/{global,workspaces/*}/topics/*.md` | — |
+| Grok | `~/.grok/AGENTS.md`, `rules/*.md`, `memory/MEMORY.md`, memory topics `memory-v2/{global,workspaces/*}/topics/*.md` | `.grok/rules/*.md` |
 | opencode | `~/.config/opencode/AGENTS.md`, `instructions` in `opencode.json(c)` | `instructions` in `opencode.json(c)` |
 | shared | — | `AGENTS.md` |
 

@@ -304,7 +304,7 @@ impl AgentPlugin for ClaudePlugin {
     }
 
     /// Auto memory: `projects/<encoded-cwd>/memory/*.md` (MEMORY.md is its index).
-    fn agent_memory_files(&self, home: &Path, cwd: Option<&str>) -> Vec<AgentMemoryFile> {
+    fn agent_memory_files(&self, home: &Path, cwds: Option<&[String]>) -> Vec<AgentMemoryFile> {
         let projects_dir = claude_base(home).join("projects");
         let pattern = format!(
             "{}/*/memory/*.md",
@@ -331,7 +331,8 @@ impl AgentPlugin for ClaudePlugin {
                 (dir, cwd)
             })
             .collect();
-        let encoded_cwd = cwd.map(encode_path_for_claude);
+        let encoded_cwds: Option<HashSet<String>> =
+            cwds.map(|c| c.iter().map(|d| encode_path_for_claude(d)).collect());
 
         memory_files
             .into_iter()
@@ -339,8 +340,11 @@ impl AgentPlugin for ClaudePlugin {
                 let project_dir = path.parent()?.parent()?;
                 let encoded_name = project_dir.file_name()?.to_string_lossy().to_string();
                 let session_cwd = project_cwds.get(project_dir).cloned().flatten();
-                if let (Some(filter), Some(cwd)) = (&encoded_cwd, cwd) {
-                    if encoded_name != *filter && session_cwd.as_deref() != Some(cwd) {
+                if let (Some(encoded), Some(cwds)) = (&encoded_cwds, cwds) {
+                    let by_cwd = session_cwd
+                        .as_deref()
+                        .is_some_and(|s| cwds.iter().any(|c| c == s));
+                    if !encoded.contains(&encoded_name) && !by_cwd {
                         return None;
                     }
                 }

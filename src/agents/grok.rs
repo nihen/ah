@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -168,17 +169,23 @@ impl AgentPlugin for GrokPlugin {
     }
 
     fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
-        vec![MemorySource::new(
-            &grok_base(home),
-            "AGENTS.md",
-            MemoryKind::Instruction,
-        )]
+        let base = grok_base(home);
+        vec![
+            MemorySource::new(&base, "AGENTS.md", MemoryKind::Instruction),
+            MemorySource::new(&base, "rules/*.md", MemoryKind::Rule),
+            // Legacy (v1) global memory notes, written by `/remember`.
+            MemorySource::new(&base, "memory/MEMORY.md", MemoryKind::Memory),
+        ]
+    }
+
+    fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
+        vec![MemorySource::new(dir, ".grok/rules/*.md", MemoryKind::Rule)]
     }
 
     /// Cross-session memory (`memory-v2`): curated topic files under
     /// `global/topics/` and `workspaces/<name>-<hash>/topics/`. `MEMORY.md`
     /// is a generated index; `observations/` and `archive/` hold raw captures.
-    fn agent_memory_files(&self, home: &Path, cwd: Option<&str>) -> Vec<AgentMemoryFile> {
+    fn agent_memory_files(&self, home: &Path, cwds: Option<&[String]>) -> Vec<AgentMemoryFile> {
         let base = grok_base(home);
         let root = base.join("memory-v2");
         let topics = |dir: &Path, project: &str| -> Vec<AgentMemoryFile> {
@@ -201,7 +208,11 @@ impl AgentPlugin for GrokPlugin {
         let Ok(entries) = fs::read_dir(root.join("workspaces")) else {
             return files;
         };
-        let cwd_name = cwd.and_then(|c| Path::new(c).file_name());
+        let basename = |c: &str| {
+            Path::new(c)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+        };
         for entry in entries.flatten() {
             let dir = entry.path();
             if !dir.is_dir() {
@@ -209,22 +220,29 @@ impl AgentPlugin for GrokPlugin {
             }
             let dir_name = entry.file_name().to_string_lossy().to_string();
             let name = workspace_name(&dir_name);
-            let ws_cwd = workspace_cwd(&dir, &base);
-            if let Some(cwd) = cwd {
-                let matches = match ws_cwd.as_deref() {
-                    Some(ws) => ws == cwd,
-                    // Unknown workspace: fall back to the directory name.
-                    None => cwd_name.is_some_and(|n| n.to_string_lossy() == name),
-                };
-                if !matches {
-                    continue;
+            // One workspace can span several checkouts (a repository and its
+            // worktrees); the most used one names it.
+            let ws_cwds = workspace_cwds(&dir, &base);
+            let project = match cwds {
+                Some(cwds) => {
+                    let matched = if ws_cwds.is_empty() {
+                        // Unknown workspace: fall back to its (lowercased) name.
+                        cwds.iter().find(|c| {
+                            basename(c).is_some_and(|b| b.to_lowercase() == name.to_lowercase())
+                        })
+                    } else {
+                        cwds.iter().find(|c| ws_cwds.contains(c))
+                    };
+                    match matched.and_then(|c| basename(c)) {
+                        Some(p) => p,
+                        None => continue,
+                    }
                 }
-            }
-            let project = ws_cwd
-                .as_deref()
-                .and_then(|c| Path::new(c).file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| name.to_string());
+                None => ws_cwds
+                    .first()
+                    .and_then(|c| basename(c))
+                    .unwrap_or_else(|| name.to_string()),
+            };
             files.extend(topics(&dir, &project));
         }
         files
@@ -250,38 +268,65 @@ fn workspace_name(dir_name: &str) -> &str {
     }
 }
 
-/// Working directory of a memory workspace, found through the sessions it
-/// captured (`memory_state.sqlite`) and their `sessions/<cwd>/<id>/` dirs.
-fn workspace_cwd(ws_dir: &Path, base: &Path) -> Option<String> {
-    let db = ws_dir.join("memory_state.sqlite");
-    if !db.is_file() {
-        return None;
-    }
-    let conn = rusqlite::Connection::open_with_flags(
-        &db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
-    let mut stmt = conn
-        .prepare("SELECT session_id FROM capture_sessions")
-        .ok()?;
-    let ids: Vec<String> = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .ok()?
-        .flatten()
-        .filter(|id| is_safe_cli_id(id) && !id.contains('/'))
-        .collect();
+/// Working directories of a memory workspace, most used first, found through
+/// the sessions it captured (`memory_state.sqlite`) and their
+/// `sessions/<cwd>/<id>/` directories.
+fn workspace_cwds(ws_dir: &Path, base: &Path) -> Vec<String> {
+    let ids = captured_session_ids(&ws_dir.join("memory_state.sqlite"));
     let sessions = base.join("sessions");
-    ids.iter().find_map(|id| {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for id in &ids {
         let pattern = format!(
             "{}/*/{}",
             glob::Pattern::escape(&sessions.to_string_lossy()),
             glob::Pattern::escape(id)
         );
-        let dir = glob::glob(&pattern).ok()?.flatten().next()?;
-        let encoded = dir.parent()?.file_name()?.to_string_lossy().to_string();
-        Some(canonicalize_if_exists(&percent_decode(&encoded)))
-    })
+        let Some(dir) = glob::glob(&pattern).ok().and_then(|g| g.flatten().next()) else {
+            continue;
+        };
+        let Some(encoded) = dir.parent().and_then(|p| p.file_name()) else {
+            continue;
+        };
+        let cwd = canonicalize_if_exists(&percent_decode(&encoded.to_string_lossy()));
+        *counts.entry(cwd).or_default() += 1;
+    }
+    let mut cwds: Vec<(String, usize)> = counts.into_iter().collect();
+    cwds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    cwds.into_iter().map(|(c, _)| c).collect()
+}
+
+/// Session ids in a workspace's `capture_sessions` table. The database is
+/// Grok's own (WAL mode, possibly busy), so it is opened without writing
+/// next to it: immutable when no `-wal` file exists, read-only otherwise.
+fn captured_session_ids(db: &Path) -> Vec<String> {
+    use rusqlite::{Connection, OpenFlags};
+    if !db.is_file() {
+        return Vec::new();
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let wal = format!("{}-wal", db.display());
+    let conn = if Path::new(&wal).exists() {
+        Connection::open_with_flags(db, flags)
+    } else {
+        Connection::open_with_flags(
+            format!("file:{}?immutable=1", super::opencode::uri_path(db)),
+            flags | OpenFlags::SQLITE_OPEN_URI,
+        )
+    };
+    let Ok(conn) = conn else {
+        return Vec::new();
+    };
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(2));
+    let Ok(mut stmt) = conn.prepare("SELECT session_id FROM capture_sessions") else {
+        return Vec::new();
+    };
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .map(|rows| {
+            rows.flatten()
+                .filter(|id| is_safe_cli_id(id) && !id.contains('/'))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -298,20 +343,28 @@ mod tests {
     }
 
     #[test]
-    fn workspace_cwd_follows_captured_sessions() {
+    fn workspace_cwds_follow_captured_sessions_most_used_first() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join(".grok");
         let ws = base.join("memory-v2/workspaces/proj-0123abcd");
         fs::create_dir_all(&ws).unwrap();
-        let conn = rusqlite::Connection::open(ws.join("memory_state.sqlite")).unwrap();
+        let db = ws.join("memory_state.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        // WAL like Grok; the writer stays open so `-wal` exists while reading.
         conn.execute_batch(
-            "CREATE TABLE capture_sessions (session_id TEXT PRIMARY KEY);
-             INSERT INTO capture_sessions VALUES ('0192-aaaa');",
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE capture_sessions (session_id TEXT PRIMARY KEY);
+             INSERT INTO capture_sessions VALUES ('a1'), ('a2'), ('b1'), ('x-gone');",
         )
         .unwrap();
+        fs::create_dir_all(base.join("sessions/%2Fsrv%2Fproj/a1")).unwrap();
+        fs::create_dir_all(base.join("sessions/%2Fsrv%2Fproj/a2")).unwrap();
+        fs::create_dir_all(base.join("sessions/%2Fsrv%2Fwt/b1")).unwrap();
+        assert_eq!(workspace_cwds(&ws, &base), vec!["/srv/proj", "/srv/wt"]);
         drop(conn);
-        fs::create_dir_all(base.join("sessions/%2Fsrv%2Fproj/0192-aaaa")).unwrap();
-        assert_eq!(workspace_cwd(&ws, &base).as_deref(), Some("/srv/proj"));
+        // Checkpointed WAL database without `-wal`: read without creating one.
+        assert_eq!(workspace_cwds(&ws, &base).len(), 2);
+        assert!(!Path::new(&format!("{}-wal", db.display())).exists());
     }
 
     fn write_session(dir: &Path, history: &str, summary: Option<&str>) -> std::path::PathBuf {

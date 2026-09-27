@@ -281,7 +281,7 @@ impl AgentPlugin for CursorPlugin {
     fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
         vec![MemorySource::new(
             &home.join(".cursor/rules"),
-            "*.mdc",
+            "**/*.mdc",
             MemoryKind::Rule,
         )]
     }
