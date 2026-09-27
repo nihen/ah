@@ -182,47 +182,56 @@ fn visit_message_value(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -
 }
 
 /// The `session_meta` fields ah reads from the first line of a rollout.
-#[derive(Clone, serde::Deserialize)]
+/// Each field is `None` unless it is a JSON string.
+#[derive(Clone)]
 struct SessionMeta {
     id: Option<String>,
     cwd: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
-struct SessionMetaLine {
-    payload: Option<SessionMeta>,
-}
-
-type CachedMeta = (PathBuf, Option<SystemTime>, Option<SessionMeta>);
+/// Path, size and mtime of the cached file, and its metadata.
+type CachedMeta = (PathBuf, IndexStamp, SessionMeta);
 
 thread_local! {
     static LAST_META: std::cell::RefCell<Option<CachedMeta>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Session metadata from the first line, which Codex writes once. Listing a
-/// session resolves its id, cwd and title separately, so each thread keeps
-/// the last parsed line (keyed by path and mtime).
+/// Session metadata from the first line, or `None` when that line cannot be
+/// read as JSON. Listing a session resolves its id, cwd and title
+/// separately, so each thread keeps the last parsed line, re-read when the
+/// file's size or mtime changes.
 fn session_meta(path: &Path) -> Option<SessionMeta> {
-    let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+    let stamp = fs::metadata(path)
+        .ok()
+        .map(|m| (m.len(), m.modified().ok()));
     let cached = LAST_META.with_borrow(|last| {
         last.as_ref()
-            .filter(|(p, t, _)| p == path && *t == mtime)
+            .filter(|(p, s, _)| p == path && *s == stamp)
             .map(|(_, _, meta)| meta.clone())
     });
-    if let Some(meta) = cached {
-        return meta;
+    if cached.is_some() {
+        return cached;
     }
-    let meta = read_session_meta(path);
-    LAST_META.set(Some((path.to_path_buf(), mtime, meta.clone())));
-    meta
+    let meta = read_session_meta(path)?;
+    LAST_META.set(Some((path.to_path_buf(), stamp, meta.clone())));
+    Some(meta)
 }
 
 fn read_session_meta(path: &Path) -> Option<SessionMeta> {
     let file = fs::File::open(path).ok()?;
     let mut line = String::new();
     BufReader::new(file).read_line(&mut line).ok()?;
-    serde_json::from_str::<SessionMetaLine>(&line).ok()?.payload
+    let val = serde_json::from_str::<serde_json::Value>(&line).ok()?;
+    let field = |pointer| {
+        val.pointer(pointer)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    Some(SessionMeta {
+        id: field("/payload/id"),
+        cwd: field("/payload/cwd"),
+    })
 }
 
 pub static PLUGIN: CodexPlugin = CodexPlugin;
@@ -305,10 +314,10 @@ impl AgentPlugin for CodexPlugin {
 
     // `codex resume <id>` also finds archived sessions, so they keep their id.
     fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
-        if let Some(id) = session_meta(path)
-            .and_then(|m| m.id)
-            .filter(|id| !id.is_empty())
-        {
+        // A first line that is not JSON (empty or partly written file) has
+        // no resumable id; only a readable line without one falls back to
+        // the file name.
+        if let Some(id) = session_meta(path)?.id.filter(|id| !id.is_empty()) {
             return Some(id);
         }
 
@@ -530,5 +539,90 @@ mod tests {
             PLUGIN.resolve_resume_id(&path, tmp.path()).as_deref(),
             Some("y")
         );
+    }
+
+    #[test]
+    fn session_meta_is_reread_when_only_the_size_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        let fixed = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let write = |body: &str| {
+            fs::write(&path, body).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(fixed)
+                .unwrap();
+        };
+        write("{\"payload\":{\"id\":\"a\"}}\n");
+        assert_eq!(
+            PLUGIN.resolve_resume_id(&path, tmp.path()).as_deref(),
+            Some("a")
+        );
+        write("{\"payload\":{\"id\":\"longer\"}}\n");
+        assert_eq!(
+            PLUGIN.resolve_resume_id(&path, tmp.path()).as_deref(),
+            Some("longer")
+        );
+    }
+
+    #[test]
+    fn fields_are_read_independently_like_json_pointers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join(format!("rollout-2026-09-27T10-00-00-{ID}.jsonl"));
+        fs::write(&path, "{\"payload\":{\"id\":123,\"cwd\":\"/tmp/p\"}}\n").unwrap();
+        assert_eq!(
+            PLUGIN.resolve_cwd(&path, tmp.path()).as_deref(),
+            Some("/tmp/p")
+        );
+        // A readable line without a string id falls back to the file name.
+        assert_eq!(
+            PLUGIN.resolve_resume_id(&path, tmp.path()).as_deref(),
+            Some(ID)
+        );
+
+        fs::write(
+            &path,
+            "{\"payload\":{\"id\":\"real\",\"cwd\":1,\"cwd\":\"/tmp/q\"}}\n",
+        )
+        .unwrap();
+        let later = SystemTime::now() + std::time::Duration::from_secs(120);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(
+            PLUGIN.resolve_resume_id(&path, tmp.path()).as_deref(),
+            Some("real")
+        );
+        assert_eq!(
+            PLUGIN.resolve_cwd(&path, tmp.path()).as_deref(),
+            Some("/tmp/q")
+        );
+    }
+
+    #[test]
+    fn unreadable_first_line_has_no_resume_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        for body in ["", "{broken\n"] {
+            let path = tmp
+                .path()
+                .join(format!("rollout-2026-09-27T10-00-00-{ID}.jsonl"));
+            fs::write(&path, body).unwrap();
+            let later = SystemTime::now() + std::time::Duration::from_secs(body.len() as u64 + 1);
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+            assert_eq!(PLUGIN.resolve_resume_id(&path, tmp.path()), None);
+            assert_eq!(PLUGIN.resolve_cwd(&path, tmp.path()), None);
+        }
     }
 }
