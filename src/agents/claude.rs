@@ -73,8 +73,7 @@ impl ClaudePlugin {
             Some(
                 val.get(field)
                     .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| !s.trim().is_empty())
                     .map(str::to_string),
             )
         })?
@@ -373,6 +372,22 @@ mod tests {
 {\"type\":\"custom-title\",\"customTitle\":\"\"}\n";
         assert_eq!(
             ClaudePlugin::extract_title_from_bytes(data).as_deref(),
+            Some("generated")
+        );
+    }
+
+    #[test]
+    fn custom_title_keeps_whitespace_but_blank_is_empty() {
+        let data = b"{\"type\":\"ai-title\",\"aiTitle\":\"generated\"}\n\
+{\"type\":\"custom-title\",\"customTitle\":\" padded \"}\n";
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(data).as_deref(),
+            Some(" padded ")
+        );
+        let blank = b"{\"type\":\"ai-title\",\"aiTitle\":\"generated\"}\n\
+{\"type\":\"custom-title\",\"customTitle\":\"   \"}\n";
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(blank).as_deref(),
             Some("generated")
         );
     }
