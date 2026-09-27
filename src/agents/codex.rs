@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
@@ -19,6 +19,47 @@ static RE_CODEX_DATE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"rollout-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})").unwrap());
 static RE_CODEX_ROLLOUT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^rollout-[\dT-]+-(.+)$").unwrap());
+
+/// Codex home of a session file: the parent of the `sessions` or
+/// `archived_sessions` directory that contains it. Falls back to the
+/// configured base (`CODEX_HOME` or `~/.codex`).
+fn codex_home_for(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|dir| {
+            matches!(
+                dir.file_name().and_then(|s| s.to_str()),
+                Some("sessions" | "archived_sessions")
+            )
+        })
+        .and_then(|dir| dir.parent())
+        .map(Path::to_path_buf)
+        .or_else(|| crate::config::resolve_agent_base("codex"))
+}
+
+/// Latest `thread_name` recorded for `session_id`. Codex appends a new line
+/// on every rename, so the last matching line wins.
+fn latest_thread_name(index_path: &Path, session_id: &str) -> Option<String> {
+    let index_file = fs::File::open(index_path).ok()?;
+    let mut latest = None;
+    for line in BufReader::new(index_file).lines() {
+        let Ok(line) = line else { break };
+        if !line.contains(session_id) {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if val.get("id").and_then(|v| v.as_str()) != Some(session_id) {
+            continue;
+        }
+        if let Some(name) = val.get("thread_name").and_then(|v| v.as_str()) {
+            if !name.is_empty() {
+                latest = Some(name.to_string());
+            }
+        }
+    }
+    latest
+}
 
 pub static PLUGIN: CodexPlugin = CodexPlugin;
 
@@ -128,25 +169,11 @@ impl AgentPlugin for CodexPlugin {
             .map(|s| s.to_string())
     }
 
-    fn resolve_title(&self, path: &Path, home: &Path) -> Option<String> {
+    fn resolve_title(&self, path: &Path, _home: &Path) -> Option<String> {
         let val = read_first_line_json(path)?;
         let session_id = val.pointer("/payload/id")?.as_str()?;
-        let index_path = home.join(".codex/session_index.jsonl");
-        let index_file = fs::File::open(&index_path).ok()?;
-        let index_reader = BufReader::new(index_file);
-        for line in index_reader.lines() {
-            let line = line.ok()?;
-            if line.contains(session_id) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(name) = val.get("thread_name").and_then(|v| v.as_str()) {
-                        if !name.is_empty() {
-                            return Some(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        None
+        let index_path = codex_home_for(path)?.join("session_index.jsonl");
+        latest_thread_name(&index_path, session_id)
     }
 
     fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
@@ -170,5 +197,73 @@ impl AgentPlugin for CodexPlugin {
     fn resume_args(&self, path: &Path, home: &Path) -> Option<Vec<String>> {
         let id = self.resolve_resume_id(path, home)?;
         Some(vec!["codex".to_string(), "resume".to_string(), id])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ID: &str = "019c1dbb-cd96-70d3-baba-ef490967626c";
+
+    fn write_session(codex_home: &Path, subdir: &str) -> PathBuf {
+        let dir = codex_home.join(subdir).join("2026/09/27");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-2026-09-27T10-00-00-{ID}.jsonl"));
+        let meta =
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{ID}","cwd":"/tmp/proj"}}}}"#);
+        fs::write(&path, format!("{meta}\n")).unwrap();
+        path
+    }
+
+    fn write_index(codex_home: &Path, lines: &[(&str, &str)]) {
+        let body: String = lines
+            .iter()
+            .map(|(id, name)| format!(r#"{{"id":"{id}","thread_name":"{name}"}}"#) + "\n")
+            .collect();
+        fs::write(codex_home.join("session_index.jsonl"), body).unwrap();
+    }
+
+    #[test]
+    fn title_uses_latest_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = write_session(tmp.path(), "sessions");
+        write_index(
+            tmp.path(),
+            &[
+                (ID, "first name"),
+                ("other-id", "unrelated"),
+                (ID, "renamed"),
+                ("other-id", "unrelated again"),
+            ],
+        );
+        assert_eq!(
+            PLUGIN.resolve_title(&session, Path::new("/nonexistent")),
+            Some("renamed".to_string())
+        );
+    }
+
+    #[test]
+    fn title_reads_index_next_to_custom_codex_home() {
+        // A CODEX_HOME-style directory that is not `~/.codex`.
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_home = tmp.path().join("my-codex");
+        let session = write_session(&codex_home, "archived_sessions");
+        write_index(&codex_home, &[(ID, "archived title")]);
+        assert_eq!(
+            PLUGIN.resolve_title(&session, tmp.path()),
+            Some("archived title".to_string())
+        );
+    }
+
+    #[test]
+    fn title_ignores_lines_that_only_mention_the_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = write_session(tmp.path(), "sessions");
+        write_index(tmp.path(), &[(ID, "real"), ("other-id", ID)]);
+        assert_eq!(
+            PLUGIN.resolve_title(&session, Path::new("/nonexistent")),
+            Some("real".to_string())
+        );
     }
 }
