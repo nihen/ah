@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
 use regex::Regex;
@@ -21,9 +22,8 @@ static RE_CODEX_ROLLOUT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^rollout-[\dT-]+-(.+)$").unwrap());
 
 /// Codex home of a session file: the parent of the `sessions` or
-/// `archived_sessions` directory that contains it. Falls back to the
-/// configured base (`CODEX_HOME` or `~/.codex`).
-fn codex_home_for(path: &Path) -> Option<PathBuf> {
+/// `archived_sessions` directory that contains it.
+fn colocated_codex_home(path: &Path) -> Option<&Path> {
     path.ancestors()
         .find(|dir| {
             matches!(
@@ -32,33 +32,78 @@ fn codex_home_for(path: &Path) -> Option<PathBuf> {
             )
         })
         .and_then(|dir| dir.parent())
-        .map(Path::to_path_buf)
-        .or_else(|| crate::config::resolve_agent_base("codex"))
 }
 
-/// Latest `thread_name` recorded for `session_id`. Codex appends a new line
-/// on every rename, so the last matching line wins.
-fn latest_thread_name(index_path: &Path, session_id: &str) -> Option<String> {
-    let index_file = fs::File::open(index_path).ok()?;
-    let mut latest = None;
+type TitleIndex = HashMap<String, String>;
+
+/// Size and mtime of an index file; `None` when it does not exist.
+type IndexStamp = Option<(u64, Option<SystemTime>)>;
+
+/// Parsed `session_index.jsonl` files, keyed by path. Every listed session
+/// needs a title, so an index is re-read only when its size or mtime
+/// changes (e.g. a rename while `ah log -i` waits for a selection).
+type TitleIndexCache = HashMap<PathBuf, (IndexStamp, Arc<TitleIndex>)>;
+
+static TITLE_INDEXES: LazyLock<Mutex<TitleIndexCache>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn title_index(index_path: &Path) -> Arc<TitleIndex> {
+    let stamp = fs::metadata(index_path)
+        .ok()
+        .map(|m| (m.len(), m.modified().ok()));
+    let mut cache = TITLE_INDEXES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached_stamp, index)) = cache.get(index_path) {
+        if *cached_stamp == stamp {
+            return index.clone();
+        }
+    }
+    let index = Arc::new(read_title_index(index_path));
+    cache.insert(index_path.to_path_buf(), (stamp, index.clone()));
+    index
+}
+
+/// Map each session id to its latest `thread_name`. Codex appends a new
+/// line on every rename, so later lines win.
+fn read_title_index(index_path: &Path) -> TitleIndex {
+    let mut names = TitleIndex::new();
+    let Ok(index_file) = fs::File::open(index_path) else {
+        return names;
+    };
     for line in BufReader::new(index_file).lines() {
         let Ok(line) = line else { break };
-        if !line.contains(session_id) {
-            continue;
-        }
         let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        if val.get("id").and_then(|v| v.as_str()) != Some(session_id) {
-            continue;
-        }
-        if let Some(name) = val.get("thread_name").and_then(|v| v.as_str()) {
+        let id = val.get("id").and_then(|v| v.as_str());
+        let name = val.get("thread_name").and_then(|v| v.as_str());
+        if let (Some(id), Some(name)) = (id, name) {
             if !name.is_empty() {
-                latest = Some(name.to_string());
+                names.insert(id.to_string(), name.to_string());
             }
         }
     }
-    latest
+    names
+}
+
+/// Latest thread name of `session_id`: from the index next to the session
+/// file, then from the configured Codex base (`CODEX_HOME` or `~/.codex`).
+fn latest_thread_name(path: &Path, session_id: &str) -> Option<String> {
+    latest_thread_name_in(path, session_id, crate::config::resolve_agent_base("codex"))
+}
+
+fn latest_thread_name_in(
+    path: &Path,
+    session_id: &str,
+    configured: Option<PathBuf>,
+) -> Option<String> {
+    let colocated = colocated_codex_home(path).map(Path::to_path_buf);
+    let mut homes = colocated.into_iter().chain(configured).collect::<Vec<_>>();
+    homes.dedup();
+    homes.iter().find_map(|home| {
+        title_index(&home.join("session_index.jsonl"))
+            .get(session_id)
+            .cloned()
+    })
 }
 
 pub static PLUGIN: CodexPlugin = CodexPlugin;
@@ -172,8 +217,7 @@ impl AgentPlugin for CodexPlugin {
     fn resolve_title(&self, path: &Path, _home: &Path) -> Option<String> {
         let val = read_first_line_json(path)?;
         let session_id = val.pointer("/payload/id")?.as_str()?;
-        let index_path = codex_home_for(path)?.join("session_index.jsonl");
-        latest_thread_name(&index_path, session_id)
+        latest_thread_name(path, session_id)
     }
 
     fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
@@ -253,6 +297,37 @@ mod tests {
         assert_eq!(
             PLUGIN.resolve_title(&session, tmp.path()),
             Some("archived title".to_string())
+        );
+    }
+
+    #[test]
+    fn title_falls_back_when_colocated_index_is_missing() {
+        // e.g. an `extra_patterns` archive of session files without an index
+        let tmp = tempfile::tempdir().unwrap();
+        let session = write_session(&tmp.path().join("archive"), "sessions");
+        let configured = tmp.path().join("codex-home");
+        fs::create_dir_all(&configured).unwrap();
+        write_index(&configured, &[(ID, "from configured base")]);
+        assert_eq!(
+            latest_thread_name_in(&session, ID, Some(configured)),
+            Some("from configured base".to_string())
+        );
+    }
+
+    #[test]
+    fn title_reflects_a_rename_after_the_index_was_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = write_session(tmp.path(), "sessions");
+        write_index(tmp.path(), &[(ID, "before")]);
+        let home = Path::new("/nonexistent");
+        assert_eq!(
+            PLUGIN.resolve_title(&session, home),
+            Some("before".to_string())
+        );
+        write_index(tmp.path(), &[(ID, "before"), (ID, "after rename")]);
+        assert_eq!(
+            PLUGIN.resolve_title(&session, home),
+            Some("after rename".to_string())
         );
     }
 
