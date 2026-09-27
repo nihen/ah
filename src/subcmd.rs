@@ -17,9 +17,11 @@ struct ResolveLookupOpts {
 /// Resolve a session file path from the given options.
 ///
 /// Priority:
-/// 1. Stdin pipe (path from pipe)
-/// 2. Session (positional: ID or path)
-/// 3. Query / filters → latest matching session (via pipeline)
+/// 1. Session (ID or path, already read by `read_session_ref`)
+/// 2. Query / filters → latest matching session (via pipeline)
+///
+/// Stdin is not read here: callers resolve it once with `read_session_ref`,
+/// so an empty first line cannot make a second read pick up the next one.
 pub fn resolve_session(
     session: Option<&str>,
     query: Option<&str>,
@@ -74,11 +76,14 @@ fn resolve_session_inner(
     search_mode: SearchMode,
     opts: ResolveLookupOpts,
 ) -> Result<PathBuf, String> {
-    if let Some(session_ref) = read_session_ref(session) {
+    if let Some(session_ref) = session
+        .map(normalize_session_ref)
+        .filter(|session_ref| !session_ref.is_empty())
+    {
         return resolve_session_ref(&session_ref, home);
     }
 
-    // 3. Query / filters → latest via pipeline
+    // 2. Query / filters → latest via pipeline
     let q = query.unwrap_or("");
     let not_found_msg = if q.is_empty() {
         "No session found matching filters".to_string()
@@ -107,32 +112,178 @@ fn resolve_session_inner(
     }
 }
 
-/// Read an explicit session reference from stdin or positional argument.
-/// Stdin takes precedence over the positional argument when present.
+/// Read an explicit session reference from the positional argument or stdin.
+///
+/// A positional session always wins and stdin is left untouched, so
+/// `while read id; do ah show "$id"; done < ids` and callers whose stdin
+/// never closes behave as expected. An empty positional session (e.g. an
+/// unset `"$id"`) is an error rather than a silent fallback to the latest
+/// session. `-` reads the reference from stdin explicitly and fails when
+/// stdin has no reference. Without a positional session, a non-terminal
+/// stdin is read for one line; an empty line or EOF falls back to the
+/// query/filter lookup.
+///
 /// The returned value is intentionally left raw — TSV escape decoding is
 /// done lazily by `resolve_session_ref` (literal-first, then unescaped
 /// fallback) and by remote dispatch sites, so raw paths piped from
 /// non-`ah` producers (e.g. `echo C:\\temp\\sess.jsonl | ah show`) still
 /// resolve correctly.
-pub fn read_session_ref(session: Option<&str>) -> Option<String> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        let mut line = String::new();
-        let mut stdin = std::io::stdin().lock();
-        if std::io::BufRead::read_line(&mut stdin, &mut line).is_ok() {
-            let line = line.trim();
-            if !line.is_empty() {
-                let first_field = line.split('\t').next().unwrap_or(line);
-                let session_ref = normalize_session_ref(first_field);
-                if !session_ref.is_empty() {
-                    return Some(session_ref);
+pub fn read_session_ref(session: Option<&str>) -> Result<Option<String>, String> {
+    match session {
+        Some("-") => read_stdin_session_ref()?
+            .map(Some)
+            .ok_or_else(|| "No session reference on stdin (SESSION is '-')".to_string()),
+        Some(session) => {
+            let session_ref = normalize_session_ref(session);
+            if session_ref.is_empty() {
+                return Err("SESSION is empty".into());
+            }
+            Ok(Some(session_ref))
+        }
+        None if !std::io::IsTerminal::is_terminal(&std::io::stdin()) => read_stdin_session_ref(),
+        None => Ok(None),
+    }
+}
+
+fn read_stdin_session_ref() -> Result<Option<String>, String> {
+    let field = read_stdin_first_field().map_err(|e| format!("Failed to read stdin: {e}"))?;
+    stdin_field_to_session_ref(field)
+}
+
+fn stdin_field_to_session_ref(field: StdinField) -> Result<Option<String>, String> {
+    let text = String::from_utf8(field.bytes)
+        .map_err(|_| "Session reference on stdin is not valid UTF-8".to_string())?;
+    // Match `line.trim().split('\t').next()`: whitespace before a tab stays
+    // in the field when a non-blank column follows (so `path: \ttail` is
+    // still an empty LTSV value); otherwise `trim` also strips the tab and
+    // the field loses its trailing whitespace.
+    let text = if field.ended_by_tab {
+        text.trim_start()
+    } else {
+        text.trim()
+    };
+    Ok(Some(normalize_session_ref(text)).filter(|s| !s.is_empty()))
+}
+
+/// Longest session reference (first TSV field) accepted on stdin.
+const MAX_SESSION_REF_LEN: usize = 64 * 1024;
+
+#[derive(Debug)]
+struct StdinField {
+    bytes: Vec<u8>,
+    /// The field ended at a tab followed by a non-blank column.
+    ended_by_tab: bool,
+}
+
+/// Collects the first TSV field of one stdin line. Leading ASCII whitespace
+/// (including tabs) is skipped, everything after the first tab is only
+/// drained, and the field is capped at `MAX_SESSION_REF_LEN` so that long
+/// trailing columns (e.g. `-o path,transcript`) do not matter.
+#[derive(Default)]
+struct FirstField {
+    buf: Vec<u8>,
+    done: bool,
+    ended_by_tab: bool,
+    tail_nonblank: bool,
+    too_long: bool,
+}
+
+impl FirstField {
+    fn push(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.done {
+                if self.ended_by_tab && !self.tail_nonblank && !b.is_ascii_whitespace() {
+                    self.tail_nonblank = true;
                 }
+                if self.tail_nonblank || !self.ended_by_tab {
+                    return;
+                }
+                continue;
+            }
+            if self.buf.is_empty() && b.is_ascii_whitespace() {
+                continue;
+            }
+            if b == b'\t' {
+                self.done = true;
+                self.ended_by_tab = true;
+            } else if self.buf.len() < MAX_SESSION_REF_LEN {
+                self.buf.push(b);
+            } else {
+                self.too_long = true;
+                self.done = true;
             }
         }
     }
 
-    session
-        .map(normalize_session_ref)
-        .filter(|session_ref| !session_ref.is_empty())
+    fn finish(self) -> std::io::Result<StdinField> {
+        if self.too_long {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("session reference longer than {MAX_SESSION_REF_LEN} bytes"),
+            ));
+        }
+        Ok(StdinField {
+            bytes: self.buf,
+            ended_by_tab: self.ended_by_tab && self.tail_nonblank,
+        })
+    }
+}
+
+/// Read the first field of one stdin line without consuming anything after
+/// its newline, so the rest of a shared stdin (e.g.
+/// `{ ah show; ah show; } < refs`) stays available to the next reader.
+#[cfg(unix)]
+fn read_stdin_first_field() -> std::io::Result<StdinField> {
+    use std::io::Read;
+    use std::os::unix::io::FromRawFd;
+
+    // Bypass std's buffered stdin, which reads ahead past the newline.
+    // ManuallyDrop keeps fd 0 open when the File goes out of scope.
+    let mut stdin = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) });
+    let mut field = FirstField::default();
+    let mut byte = [0u8; 1];
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => field.push(&byte),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    field.finish()
+}
+
+/// Non-Unix fallback: std's buffered stdin may read past the first line, so
+/// a stdin shared by several `ah` invocations is not supported here.
+#[cfg(not(unix))]
+fn read_stdin_first_field() -> std::io::Result<StdinField> {
+    read_first_field(&mut std::io::stdin().lock())
+}
+
+/// Read the first field of one line from a buffered reader, consuming the
+/// line through its newline.
+#[cfg_attr(unix, allow(dead_code))]
+fn read_first_field(reader: &mut impl std::io::BufRead) -> std::io::Result<StdinField> {
+    let mut field = FirstField::default();
+    loop {
+        let buf = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if buf.is_empty() {
+            break;
+        }
+        let newline = buf.iter().position(|&b| b == b'\n');
+        field.push(&buf[..newline.unwrap_or(buf.len())]);
+        let used = newline.map_or(buf.len(), |i| i + 1);
+        reader.consume(used);
+        if newline.is_some() {
+            break;
+        }
+    }
+    field.finish()
 }
 
 /// Resolve a session reference: try as file path first, then as session ID.
@@ -296,6 +447,62 @@ fn resolve_fields_for_lookup(require_resume_cmd: bool) -> Vec<Field> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_field_reader_keeps_the_rest_and_bounds_only_the_first_field() {
+        // A tiny buffer forces lines to span several fill_buf() calls.
+        let exact = "a".repeat(MAX_SESSION_REF_LEN);
+        let over = "b".repeat(MAX_SESSION_REF_LEN + 1);
+        let long_tail = "t".repeat(MAX_SESSION_REF_LEN * 2);
+        let input = format!("{exact}\n{over}\n \tref\t{long_tail}\nlast");
+        let mut reader = std::io::BufReader::with_capacity(7, input.as_bytes());
+
+        let mut next = || read_first_field(&mut reader);
+        let field = next().unwrap();
+        assert_eq!(field.bytes, exact.as_bytes());
+        assert!(!field.ended_by_tab);
+        assert_eq!(next().unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        // Leading whitespace is skipped; a long trailing column is drained.
+        let field = next().unwrap();
+        assert_eq!(field.bytes, b"ref");
+        assert!(field.ended_by_tab);
+        assert_eq!(next().unwrap().bytes, b"last");
+        assert_eq!(next().unwrap().bytes, b"");
+    }
+
+    #[test]
+    fn stdin_field_trimming_matches_line_trim_then_split() {
+        // normalize_session_ref consults configured remotes.
+        crate::config::init(&crate::agents::common::canonical_home());
+        // Old behavior: normalize(line.trim().split('\t').next()).
+        let old = |line: &str| {
+            let first = line.trim().split('\t').next().unwrap_or("");
+            Some(normalize_session_ref(first)).filter(|s| !s.is_empty())
+        };
+        let new = |line: &str| {
+            let mut reader = std::io::BufReader::new(line.as_bytes());
+            stdin_field_to_session_ref(read_first_field(&mut reader).unwrap()).unwrap()
+        };
+        for line in [
+            "/a/b.jsonl",
+            "  /a/b.jsonl  \r\n",
+            " \t/a/b.jsonl\tx",
+            "/a/b.jsonl \tx",
+            "path:/a/b.jsonl\tx",
+            "path: \ttail",
+            "path: \t",
+            "path: \t\n",
+            "path: \t \r\n",
+            "path: \t \t x",
+            "path: ",
+            "path:",
+            "/a/b.jsonl\t\t",
+            "",
+            "\t\t",
+        ] {
+            assert_eq!(new(line), old(line), "{line:?}");
+        }
+    }
 
     #[test]
     fn resumable_lookup_resolves_resume_cmd_field() {

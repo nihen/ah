@@ -1218,6 +1218,145 @@ fn gemini_disabled_agent_owning_jsonl_keeps_legacy_file() {
         .stdout(format!("gemini\t{json}\n"));
 }
 
+// ─── Session reference from positional argument vs stdin ─────────────
+
+#[test]
+fn positional_session_ignores_piped_stdin() {
+    let (_tmp, session_path) = codex_session_copy();
+    ah().args(["show", "-o", "path", &session_path])
+        .write_stdin("/nonexistent/other.jsonl\n")
+        .assert()
+        .success()
+        .stdout(format!("{session_path}\n"));
+}
+
+#[test]
+fn dash_reads_session_from_stdin() {
+    let (_tmp, session_path) = codex_session_copy();
+    ah().args(["show", "-o", "path", "-"])
+        .write_stdin(format!("{session_path}\textra\n"))
+        .assert()
+        .success()
+        .stdout(format!("{session_path}\n"));
+}
+
+#[test]
+fn dash_with_empty_stdin_fails() {
+    ah().args(["resume", "--print", "-"])
+        .write_stdin("")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No session reference on stdin"));
+}
+
+#[test]
+fn empty_positional_session_is_an_error() {
+    for sub in [&["show", "-o", "path"][..], &["resume", "--print"][..]] {
+        for empty in ["", "  "] {
+            let (_tmp, session_path) = codex_session_copy();
+            ah().args(sub)
+                .arg(empty)
+                .write_stdin(format!("{session_path}\n"))
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("SESSION is empty"));
+        }
+    }
+}
+
+// Shared-stdin tests need `sh` and the unbuffered Unix stdin reader.
+#[cfg(unix)]
+#[test]
+fn overlong_stdin_line_is_rejected_and_fully_consumed() {
+    let (_tmp, session_path) = codex_session_copy();
+    let refs = TempDir::new().unwrap();
+    let refs_path = refs.path().join("refs.txt");
+    // A 70 KiB first line hides a valid path past the 64 KiB limit; the next
+    // reader must see the second line, not the tail of the first.
+    let long = format!("{}{session_path}", "x".repeat(70 * 1024));
+    fs::write(&refs_path, format!("{long}\n{session_path}\n")).unwrap();
+
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("\"$0\" show -o path -; echo \"rc=$?\"; \"$0\" show -o path -")
+        .arg(assert_cmd::cargo::cargo_bin("ah"))
+        .stdin(fs::File::open(&refs_path).unwrap())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout, format!("rc=1\n{session_path}\n"), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("longer than"));
+}
+
+#[test]
+fn long_trailing_columns_do_not_count_against_the_ref_limit() {
+    let (_tmp, session_path) = codex_session_copy();
+    let transcript = "t".repeat(200 * 1024);
+    ah().args(["show", "-o", "path"])
+        .write_stdin(format!("{session_path}\t{transcript}\n"))
+        .assert()
+        .success()
+        .stdout(format!("{session_path}\n"));
+}
+
+#[test]
+fn invalid_utf8_stdin_is_rejected() {
+    ah().args(["resume", "--print", "-"])
+        .write_stdin(b"/tmp/rollout-\xff.jsonl\n".to_vec())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not valid UTF-8"));
+}
+
+#[cfg(unix)]
+#[test]
+fn piped_session_ref_consumes_only_the_first_line() {
+    let (_tmp1, first) = codex_session_copy();
+    let (_tmp2, second) = codex_session_copy();
+    let refs = TempDir::new().unwrap();
+    let refs_path = refs.path().join("refs.txt");
+    fs::write(&refs_path, format!("{first}\n{second}\n")).unwrap();
+
+    // Two readers share one stdin; each must take exactly one line.
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("\"$0\" show -o path; \"$0\" show -o path")
+        .arg(assert_cmd::cargo::cargo_bin("ah"))
+        .stdin(fs::File::open(&refs_path).unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{first}\n{second}\n")
+    );
+}
+
+#[test]
+fn positional_session_does_not_wait_for_open_stdin() {
+    let (_tmp, session_path) = codex_session_copy();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("ah"))
+        .args(["show", "-o", "path", &session_path])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Keep the write end open: a stdin-first lookup would block here.
+    let _stdin = child.stdin.take();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("ah show blocked on an open stdin despite a positional session");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(status.success());
+}
+
 fn write_codex_rollout(dir: &Path, stamp: &str, id: &str) -> String {
     fs::create_dir_all(dir).unwrap();
     let path = dir.join(format!("rollout-{stamp}-{id}.jsonl"));

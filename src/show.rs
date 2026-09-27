@@ -39,7 +39,7 @@ fn highlight_text(text: &str, re: &regex::Regex) -> String {
 
 pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
     let home = canonical_home();
-    let explicit_session = subcmd::read_session_ref(args.session.as_deref());
+    let explicit_session = subcmd::read_session_ref(args.session.as_deref())?;
 
     if let Some(session) = explicit_session.as_deref() {
         let unquoted = strip_quotes(session);

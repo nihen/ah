@@ -10,8 +10,16 @@ use crate::resolver::{self, shell_quote};
 use crate::subcmd;
 
 pub fn run(args: ResumeArgs, filter: &FilterArgs) -> Result<(), String> {
+    let explicit_session = subcmd::read_session_ref(args.session.as_deref())?;
+    run_with_session(explicit_session, args, filter)
+}
+
+fn run_with_session(
+    explicit_session: Option<String>,
+    args: ResumeArgs,
+    filter: &FilterArgs,
+) -> Result<(), String> {
     let home = canonical_home();
-    let explicit_session = subcmd::read_session_ref(args.session.as_deref());
 
     if let Some(session) = explicit_session.as_deref() {
         let unquoted = strip_quotes(session);
@@ -42,7 +50,9 @@ pub fn run(args: ResumeArgs, filter: &FilterArgs) -> Result<(), String> {
     let full_cmd = if let Some(session) = explicit_session.as_deref() {
         build_resume_command_for_ref(&args, filter, session, &home)?
     } else {
-        build_resume_command(&args, filter)?
+        // `args.session` was already consumed by `read_session_ref`; do not
+        // look at it again here.
+        build_resume_command_for_lookup(&args, filter, &home)?
     };
     if args.print {
         println!("{}", full_cmd);
@@ -51,7 +61,8 @@ pub fn run(args: ResumeArgs, filter: &FilterArgs) -> Result<(), String> {
     exec_resume(&full_cmd);
 }
 
-pub fn build_resume_command(args: &ResumeArgs, filter: &FilterArgs) -> Result<String, String> {
+#[cfg(test)]
+fn build_resume_command(args: &ResumeArgs, filter: &FilterArgs) -> Result<String, String> {
     let home = canonical_home();
     if let Some(session) = args.session.as_deref() {
         build_resume_command_for_ref(args, filter, session, &home)
@@ -247,7 +258,7 @@ mod tests {
         let mut filter = default_filter();
         filter.remote = vec!["mydev".to_string()];
 
-        let result = run(args, &filter);
+        let result = run_with_session(None, args, &filter);
         assert!(result.is_err());
         assert!(
             result
