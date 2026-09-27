@@ -88,16 +88,20 @@ fn read_title_index(index_path: &Path) -> TitleIndex {
 /// Latest thread name of `session_id`: from the index next to the session
 /// file, then from the configured Codex base (`CODEX_HOME` or `~/.codex`).
 fn latest_thread_name(path: &Path, session_id: &str) -> Option<String> {
-    latest_thread_name_in(path, session_id, crate::config::resolve_agent_base("codex"))
+    static CONFIGURED_BASE: LazyLock<Option<PathBuf>> =
+        LazyLock::new(|| crate::config::resolve_agent_base("codex"));
+    latest_thread_name_in(path, session_id, CONFIGURED_BASE.as_deref())
 }
 
 fn latest_thread_name_in(
     path: &Path,
     session_id: &str,
-    configured: Option<PathBuf>,
+    configured: Option<&Path>,
 ) -> Option<String> {
-    let colocated = colocated_codex_home(path).map(Path::to_path_buf);
-    let mut homes = colocated.into_iter().chain(configured).collect::<Vec<_>>();
+    let mut homes = colocated_codex_home(path)
+        .into_iter()
+        .chain(configured)
+        .collect::<Vec<_>>();
     homes.dedup();
     homes.iter().find_map(|home| {
         title_index(&home.join("session_index.jsonl"))
@@ -309,7 +313,7 @@ mod tests {
         fs::create_dir_all(&configured).unwrap();
         write_index(&configured, &[(ID, "from configured base")]);
         assert_eq!(
-            latest_thread_name_in(&session, ID, Some(configured)),
+            latest_thread_name_in(&session, ID, Some(&configured)),
             Some("from configured base".to_string())
         );
     }
