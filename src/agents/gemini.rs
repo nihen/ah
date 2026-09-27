@@ -388,9 +388,10 @@ fn visit_function_part(part: &serde_json::Value, visit: &mut dyn FnMut(&str) -> 
     part.get("name")
         .and_then(|v| v.as_str())
         .is_none_or(&mut *visit)
-        && ["args", "response"]
-            .iter()
-            .all(|key| part.get(*key).is_none_or(|v| visit_all_strings(v, visit)))
+        && part.get("args").is_none_or(|v| visit_all_strings(v, visit))
+        && part
+            .get("response")
+            .is_none_or(|v| visit_tool_output(v, visit))
 }
 
 /// Answer text of a Gemini turn. `content` is a string, or (after a

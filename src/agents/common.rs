@@ -125,50 +125,43 @@ pub fn first_text_part(val: &serde_json::Value) -> Option<&str> {
         })
 }
 
-/// Keys of typed content parts (objects with a string `type`, e.g.
-/// `{"type":"image","source":{...}}` or `{"type":"input_text","text":...}`)
-/// that hold identifiers, type tags or encoded data rather than text.
-const PART_OPAQUE_KEYS: &[&str] = &[
-    "type",
-    "id",
-    "call_id",
-    "tool_use_id",
-    "tool_call_id",
-    "toolCallId",
-    "signature",
-    "encrypted_content",
-    "source",
-    "image_url",
-    "inlineData",
-    "mimeType",
-    "media_type",
-];
+/// `type`s of content parts whose only text is `text`.
+const TEXT_PART_TYPES: &[&str] = &["text", "input_text", "output_text"];
 
-/// Visit every string and number of `val` (e.g. a tool call's arguments,
-/// whose keys are the tool's own and may be named anything). Numbers are
-/// written verbatim in the raw bytes, like unescaped strings. Returns
-/// `false` when `visit` stops.
+/// `type`s of content parts that carry encoded media rather than text.
+const MEDIA_PART_TYPES: &[&str] = &["image", "input_image", "image_url", "document"];
+
+/// Visit every string of `val` (e.g. a tool call's arguments, whose keys are
+/// the tool's own and may be named anything). Numbers are not visited: their
+/// parsed form (`1e3` → `1000.0`) need not appear in the raw bytes, which
+/// the raw-bytes prefilters rely on. Returns `false` when `visit` stops.
 pub fn visit_all_strings(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
     match val {
         serde_json::Value::String(s) => visit(s),
-        serde_json::Value::Number(n) => visit(&n.to_string()),
         serde_json::Value::Array(items) => items.iter().all(|v| visit_all_strings(v, visit)),
         serde_json::Value::Object(map) => map.values().all(|v| visit_all_strings(v, visit)),
         _ => true,
     }
 }
 
-/// Visit the string values of a tool's output: a string, or content parts.
-/// In typed parts `PART_OPAQUE_KEYS` are skipped (image data, ids); other
-/// objects are the tool's own data and are visited in full.
+/// Visit the strings of a tool's output. Known content parts are reduced to
+/// their text (`{"type":"text","text":...}`) or skipped when they carry
+/// media (`{"type":"image","source":{...}}`, Gemini `inlineData`); any other
+/// object is the tool's own data and is visited in full.
 pub fn visit_tool_output(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
     match val {
         serde_json::Value::String(s) => visit(s),
         serde_json::Value::Array(items) => items.iter().all(|v| visit_tool_output(v, visit)),
         serde_json::Value::Object(map) => {
-            let typed = map.get("type").is_some_and(|v| v.is_string());
+            let kind = map.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if TEXT_PART_TYPES.contains(&kind) {
+                return map.get("text").is_none_or(|v| visit_tool_output(v, visit));
+            }
+            if MEDIA_PART_TYPES.contains(&kind) {
+                return true;
+            }
             map.iter()
-                .filter(|(key, _)| !typed || !PART_OPAQUE_KEYS.contains(&key.as_str()))
+                .filter(|(key, _)| key.as_str() != "inlineData")
                 .all(|(_, v)| visit_tool_output(v, visit))
         }
         _ => true,

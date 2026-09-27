@@ -674,6 +674,7 @@ mod tests {
                     r#"{"type":"assistant","message":{"content":[{"type":"text","text":"running"},{"type":"tool_use","id":"toolu_secret_id","name":"Bash","input":{"command":"cargo test tool-arg-needle"}}]}}"#,
                     r#"{"type":"user","message":{"content":[{"tool_use_id":"toolu_secret_id","type":"tool_result","content":"ok tool-out-needle"}]}}"#,
                     r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_x","content":[{"type":"text","text":"done"}]}]}}"#,
+                    r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_y","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAA"}}]}]}}"#,
                 ],
             ),
         ));
@@ -708,7 +709,7 @@ mod tests {
                 &[
                     r#"{"sessionId":"g-tools","projectHash":"x","startTime":"2026-06-11T02:44:54.529Z","lastUpdated":"2026-06-11T02:44:54.529Z","kind":"main"}"#,
                     r#"{"id":"m1","type":"user","content":[{"text":"use redis"}]}"#,
-                    r#"{"id":"m2","type":"gemini","content":"","toolCalls":[{"id":"call_id_g","name":"run_shell_command","args":{"command":"cat tool-arg-needle"},"result":[{"functionResponse":{"id":"call_id_g","name":"run_shell_command","response":{"output":"tool-out-needle"}}}]}]}"#,
+                    r#"{"id":"m2","type":"gemini","content":"","toolCalls":[{"id":"call_id_g","name":"run_shell_command","args":{"command":"cat tool-arg-needle"},"result":[{"functionResponse":{"id":"call_id_g","name":"run_shell_command","response":{"output":"tool-out-needle","content":[{"type":"image","source":{"data":"iVBORw0KGgoAAAA"}},{"inlineData":{"mimeType":"image/png","data":"iVBORw0KGgoBBBB"}}]}}}]}]}"#,
                 ],
             ),
         ));
@@ -876,6 +877,7 @@ mod tests {
                 }
             }
             for noise in [
+                "iVBORw0KGgo",
                 "tool_use_id",
                 "call_id",
                 "base_instructions",
@@ -1008,16 +1010,35 @@ mod tests {
                 ),
                 "needle",
             ),
-            // numeric tool arguments
+            // record types written with escapes
             (
                 "claude",
                 write(
-                    "numbers.jsonl",
+                    "escaped_type.jsonl",
+                    &[r#"{"type":"\u0075ser","message":{"content":"needle here"}}"#],
+                ),
+                "needle",
+            ),
+            (
+                "codex",
+                write(
+                    "escaped_type_codex.jsonl",
                     &[
-                        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"offset":98765}}]}}"#,
+                        r#"{"timestamp":"t","type":"response\u005fitem","payload":{"type":"function_call_output","output":"needle here"}}"#,
                     ],
                 ),
-                "98765",
+                "needle",
+            ),
+            // a tool's own data with a `type` field is not a content part
+            (
+                "claude",
+                write(
+                    "typed_output.jsonl",
+                    &[
+                        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"file","source":"unique.txt","content":"ok"}]}]}}"#,
+                    ],
+                ),
+                "unique",
             ),
             // prefixes follow the search's case-insensitive flag
             (

@@ -305,10 +305,11 @@ impl AgentPlugin for ClaudePlugin {
     /// Only `user` and `assistant` records hold search texts. A quoted
     /// `"type":"user"` outside a JSON string is always a real key.
     fn line_may_hold_search_texts(&self, line: &[u8]) -> bool {
-        // JSON allows whitespace around `:`.
+        // JSON allows whitespace around `:`; a `type` value with an escape
+        // cannot be read here, so its line is kept.
         static RECORD_TYPE: std::sync::LazyLock<regex::bytes::Regex> =
             std::sync::LazyLock::new(|| {
-                regex::bytes::Regex::new(r#""type"\s*:\s*"(?:user|assistant)""#).unwrap()
+                regex::bytes::Regex::new(r#""type"\s*:\s*"(?:user"|assistant"|[^"]*\\)"#).unwrap()
             });
         RECORD_TYPE.is_match(line)
     }

@@ -185,6 +185,10 @@ fn may_hold_search_text(line: &[u8]) -> bool {
     let Some(kind) = TYPE_VALUE.captures(head).and_then(|caps| caps.get(1)) else {
         return true;
     };
+    // a type written with escapes cannot be read here: keep the line
+    if kind.as_bytes().contains(&b'\\') {
+        return true;
+    }
     if kind.as_bytes() != b"response_item" || SKIPPED_PAYLOAD.is_match(head) {
         return false;
     }
