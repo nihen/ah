@@ -268,12 +268,14 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
         );
     }
 
-    // PID map + running field (Claude + Grok)
-    let pid_map = crate::build_pid_map();
+    // Running sessions reported by the agent plugins
+    let pid_map = crate::agents::running_session_map();
     for session in &mut sessions {
         let session_id = session.fields.get(&Field::Id).cloned().unwrap_or_default();
-        if let Some(&pid) = pid_map.get(&session_id) {
-            session.fields.insert(Field::Pid, pid.to_string());
+        if let Some(pid) = pid_map.get(&session_id) {
+            if let Some(pid) = pid {
+                session.fields.insert(Field::Pid, pid.to_string());
+            }
             session.fields.insert(Field::Running, "true".to_string());
         } else {
             session.fields.insert(Field::Running, "false".to_string());

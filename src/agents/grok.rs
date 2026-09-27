@@ -6,7 +6,9 @@ use super::Message;
 use super::common::canonicalize_if_exists;
 use super::common::first_text_part;
 use super::common::for_each_jsonl_value;
+use super::common::is_pid_alive;
 use super::common::is_safe_cli_id;
+use super::common::json_pid;
 use super::common::percent_decode;
 use super::common::strip_home;
 use super::common::tagged_user_body;
@@ -161,6 +163,32 @@ impl AgentPlugin for GrokPlugin {
         let id = self.resolve_resume_id(path, home)?;
         Some(vec!["grok".to_string(), "--resume".to_string(), id])
     }
+
+    fn running_sessions(&self) -> Vec<(String, Option<u32>)> {
+        crate::config::resolve_agent_base("grok")
+            .map(|base| running_in(&base.join("active_sessions.json")))
+            .unwrap_or_default()
+    }
+}
+
+/// Running sessions from `active_sessions.json`:
+/// `[{"session_id": "...", "pid": N, "cwd": "..."}]`.
+fn running_in(active_sessions: &Path) -> Vec<(String, Option<u32>)> {
+    let Some(val) = fs::read_to_string(active_sessions)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+    else {
+        return Vec::new();
+    };
+    val.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let pid = json_pid(entry, "pid")?;
+            let id = entry.get("session_id")?.as_str()?;
+            (!id.is_empty() && is_pid_alive(pid)).then(|| (id.to_string(), Some(pid)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -286,5 +314,23 @@ mod tests {
             PLUGIN.resolve_resume_id(&path, home).as_deref(),
             Some("0192-bbbb")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_in_keeps_live_entries_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("active_sessions.json");
+        let me = std::process::id();
+        fs::write(
+            &file,
+            format!(
+                r#"[{{"session_id":"live","pid":{me}}},{{"session_id":"dead","pid":{}}},{{"session_id":"","pid":{me}}},{{"pid":{me}}}]"#,
+                i32::MAX
+            ),
+        )
+        .unwrap();
+        assert_eq!(running_in(&file), vec![("live".to_string(), Some(me))]);
+        assert!(running_in(&dir.path().join("missing.json")).is_empty());
     }
 }
