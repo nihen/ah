@@ -182,10 +182,7 @@ fn read_stdin_line() -> std::io::Result<Vec<u8>> {
         }
     }
     if too_long {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("line longer than {MAX_STDIN_LINE} bytes"),
-        ));
+        return Err(line_too_long());
     }
     Ok(buf)
 }
@@ -194,15 +191,49 @@ fn read_stdin_line() -> std::io::Result<Vec<u8>> {
 /// a stdin shared by several `ah` invocations is not supported here.
 #[cfg(not(unix))]
 fn read_stdin_line() -> std::io::Result<Vec<u8>> {
+    read_bounded_line(&mut std::io::stdin().lock())
+}
+
+/// Read one line (without its newline) from a buffered reader, keeping at
+/// most `MAX_STDIN_LINE` bytes; a longer line is consumed through its
+/// newline and rejected.
+#[cfg_attr(unix, allow(dead_code))]
+fn read_bounded_line(reader: &mut impl std::io::BufRead) -> std::io::Result<Vec<u8>> {
     let mut line = Vec::new();
-    std::io::BufRead::read_until(&mut std::io::stdin().lock(), b'\n', &mut line)?;
-    if line.len() > MAX_STDIN_LINE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("line longer than {MAX_STDIN_LINE} bytes"),
-        ));
+    let mut too_long = false;
+    loop {
+        let buf = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if buf.is_empty() {
+            break;
+        }
+        let newline = buf.iter().position(|&b| b == b'\n');
+        let body = &buf[..newline.unwrap_or(buf.len())];
+        let room = MAX_STDIN_LINE - line.len();
+        if body.len() > room {
+            too_long = true;
+        }
+        line.extend_from_slice(&body[..body.len().min(room)]);
+        let used = newline.map_or(buf.len(), |i| i + 1);
+        reader.consume(used);
+        if newline.is_some() {
+            break;
+        }
+    }
+    if too_long {
+        return Err(line_too_long());
     }
     Ok(line)
+}
+
+fn line_too_long() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("line longer than {MAX_STDIN_LINE} bytes"),
+    )
 }
 
 /// Resolve a session reference: try as file path first, then as session ID.
@@ -341,6 +372,24 @@ fn resolve_fields_for_lookup(require_resume_cmd: bool) -> Vec<Field> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_line_reader_keeps_the_rest_and_rejects_overlong_lines() {
+        // A tiny buffer forces lines to span several fill_buf() calls.
+        let exact = "a".repeat(MAX_STDIN_LINE);
+        let over = "b".repeat(MAX_STDIN_LINE + 1);
+        let input = format!("{exact}\n{over}\nnext\nlast");
+        let mut reader = std::io::BufReader::with_capacity(7, input.as_bytes());
+
+        assert_eq!(read_bounded_line(&mut reader).unwrap(), exact.as_bytes());
+        assert_eq!(
+            read_bounded_line(&mut reader).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(read_bounded_line(&mut reader).unwrap(), b"next");
+        assert_eq!(read_bounded_line(&mut reader).unwrap(), b"last");
+        assert_eq!(read_bounded_line(&mut reader).unwrap(), b"");
+    }
 
     #[test]
     fn resumable_lookup_resolves_resume_cmd_field() {

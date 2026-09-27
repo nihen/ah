@@ -306,7 +306,7 @@ Usage:
 
 If SESSION is omitted, ah reads it from piped stdin (first line); if stdin is
 a terminal or empty, ah shows the latest session matching -q and other filters.
-Use - as SESSION to read it from stdin explicitly.
+Use - as SESSION to read it from stdin explicitly. An empty SESSION is an error.
 
 Transcript output:
   --head N                Show first N messages only
@@ -347,7 +347,7 @@ Usage:
 
 If SESSION is omitted, ah reads it from piped stdin (first line); if stdin is
 a terminal or empty, ah resumes the latest session matching -q and other filters.
-Use - as SESSION to read it from stdin explicitly.
+Use - as SESSION to read it from stdin explicitly. An empty SESSION is an error.
 
 Arguments after -- are passed directly to the agent command.
 
