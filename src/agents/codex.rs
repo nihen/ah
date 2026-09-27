@@ -9,9 +9,8 @@ use regex::Regex;
 
 use super::AgentPlugin;
 use super::Message;
-use super::common::for_each_jsonl_value;
 use super::common::format_mtime;
-use super::common::read_first_line_json;
+use super::common::mmap_file;
 use super::common::strip_home;
 
 static RE_CODEX_SESSIONS: LazyLock<Regex> =
@@ -113,6 +112,128 @@ fn latest_thread_name_in(
     })
 }
 
+/// Visit the user and assistant messages of a rollout. Only `response_item`
+/// lines that name a message role can hold one, so other lines are skipped
+/// before JSON parsing. This matters when the title falls back to the first
+/// prompt: sessions without a real user prompt are scanned to the end.
+fn for_each_message(data: &[u8], visit: &mut dyn FnMut(Message) -> bool) {
+    use memchr::memmem::Finder;
+    static RESPONSE_ITEM: LazyLock<Finder<'static>> =
+        LazyLock::new(|| Finder::new(b"\"response_item\""));
+    static USER: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\"user\""));
+    static ASSISTANT: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\"assistant\""));
+
+    for line in data.split(|&b| b == b'\n') {
+        if RESPONSE_ITEM.find(line).is_none()
+            || (USER.find(line).is_none() && ASSISTANT.find(line).is_none())
+        {
+            continue;
+        }
+        let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if !visit_message_value(&val, visit) {
+            return;
+        }
+    }
+}
+
+/// Visit the messages of one rollout line; `false` stops the iteration.
+fn visit_message_value(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -> bool) -> bool {
+    if val.get("type").and_then(|v| v.as_str()) != Some("response_item") {
+        return true;
+    }
+    let Some(contents) = val.pointer("/payload/content").and_then(|v| v.as_array()) else {
+        return true;
+    };
+    match val.pointer("/payload/role").and_then(|v| v.as_str()) {
+        Some("user") => {
+            for item in contents {
+                let is_user_text = matches!(
+                    item.get("type").and_then(|v| v.as_str()),
+                    Some("input_text" | "text")
+                );
+                if is_user_text {
+                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                        if !text.starts_with('<')
+                            && !text.starts_with("# ")
+                            && !visit(Message::user(text.to_string()))
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        Some("assistant") => {
+            for item in contents {
+                if item.get("type").and_then(|v| v.as_str()) == Some("output_text") {
+                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                        if !visit(Message::assistant(text.to_string())) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+/// The `session_meta` fields ah reads from the first line of a rollout.
+/// Each field is `None` unless it is a JSON string.
+#[derive(Clone)]
+struct SessionMeta {
+    id: Option<String>,
+    cwd: Option<String>,
+}
+
+/// Path, size and mtime of the cached file, and its metadata.
+type CachedMeta = (PathBuf, IndexStamp, SessionMeta);
+
+thread_local! {
+    static LAST_META: std::cell::RefCell<Option<CachedMeta>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Session metadata from the first line, or `None` when that line cannot be
+/// read as JSON. Listing a session resolves its id, cwd and title
+/// separately, so each thread keeps the last parsed line, re-read when the
+/// file's size or mtime changes.
+fn session_meta(path: &Path) -> Option<SessionMeta> {
+    let stamp = fs::metadata(path)
+        .ok()
+        .map(|m| (m.len(), m.modified().ok()));
+    let cached = LAST_META.with_borrow(|last| {
+        last.as_ref()
+            .filter(|(p, s, _)| p == path && *s == stamp)
+            .map(|(_, _, meta)| meta.clone())
+    });
+    if cached.is_some() {
+        return cached;
+    }
+    let meta = read_session_meta(path)?;
+    LAST_META.set(Some((path.to_path_buf(), stamp, meta.clone())));
+    Some(meta)
+}
+
+fn read_session_meta(path: &Path) -> Option<SessionMeta> {
+    let file = fs::File::open(path).ok()?;
+    let mut line = String::new();
+    BufReader::new(file).read_line(&mut line).ok()?;
+    let val = serde_json::from_str::<serde_json::Value>(&line).ok()?;
+    let field = |pointer| {
+        val.pointer(pointer)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    Some(SessionMeta {
+        id: field("/payload/id"),
+        cwd: field("/payload/cwd"),
+    })
+}
+
 pub static PLUGIN: CodexPlugin = CodexPlugin;
 
 pub struct CodexPlugin;
@@ -151,53 +272,18 @@ impl AgentPlugin for CodexPlugin {
     }
 
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
-        for_each_jsonl_value(path, |val| {
-            if val.get("type").and_then(|v| v.as_str()) != Some("response_item") {
-                return true;
-            }
+        if let Some(mmap) = mmap_file(path) {
+            for_each_message(&mmap, visit);
+        }
+    }
 
-            match val.pointer("/payload/role").and_then(|v| v.as_str()) {
-                Some("user") => {
-                    if let Some(contents) =
-                        val.pointer("/payload/content").and_then(|v| v.as_array())
-                    {
-                        for item in contents {
-                            let is_user_text = matches!(
-                                item.get("type").and_then(|v| v.as_str()),
-                                Some("input_text" | "text")
-                            );
-                            if is_user_text {
-                                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                                    if !text.starts_with('<')
-                                        && !text.starts_with("# ")
-                                        && !visit(Message::user(text.to_string()))
-                                    {
-                                        return false;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Some("assistant") => {
-                    if let Some(contents) =
-                        val.pointer("/payload/content").and_then(|v| v.as_array())
-                    {
-                        for item in contents {
-                            if item.get("type").and_then(|v| v.as_str()) == Some("output_text") {
-                                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                                    if !visit(Message::assistant(text.to_string())) {
-                                        return false;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-            true
-        });
+    fn iter_messages_from_bytes(
+        &self,
+        _path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(Message) -> bool,
+    ) {
+        for_each_message(data, visit);
     }
 
     fn resolve_project(&self, path: &Path, home: &Path) -> Option<String> {
@@ -219,17 +305,12 @@ impl AgentPlugin for CodexPlugin {
     }
 
     fn resolve_cwd(&self, path: &Path, _home: &Path) -> Option<String> {
-        let val = read_first_line_json(path)?;
-        val.pointer("/payload/cwd")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+        session_meta(path)?.cwd.filter(|s| !s.is_empty())
     }
 
     fn resolve_title(&self, path: &Path, _home: &Path) -> Option<String> {
-        let val = read_first_line_json(path)?;
-        let session_id = val.pointer("/payload/id")?.as_str()?;
-        latest_thread_name(path, session_id)
+        let session_id = session_meta(path)?.id?;
+        latest_thread_name(path, &session_id)
     }
 
     fn is_archived(&self, path: &Path) -> bool {
@@ -238,11 +319,11 @@ impl AgentPlugin for CodexPlugin {
 
     // `codex resume <id>` also finds archived sessions, so they keep their id.
     fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
-        let val = read_first_line_json(path)?;
-        if let Some(id) = val.pointer("/payload/id").and_then(|v| v.as_str()) {
-            if !id.is_empty() {
-                return Some(id.to_string());
-            }
+        // A first line that is not JSON (empty or partly written file) has
+        // no resumable id; only a readable line without one falls back to
+        // the file name.
+        if let Some(id) = session_meta(path)?.id.filter(|id| !id.is_empty()) {
+            return Some(id);
         }
 
         let stem = path.file_stem()?.to_string_lossy();
@@ -438,5 +519,178 @@ mod tests {
             vec![("0199-held".to_string(), Some(4242))]
         );
         assert!(running_in(dir.path(), &HashMap::new()).is_empty());
+    }
+
+    const ROLLOUT: &str = concat!(
+        r#"{"type":"session_meta","payload":{"id":"x","cwd":"/tmp/p","base_instructions":{"text":"user assistant"}}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"user_message","message":"not a response item"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"rules"}]}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>"}]}}"#,
+        "\n",
+        r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions"}]}}"##,
+        "\n",
+        r#"{"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix the bug"}]}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"role\":\"user\"}"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+        "\n",
+    );
+
+    fn collect(visit_all: impl FnOnce(&mut dyn FnMut(Message) -> bool)) -> Vec<Message> {
+        let mut messages = Vec::new();
+        visit_all(&mut |m| {
+            messages.push(m);
+            true
+        });
+        messages
+    }
+
+    #[test]
+    fn messages_skip_non_message_lines_and_injected_prompts() {
+        let messages = collect(|visit| for_each_message(ROLLOUT.as_bytes(), visit));
+        assert_eq!(
+            messages,
+            vec![
+                Message::user("fix the bug".to_string()),
+                Message::assistant("done".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn messages_from_file_and_bytes_agree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        fs::write(&path, ROLLOUT).unwrap();
+        let from_file = collect(|visit| PLUGIN.iter_messages(&path, visit));
+        let from_bytes =
+            collect(|visit| PLUGIN.iter_messages_from_bytes(&path, ROLLOUT.as_bytes(), visit));
+        assert_eq!(from_file, from_bytes);
+        assert_eq!(from_file.len(), 2);
+    }
+
+    #[test]
+    fn session_meta_is_reread_when_the_file_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        fs::write(&path, ROLLOUT).unwrap();
+        assert_eq!(
+            PLUGIN.resolve_cwd(&path, tmp.path()).as_deref(),
+            Some("/tmp/p")
+        );
+        assert_eq!(
+            PLUGIN.resolve_resume_id(&path, tmp.path()).as_deref(),
+            Some("x")
+        );
+
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"y","cwd":"/tmp/q"}}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let later = SystemTime::now() + std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(
+            PLUGIN.resolve_cwd(&path, tmp.path()).as_deref(),
+            Some("/tmp/q")
+        );
+        assert_eq!(
+            PLUGIN.resolve_resume_id(&path, tmp.path()).as_deref(),
+            Some("y")
+        );
+    }
+
+    #[test]
+    fn session_meta_is_reread_when_only_the_size_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        let fixed = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let write = |body: &str| {
+            fs::write(&path, body).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(fixed)
+                .unwrap();
+        };
+        write("{\"payload\":{\"id\":\"a\"}}\n");
+        assert_eq!(
+            PLUGIN.resolve_resume_id(&path, tmp.path()).as_deref(),
+            Some("a")
+        );
+        write("{\"payload\":{\"id\":\"longer\"}}\n");
+        assert_eq!(
+            PLUGIN.resolve_resume_id(&path, tmp.path()).as_deref(),
+            Some("longer")
+        );
+    }
+
+    #[test]
+    fn fields_are_read_independently_like_json_pointers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join(format!("rollout-2026-09-27T10-00-00-{ID}.jsonl"));
+        fs::write(&path, "{\"payload\":{\"id\":123,\"cwd\":\"/tmp/p\"}}\n").unwrap();
+        assert_eq!(
+            PLUGIN.resolve_cwd(&path, tmp.path()).as_deref(),
+            Some("/tmp/p")
+        );
+        // A readable line without a string id falls back to the file name.
+        assert_eq!(
+            PLUGIN.resolve_resume_id(&path, tmp.path()).as_deref(),
+            Some(ID)
+        );
+
+        fs::write(
+            &path,
+            "{\"payload\":{\"id\":\"real\",\"cwd\":1,\"cwd\":\"/tmp/q\"}}\n",
+        )
+        .unwrap();
+        let later = SystemTime::now() + std::time::Duration::from_secs(120);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(
+            PLUGIN.resolve_resume_id(&path, tmp.path()).as_deref(),
+            Some("real")
+        );
+        assert_eq!(
+            PLUGIN.resolve_cwd(&path, tmp.path()).as_deref(),
+            Some("/tmp/q")
+        );
+    }
+
+    #[test]
+    fn unreadable_first_line_has_no_resume_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        for body in ["", "{broken\n"] {
+            let path = tmp
+                .path()
+                .join(format!("rollout-2026-09-27T10-00-00-{ID}.jsonl"));
+            fs::write(&path, body).unwrap();
+            let later = SystemTime::now() + std::time::Duration::from_secs(body.len() as u64 + 1);
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+            assert_eq!(PLUGIN.resolve_resume_id(&path, tmp.path()), None);
+            assert_eq!(PLUGIN.resolve_cwd(&path, tmp.path()), None);
+        }
     }
 }
