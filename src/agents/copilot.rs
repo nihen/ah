@@ -203,6 +203,9 @@ impl AgentPlugin for CopilotPlugin {
     fn can_resume(&self) -> bool {
         true
     }
+    fn prompts_in_session_json(&self) -> bool {
+        true
+    }
 
     fn project_desc(&self) -> &'static str {
         "basename of cwd (raw: home-relative path of cwd)"
