@@ -87,8 +87,10 @@ fn builtin_env_info(agent_id: &str) -> Option<BuiltinInfo> {
             env_var: "COPILOT_HOME",
             default_prefix: ".copilot",
         }),
+        // cursor-agent keeps projects/ under CURSOR_DATA_DIR; CURSOR_CONFIG_DIR
+        // only moves its config files.
         "cursor" => Some(BuiltinInfo {
-            env_var: "CURSOR_CONFIG_DIR",
+            env_var: "CURSOR_DATA_DIR",
             default_prefix: ".cursor",
         }),
         "grok" => Some(BuiltinInfo {

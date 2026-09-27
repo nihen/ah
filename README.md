@@ -558,7 +558,7 @@ Each built-in agent respects its CLI's config directory environment variable:
 | Codex   | `sessions/**/*.jsonl` | `CODEX_HOME`       | `~/.codex`  |
 | Gemini  | `tmp/*/chats/session-*.jsonl` (`.json` before v0.39) | `GEMINI_CLI_HOME`  | `~/.gemini` |
 | Copilot | `session-state/*/workspace.yaml` | `COPILOT_HOME`     | `~/.copilot`|
-| Cursor  | `projects/*/agent-transcripts/**/*.jsonl` | `CURSOR_CONFIG_DIR`| `~/.cursor` |
+| Cursor  | `projects/*/agent-transcripts/**/*.jsonl` | `CURSOR_DATA_DIR`  | `~/.cursor` |
 | Antigravity (agy) | `antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl` | — | `~/.gemini` |
 | Grok    | `sessions/*/*/chat_history.jsonl` | `GROK_HOME`        | `~/.grok`   |
 | opencode | `opencode/opencode*.db` (SQLite) | `XDG_DATA_HOME` | `~/.local/share` |
