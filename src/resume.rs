@@ -179,6 +179,7 @@ mod tests {
             prompt_only: false,
             limit: 0,
             running: false,
+            no_archived: false,
             remote: vec![],
             since: None,
             until: None,

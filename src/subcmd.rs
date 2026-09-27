@@ -187,37 +187,59 @@ fn session_exists(path: &Path) -> bool {
 }
 
 fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
-    let files = collector::collect_files(0);
+    // Several files can hold one session (e.g. a Gemini log migrated from
+    // .json to .jsonl); pick the copy `ah log` lists. Explicit references
+    // also reach archived sessions.
+    let files = collector::collect_all_files(0);
     let resolve_fields = [Field::Id];
     let opts = resolver::ResolveOpts::default();
 
-    let mut prefix_match: Option<PathBuf> = None;
-    let mut prefix_ambiguous = false;
+    // Preferred file per session id: exact match, then id-prefix matches.
+    let mut exact: Option<(PathBuf, SystemTime)> = None;
+    let mut prefix_matches: Vec<(String, PathBuf, SystemTime)> = Vec::new();
+    let better = |a: &PathBuf, a_mtime: SystemTime, b: &PathBuf, b_mtime: SystemTime| {
+        pipeline::copy_preference(a, a_mtime) > pipeline::copy_preference(b, b_mtime)
+    };
 
     for (fpath, mtime) in &files {
         let plugin = agents::find_plugin_for_path(fpath);
         let fields = resolver::resolve_fields(fpath, plugin, *mtime, home, &resolve_fields, &opts);
-        if let Some(v) = fields.get(&Field::Id) {
-            if v == id {
+        let Some(v) = fields.get(&Field::Id) else {
+            continue;
+        };
+        if v == id {
+            // Files come newest first, so the first dedicated session file
+            // is the preferred copy; only a secondary record keeps looking.
+            if !plugin.is_secondary_record(fpath) {
                 return Ok(fpath.clone());
             }
-            if v.starts_with(id) {
-                if prefix_match.is_some() {
-                    prefix_ambiguous = true;
-                } else {
-                    prefix_match = Some(fpath.clone());
+            if exact
+                .as_ref()
+                .is_none_or(|(p, m)| better(fpath, *mtime, p, *m))
+            {
+                exact = Some((fpath.clone(), *mtime));
+            }
+        } else if v.starts_with(id) {
+            match prefix_matches.iter_mut().find(|(seen, _, _)| seen == v) {
+                Some(entry) => {
+                    if better(fpath, *mtime, &entry.1, entry.2) {
+                        entry.1 = fpath.clone();
+                        entry.2 = *mtime;
+                    }
                 }
+                None => prefix_matches.push((v.clone(), fpath.clone(), *mtime)),
             }
         }
     }
 
-    if prefix_ambiguous {
-        return Err(format!("Ambiguous session id prefix: {}", id));
-    }
-    if let Some(path) = prefix_match {
+    if let Some((path, _)) = exact {
         return Ok(path);
     }
-    Err(format!("No session found for id: {}", id))
+    match prefix_matches.len() {
+        0 => Err(format!("No session found for id: {}", id)),
+        1 => Ok(prefix_matches.remove(0).1),
+        _ => Err(format!("Ambiguous session id prefix: {}", id)),
+    }
 }
 
 fn normalize_session_ref(s: &str) -> String {

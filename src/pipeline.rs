@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::{Instant, SystemTime};
 
 use rayon::prelude::*;
@@ -127,7 +128,7 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
         None
     };
 
-    let mut sessions: Vec<Session> = files
+    let sessions: Vec<(Session, SystemTime)> = files
         .par_iter()
         .filter_map(|(path, mtime)| {
             // Time range filter
@@ -248,12 +249,16 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
                 return None;
             }
 
-            Some(Session {
-                path: path.clone(),
-                fields,
-            })
+            Some((
+                Session {
+                    path: path.clone(),
+                    fields,
+                },
+                *mtime,
+            ))
         })
         .collect();
+    let mut sessions = dedup_by_id(sessions);
 
     if debug {
         eprintln!(
@@ -297,50 +302,6 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
         }),
     }
 
-    // Deduplicate sessions with the same ID.
-    // When a tool (e.g. copilot) is invoked from within another agent, both may
-    // record the same session ID. Prefer the entry whose file path matches its agent.
-    {
-        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for (i, session) in sessions.iter().enumerate() {
-            let id = session
-                .fields
-                .get(&Field::Id)
-                .map(|v| v.as_str())
-                .unwrap_or("");
-            if id.is_empty() {
-                continue;
-            }
-            if seen.contains_key(id) {
-                // Keep the entry whose path matches the agent detected from path_markers
-                let path_agent = crate::config::find_agent_for_path(&session.path)
-                    .map(|a| a.id.as_str())
-                    .unwrap_or("");
-                let field_agent = session
-                    .fields
-                    .get(&Field::Agent)
-                    .map(|v| v.as_str())
-                    .unwrap_or("");
-                // Replace only if this entry's agent matches the session's agent field
-                // (i.e., this is the true owner, not a cross-agent duplicate).
-                // If Agent field was not resolved, keep first-seen entry.
-                if !field_agent.is_empty() && path_agent == field_agent {
-                    seen.insert(id.to_string(), i);
-                }
-                // Otherwise keep previous entry (first seen or true owner)
-            } else {
-                seen.insert(id.to_string(), i);
-            }
-        }
-        let keep: std::collections::HashSet<usize> = seen.values().copied().collect();
-        let mut idx = 0;
-        sessions.retain(|_| {
-            let k = keep.contains(&idx);
-            idx += 1;
-            k
-        });
-    }
-
     if debug {
         eprintln!(
             "[debug] pipeline: {} sessions final  ({:.1}ms total)",
@@ -350,6 +311,50 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
     }
 
     Ok(PipelineResult { sessions })
+}
+
+/// Preference among files that share a session id: a dedicated session file
+/// over a secondary record, then the most recently modified, then the path
+/// (for a stable choice). Shared by `log` and id lookups so both pick the
+/// same copy (e.g. a Gemini session migrated from .json to .jsonl).
+pub fn copy_preference(path: &Path, mtime: SystemTime) -> (bool, SystemTime, &Path) {
+    let secondary = agents::find_plugin_for_path(path).is_secondary_record(path);
+    (!secondary, mtime, path)
+}
+
+/// Keep one session per id, the copy `copy_preference` ranks highest.
+/// Sessions without an id are distinct and all kept.
+fn dedup_by_id(sessions: Vec<(Session, SystemTime)>) -> Vec<Session> {
+    let mut best: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, (session, mtime)) in sessions.iter().enumerate() {
+        let id = session
+            .fields
+            .get(&Field::Id)
+            .map(|v| v.as_str())
+            .unwrap_or("");
+        if id.is_empty() {
+            continue;
+        }
+        best.entry(id)
+            .and_modify(|j| {
+                let (other, other_mtime) = &sessions[*j];
+                if copy_preference(&session.path, *mtime)
+                    > copy_preference(&other.path, *other_mtime)
+                {
+                    *j = i;
+                }
+            })
+            .or_insert(i);
+    }
+    let keep: std::collections::HashSet<usize> = best.into_values().collect();
+    sessions
+        .into_iter()
+        .enumerate()
+        .filter(|(i, (session, _))| {
+            keep.contains(i) || session.fields.get(&Field::Id).is_none_or(|v| v.is_empty())
+        })
+        .map(|(_, (session, _))| session)
+        .collect()
 }
 
 /// Fast case-insensitive byte search for ASCII patterns using SIMD-accelerated memchr.

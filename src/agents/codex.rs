@@ -21,17 +21,20 @@ static RE_CODEX_DATE: LazyLock<Regex> =
 static RE_CODEX_ROLLOUT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^rollout-[\dT-]+-(.+)$").unwrap());
 
-/// Codex home of a session file: the parent of the `sessions` or
-/// `archived_sessions` directory that contains it.
+/// The nearest `sessions` or `archived_sessions` directory containing a
+/// session file.
+fn sessions_root(path: &Path) -> Option<&Path> {
+    path.ancestors().find(|dir| {
+        matches!(
+            dir.file_name().and_then(|s| s.to_str()),
+            Some("sessions" | "archived_sessions")
+        )
+    })
+}
+
+/// Codex home of a session file: the parent of its sessions root.
 fn colocated_codex_home(path: &Path) -> Option<&Path> {
-    path.ancestors()
-        .find(|dir| {
-            matches!(
-                dir.file_name().and_then(|s| s.to_str()),
-                Some("sessions" | "archived_sessions")
-            )
-        })
-        .and_then(|dir| dir.parent())
+    sessions_root(path).and_then(|dir| dir.parent())
 }
 
 type TitleIndex = HashMap<String, String>;
@@ -224,11 +227,12 @@ impl AgentPlugin for CodexPlugin {
         latest_thread_name(path, session_id)
     }
 
-    fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
-        if path.to_string_lossy().contains("/archived_sessions/") {
-            return None;
-        }
+    fn is_archived(&self, path: &Path) -> bool {
+        sessions_root(path).and_then(|dir| dir.file_name()) == Some("archived_sessions".as_ref())
+    }
 
+    // `codex resume <id>` also finds archived sessions, so they keep their id.
+    fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
         let val = read_first_line_json(path)?;
         if let Some(id) = val.pointer("/payload/id").and_then(|v| v.as_str()) {
             if !id.is_empty() {
@@ -343,6 +347,28 @@ mod tests {
         assert_eq!(
             PLUGIN.resolve_title(&session, Path::new("/nonexistent")),
             Some("real".to_string())
+        );
+    }
+
+    #[test]
+    fn archived_sessions_keep_their_resume_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let active = write_session(&home.join(".codex"), "sessions");
+        let archived = write_session(&home.join(".codex"), "archived_sessions");
+        assert!(!PLUGIN.is_archived(&active));
+        assert!(PLUGIN.is_archived(&archived));
+        assert_eq!(
+            PLUGIN.resolve_resume_id(&archived, home).as_deref(),
+            Some(ID)
+        );
+        assert_eq!(
+            PLUGIN.resume_args(&archived, home),
+            Some(vec![
+                "codex".to_string(),
+                "resume".to_string(),
+                ID.to_string()
+            ])
         );
     }
 }

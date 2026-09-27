@@ -2,8 +2,8 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ffi::OsString;
-use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Instant, SystemTime};
 
 use rayon::prelude::*;
@@ -12,8 +12,26 @@ use crate::agents::AgentPlugin;
 use crate::color;
 use crate::config;
 
+static EXCLUDE_ARCHIVED: AtomicBool = AtomicBool::new(false);
+
+/// Hide archived sessions from listings (`--no-archived`).
+pub fn init_exclude_archived(exclude: bool) {
+    EXCLUDE_ARCHIVED.store(exclude, AtomicOrdering::Relaxed);
+}
+
 /// Collect session files, sorted by mtime descending, limited to top N.
+/// Archived sessions are skipped when `--no-archived` is set.
 pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
+    collect(limit, EXCLUDE_ARCHIVED.load(AtomicOrdering::Relaxed))
+}
+
+/// Like `collect_files`, but always includes archived sessions (for lookups
+/// of an explicit session reference).
+pub fn collect_all_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
+    collect(limit, false)
+}
+
+fn collect(limit: usize, exclude_archived: bool) -> Vec<(PathBuf, SystemTime)> {
     let debug = color::is_debug();
     let t0 = if debug { Some(Instant::now()) } else { None };
 
@@ -52,7 +70,7 @@ pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
     let mut expanded: HashSet<PathBuf> = HashSet::new();
     let mut virtual_entries: HashMap<(&'static str, OsString), (PathBuf, SystemTime)> =
         HashMap::new();
-    let per_pattern: Vec<Vec<PathBuf>> = patterns
+    let per_pattern: Vec<(&'static dyn AgentPlugin, Vec<PathBuf>)> = patterns
         .iter()
         .zip(per_pattern)
         .map(|((plugin, _, unattributed), paths)| {
@@ -69,7 +87,9 @@ pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
                     Some(sessions) => {
                         for (session, mtime) in sessions {
                             // An unowned copy must not win over a good one.
-                            if !owned(&session) {
+                            if !owned(&session)
+                                || (exclude_archived && plugin.is_archived(&session))
+                            {
                                 continue;
                             }
                             let key = (
@@ -92,20 +112,30 @@ pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
                     None => files.push(path),
                 }
             }
-            files
+            (*plugin, files)
         })
         .collect();
 
-    let all_paths: HashSet<PathBuf> = per_pattern.into_iter().flatten().collect();
+    // Each file keeps the plugin of the first pattern that matched it.
+    let mut all_paths: HashMap<PathBuf, &'static dyn AgentPlugin> = HashMap::new();
+    for (plugin, files) in per_pattern {
+        for path in files {
+            all_paths.entry(path).or_insert(plugin);
+        }
+    }
     let unique_count = all_paths.len();
 
-    // Parallel stat
+    // Parallel stat. The matching pattern's plugin decides the session's
+    // mtime (e.g. Copilot's events.jsonl is newer than the workspace.yaml the
+    // glob matched), so time filters, `-n` and project dates agree with
+    // `modified_at`.
     let mut entries: Vec<(PathBuf, SystemTime)> = all_paths
         .into_par_iter()
-        .filter_map(|path| {
-            fs::metadata(&path)
-                .ok()
-                .and_then(|meta| meta.modified().ok().map(|mtime| (path, mtime)))
+        .filter_map(|(path, plugin)| {
+            if exclude_archived && plugin.is_archived(&path) {
+                return None;
+            }
+            plugin.session_mtime(&path).map(|mtime| (path, mtime))
         })
         .collect();
     let mut virtual_entries: Vec<_> = virtual_entries.into_values().collect();

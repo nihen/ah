@@ -235,6 +235,7 @@ Global options:
   --no-preview            Disable preview in interactive mode
   --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
   --running               Show only currently running sessions (Claude, Grok)
+  --no-archived           Hide sessions the agent has archived (Codex)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
@@ -569,6 +570,8 @@ Each built-in agent respects its CLI's config directory environment variable:
 | opencode | `opencode/opencode*.db` (SQLite) | `XDG_DATA_HOME` | `~/.local/share` |
 
 opencode stores all sessions in one SQLite database. `ah` reads it read-only and lists each top-level session (subagent sessions are skipped) under the virtual path `<db>/<session-id>`, which works with `ah show`, `ah resume`, and `-o path` like a regular session file. `ah show --raw` prints one JSON line per message with its parts.
+
+Codex sessions archived with `codex archive` stay listed and resumable (`codex resume` still finds them). They carry `archived=true` (`-o archived`); hide them with `--no-archived`.
 
 Run `ah list-agents` to see the full configuration including glob patterns and capabilities.
 
