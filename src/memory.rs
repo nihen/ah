@@ -288,9 +288,15 @@ const RECURSIVE_GLOB_MAX_DEPTH: usize = 16;
 /// without cycle detection, so recursive patterns are walked here instead,
 /// skipping directories already visited (by canonical path).
 fn glob_files(pattern: &str) -> Vec<PathBuf> {
-    // `.`/`..` components need the glob crate's component-wise handling.
-    let dot_components = pattern.split('/').any(|c| c == "." || c == "..");
-    if !pattern.contains("**") || dot_components {
+    // `.` components are no-ops; drop them so they do not defeat matching.
+    // `..` depends on symlinks and is left to the glob crate.
+    let normalized: String = pattern
+        .split('/')
+        .filter(|c| *c != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    let pattern = normalized.as_str();
+    if !pattern.contains("**") || pattern.split('/').any(|c| c == "..") {
         return glob::glob(pattern)
             .into_iter()
             .flatten()
@@ -525,9 +531,10 @@ pub fn build_memory_records(
     ));
     // A project scan of the home directory itself reaches global files
     // (e.g. `~/.claude/CLAUDE.md` as `<dir>/.claude/CLAUDE.md`); those stay
-    // global. Files are compared by their resolved directory and own name,
-    // so a project file that is itself a symlink to/from a global one keeps
-    // its project attribution.
+    // global. Global files are keyed by their resolved directory and own
+    // name (so a symlinked home still matches), project files by the
+    // resolved project directory plus their path inside it (so symlinks
+    // inside the project keep their project attribution).
     let global_paths: HashSet<(PathBuf, &'static str)> = global_entries
         .iter()
         .map(|e| (location_key(&e.path), e.agent))
@@ -552,14 +559,24 @@ pub fn build_memory_records(
     };
     let project_entries: Vec<Vec<MemoryEntry>> = project_dirs
         .par_iter()
-        .map(|dir| collect_project_files(dir, &plugins, with_skills))
+        .map(|dir| {
+            // Only the project directory itself is resolved: a symlinked
+            // directory inside the project (e.g. `.claude/rules` shared with
+            // `~/.claude/rules`) keeps its files attributed to the project.
+            let root = fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+            collect_project_files(dir, &plugins, with_skills)
+                .into_iter()
+                .filter(|e| {
+                    let key = match e.path.strip_prefix(dir) {
+                        Ok(rel) => root.join(rel),
+                        Err(_) => location_key(&e.path),
+                    };
+                    !global_paths.contains(&(key, e.agent))
+                })
+                .collect()
+        })
         .collect();
-    entries.extend(
-        project_entries
-            .into_iter()
-            .flatten()
-            .filter(|e| !global_paths.contains(&(location_key(&e.path), e.agent))),
-    );
+    entries.extend(project_entries.into_iter().flatten());
     entries.extend(global_entries);
 
     if entries.is_empty() {

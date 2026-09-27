@@ -35,30 +35,27 @@ fn gemini_base(home: &Path) -> PathBuf {
 /// Context file names Gemini CLI loads (`GEMINI.md` unless `settings.json`
 /// sets `context.fileName` or the older `contextFileName`, either a string
 /// or a list). Names are escaped for use in glob patterns.
-fn context_file_names(base: &Path) -> &'static [String] {
-    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    NAMES.get_or_init(|| {
-        let settings = fs::read_to_string(base.join("settings.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-        let configured = settings.as_ref().and_then(|s| {
-            s.pointer("/context/fileName")
-                .or_else(|| s.get("contextFileName"))
-        });
-        let mut names: Vec<String> = match configured {
-            Some(serde_json::Value::String(name)) => vec![name.clone()],
-            Some(serde_json::Value::Array(items)) => items
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect(),
-            _ => Vec::new(),
-        };
-        names.retain(|n| !n.is_empty() && !n.contains('/'));
-        if names.is_empty() {
-            names.push("GEMINI.md".to_string());
-        }
-        names.iter().map(|n| glob::Pattern::escape(n)).collect()
-    })
+fn context_file_names(base: &Path) -> Vec<String> {
+    let settings = fs::read_to_string(base.join("settings.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let configured = settings.as_ref().and_then(|s| {
+        s.pointer("/context/fileName")
+            .or_else(|| s.get("contextFileName"))
+    });
+    let mut names: Vec<String> = match configured {
+        Some(serde_json::Value::String(name)) => vec![name.clone()],
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    names.retain(|n| !n.is_empty() && !n.contains('/'));
+    if names.is_empty() {
+        names.push("GEMINI.md".to_string());
+    }
+    names.iter().map(|n| glob::Pattern::escape(n)).collect()
 }
 
 /// Whether `path` is listed as a Gemini session on its own: it is attributed

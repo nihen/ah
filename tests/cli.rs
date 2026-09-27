@@ -2129,3 +2129,51 @@ fn memory_recursive_patterns_survive_symlink_cycles() {
         .success()
         .stdout("claude\trule\tr.md\n");
 }
+
+#[cfg(unix)]
+#[test]
+fn memory_symlinked_project_directory_keeps_project_attribution() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    fs::create_dir_all(home.join(".claude/rules")).unwrap();
+    fs::write(home.join(".claude/rules/shared.md"), "shared rule\n").unwrap();
+    let repo = home.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::create_dir_all(repo.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(home.join(".claude/rules"), repo.join(".claude/rules")).unwrap();
+
+    let assert = memory_cmd(&home, &repo)
+        .args(["memory", "--tsv", "-o", "agent,project,name"])
+        .write_stdin("")
+        .assert()
+        .success();
+    let mut rows: Vec<String> = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    rows.sort();
+    // The same file is listed once, attributed to the project (#35).
+    assert_eq!(rows, vec!["claude\trepo\tshared.md"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_dot_components_do_not_bypass_cycle_protection() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let rules = home.join(".claude/rules");
+    fs::create_dir_all(&rules).unwrap();
+    fs::write(rules.join("r.md"), "rule\n").unwrap();
+    std::os::unix::fs::symlink(".", rules.join("l1")).unwrap();
+    std::os::unix::fs::symlink(".", rules.join("l2")).unwrap();
+
+    memory_cmd(&home, &home)
+        .env("CLAUDE_CONFIG_DIR", home.join(".").join(".claude"))
+        .timeout(std::time::Duration::from_secs(20))
+        .args(["memory", "--tsv", "-o", "agent,type,name"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("claude\trule\tr.md\n");
+}
