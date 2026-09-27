@@ -61,6 +61,9 @@ fn build_remote_args(remote: &RemoteDef, fields: &[Field], filter: &FilterArgs) 
     if filter.running {
         args.push("--running".to_string());
     }
+    if filter.no_archived {
+        args.push("--no-archived".to_string());
+    }
 
     args
 }
@@ -703,6 +706,9 @@ fn fetch_one_agent_stats(
         args.push("--until".to_string());
         args.push(u.clone());
     }
+    if filter.no_archived {
+        args.push("--no-archived".to_string());
+    }
 
     let stdout = run_ssh_capture(&remote.name, &remote.host, &args)?;
     let mut stats = Vec::new();
@@ -846,6 +852,9 @@ fn forward_common_filters(args: &mut Vec<String>, filter: &FilterArgs) {
     if let Some(ref u) = filter.until {
         args.push("--until".to_string());
         args.push(u.clone());
+    }
+    if filter.no_archived {
+        args.push("--no-archived".to_string());
     }
 }
 
@@ -1065,6 +1074,7 @@ mod tests {
             since: None,
             until: None,
             running: false,
+            no_archived: false,
             remote: vec![],
             color: false,
             no_color: false,
@@ -1105,6 +1115,7 @@ mod tests {
             since: Some("3d".to_string()),
             until: None,
             running: false,
+            no_archived: false,
             remote: vec![],
             color: false,
             no_color: false,

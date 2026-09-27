@@ -107,6 +107,7 @@ pub enum Field {
     Size,
     Running,
     Pid,
+    Archived,
 }
 
 impl Field {
@@ -133,6 +134,7 @@ impl Field {
             Field::Size => "size",
             Field::Running => "running",
             Field::Pid => "pid",
+            Field::Archived => "archived",
         }
     }
 
@@ -159,11 +161,12 @@ impl Field {
             Field::Size,
             Field::Running,
             Field::Pid,
+            Field::Archived,
         ]
     }
 
     pub fn all_names() -> &'static str {
-        "agent, project, project_raw, modified_at, created_at, title, first_prompt, last_prompt, prompts, responses, messages, transcript, matched, path, cwd, id, resume_cmd, turns, size, running, pid"
+        "agent, project, project_raw, modified_at, created_at, title, first_prompt, last_prompt, prompts, responses, messages, transcript, matched, path, cwd, id, resume_cmd, turns, size, running, pid, archived"
     }
 
     pub fn description(&self) -> &'static str {
@@ -189,6 +192,7 @@ impl Field {
             Field::Size => "Session file size in bytes",
             Field::Running => "Whether the session is currently running",
             Field::Pid => "PID of running agent process",
+            Field::Archived => "Whether the agent archived the session (Codex)",
         }
     }
 
@@ -217,6 +221,7 @@ impl Field {
             Field::Size => "34567",
             Field::Running => "true",
             Field::Pid => "12345",
+            Field::Archived => "false",
         }
     }
 
@@ -251,6 +256,7 @@ impl FromStr for Field {
             "size" => Ok(Field::Size),
             "running" => Ok(Field::Running),
             "pid" => Ok(Field::Pid),
+            "archived" => Ok(Field::Archived),
             _ => Err(format!(
                 "unknown field '{}'. available: {}",
                 s,
@@ -468,6 +474,10 @@ pub struct FilterArgs {
     /// Show only currently running sessions (Claude, Grok)
     #[arg(long = "running", global = true)]
     pub running: bool,
+
+    /// Hide sessions the agent has archived (Codex)
+    #[arg(long = "no-archived", global = true)]
+    pub no_archived: bool,
 
     /// Include sessions from a remote host (repeatable; name must match [remotes.*] in ~/.ahrc)
     #[arg(long = "remote", global = true, conflicts_with = "dir")]
@@ -1562,6 +1572,7 @@ Global options:
   --no-preview            Disable preview in interactive mode
   --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
   --running               Show only currently running sessions (Claude, Grok)
+  --no-archived           Hide sessions the agent has archived (Codex)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
@@ -1597,6 +1608,7 @@ const GLOBAL_OPTIONS: &str = r#"Global options:
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --running               Show only currently running sessions (Claude, Grok)
+  --no-archived           Hide sessions the agent has archived (Codex)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --color                 Force colored output (even through pipes)
   --no-color              Disable colored output
@@ -1928,7 +1940,7 @@ mod tests {
 
     #[test]
     fn test_field_all_count() {
-        assert_eq!(Field::all().len(), 21);
+        assert_eq!(Field::all().len(), 22);
     }
 
     #[test]

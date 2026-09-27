@@ -122,6 +122,19 @@ pub trait AgentPlugin: Sync {
         fs::metadata(path).map(|m| m.len()).ok()
     }
 
+    /// Whether this file is only a secondary record of its session (e.g.
+    /// Gemini's per-project `logs.json` prompt log). When several files
+    /// share a session id, a dedicated session file wins over such a copy.
+    fn is_secondary_record(&self, _path: &Path) -> bool {
+        false
+    }
+
+    /// Whether the agent has archived this session (hidden from its own
+    /// session picker but still resumable).
+    fn is_archived(&self, _path: &Path) -> bool {
+        false
+    }
+
     /// Bytes used for full-text search. Defaults to mmapping `search_path`.
     fn session_bytes(&self, path: &Path) -> Option<SessionBytes> {
         mmap_file(&self.search_path(path)).map(SessionBytes::Mmap)

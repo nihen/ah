@@ -676,6 +676,7 @@ pub fn resolve_fields_with_mmap(
             Field::Id => plugin.resolve_resume_id(path, home).unwrap_or_default(),
             Field::ResumeCmd => resolve_resume_command(path, plugin, home, &cwd),
             Field::Size => resolve_size(path, plugin).to_string(),
+            Field::Archived => plugin.is_archived(path).to_string(),
             Field::Matched => resolve_matched(path, plugin, opts, preloaded_mmap),
             _ => String::new(),
         };

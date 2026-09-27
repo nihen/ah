@@ -961,8 +961,8 @@ fn broad_extra_pattern_keeps_attributable_files_only() {
             "claude\t{}\n",
             other.join("abc.jsonl").to_string_lossy()
         ));
-    // `log` drops id-less sessions; `project` would list a stray file as
-    // an `unknown` agent if it were collected.
+    // `project` would list a stray file as an `unknown` agent if it were
+    // collected.
     ah_opencode(&home)
         .env_remove("CLAUDE_CONFIG_DIR")
         .args(["project", "-o", "agents"])
@@ -1192,7 +1192,8 @@ fn gemini_unreadable_jsonl_keeps_legacy_file() {
             .args(["log", "-a", "-o", "path"])
             .assert()
             .success()
-            .stdout(format!("{json}\n"));
+            // The unreadable .jsonl has no id and is listed on its own.
+            .stdout(predicate::str::contains(format!("{json}\n")));
     }
 }
 
@@ -1213,6 +1214,7 @@ fn gemini_disabled_agent_owning_jsonl_keeps_legacy_file() {
         .args(["log", "-a", "-o", "agent,path"])
         .assert()
         .success()
+        // The disabled agent's .jsonl stays hidden.
         .stdout(format!("gemini\t{json}\n"));
 }
 
@@ -1353,4 +1355,272 @@ fn positional_session_does_not_wait_for_open_stdin() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     assert!(status.success());
+}
+
+fn write_codex_rollout(dir: &Path, stamp: &str, id: &str) -> String {
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join(format!("rollout-{stamp}-{id}.jsonl"));
+    let body = format!(
+        "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"/tmp/proj\"}}}}\n\
+         {{\"type\":\"response_item\",\"payload\":{{\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"hello {id}\"}}]}}}}\n"
+    );
+    fs::write(&path, body).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+fn ah_codex(home: &Path) -> Command {
+    let mut cmd = ah_opencode(home);
+    cmd.env("CODEX_HOME", home.join(".codex"));
+    cmd
+}
+
+fn set_mtime(path: &str, ago_secs: u64) {
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(ago_secs);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+#[test]
+fn codex_archived_sessions_are_listed_and_resumable() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let codex = home.join(".codex");
+    let active_id = "019c0000-0000-7000-8000-00000000aaaa";
+    let archived_id = "019c0000-0000-7000-8000-00000000bbbb";
+    write_codex_rollout(
+        &codex.join("sessions/2026/09/27"),
+        "2026-09-27T10-00-00",
+        active_id,
+    );
+    let archived = write_codex_rollout(
+        &codex.join("archived_sessions"),
+        "2026-09-26T10-00-00",
+        archived_id,
+    );
+
+    ah_codex(&home)
+        .args(["log", "-a", "-o", "id,archived", "-S", "id", "--asc"])
+        .assert()
+        .success()
+        .stdout(format!("{active_id}\tfalse\n{archived_id}\ttrue\n"));
+
+    ah_codex(&home)
+        .args(["log", "-a", "--no-archived", "-o", "id"])
+        .assert()
+        .success()
+        .stdout(format!("{active_id}\n"));
+
+    // `ah agent` and `ah log` count the same sessions.
+    ah_codex(&home)
+        .args(["agent", "-a", "--tsv"])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("codex\t2\t"));
+
+    // An explicit id reaches an archived session even with --no-archived.
+    ah_codex(&home)
+        .args(["show", "--no-archived", "-o", "path", &archived_id[..34]])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout(format!("{archived}\n"));
+
+    ah_codex(&home)
+        .args(["resume", "--print", archived_id])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "'codex' 'resume' '{archived_id}'"
+        )));
+}
+
+#[test]
+fn log_keeps_sessions_without_an_id() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let dir = home.join(".codex/sessions/2026/09/27");
+    fs::create_dir_all(&dir).unwrap();
+    // No session_meta line and no id in the file name: the session has no id.
+    for name in ["a.jsonl", "b.jsonl"] {
+        fs::write(
+            dir.join(name),
+            "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}}\n",
+        )
+        .unwrap();
+    }
+    ah_codex(&home)
+        .args(["log", "-a", "-o", "path", "-S", "path", "--asc"])
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n{}\n",
+            dir.join("a.jsonl").display(),
+            dir.join("b.jsonl").display()
+        ));
+}
+
+#[test]
+fn duplicate_session_id_resolves_to_newest_copy() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let codex = home.join(".codex");
+    let id = "019c0000-0000-7000-8000-00000000cccc";
+    let old = write_codex_rollout(
+        &codex.join("sessions/2026/09/26"),
+        "2026-09-26T10-00-00",
+        id,
+    );
+    let new = write_codex_rollout(
+        &codex.join("sessions/2026/09/27"),
+        "2026-09-27T10-00-00",
+        id,
+    );
+    set_mtime(&old, 3600);
+
+    for order in ["--asc", "--desc"] {
+        ah_codex(&home)
+            .args(["log", "-a", "-o", "path", order])
+            .assert()
+            .success()
+            .stdout(format!("{new}\n"));
+    }
+    // A short id matching two files of one session is not ambiguous.
+    ah_codex(&home)
+        .args(["show", "-o", "path", &id[..30]])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout(format!("{new}\n"));
+}
+
+#[test]
+fn copilot_time_filters_use_events_mtime() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let dir = home.join(".copilot/session-state/0192aaaa-0000-7000-8000-000000000001");
+    fs::create_dir_all(&dir).unwrap();
+    let yaml = dir.join("workspace.yaml");
+    fs::write(
+        &yaml,
+        "id: 0192aaaa-0000-7000-8000-000000000001\ncwd: /tmp/proj\nname: copilot session\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("events.jsonl"),
+        "{\"type\":\"user.message\",\"data\":{\"content\":\"hello\"}}\n",
+    )
+    .unwrap();
+    set_mtime(yaml.to_str().unwrap(), 10 * 86400);
+
+    ah_opencode(&home)
+        .env("COPILOT_HOME", home.join(".copilot"))
+        .args(["log", "-a", "--since", "1d", "-o", "title"])
+        .assert()
+        .success()
+        .stdout("copilot session\n");
+}
+
+#[test]
+fn gemini_session_file_wins_over_newer_logs_json() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let project = home.join(".gemini/tmp/proj");
+    let chats = project.join("chats");
+    fs::create_dir_all(&chats).unwrap();
+    let chat = chats.join("session-2026-06-11T20-44-gemlog01.json");
+    fs::write(
+        &chat,
+        r#"{"sessionId":"gemlog01-0000","messages":[{"type":"user","content":[{"text":"hi"}]}]}"#,
+    )
+    .unwrap();
+    let chat = chat.to_str().unwrap().to_string();
+    set_mtime(&chat, 3600);
+    // The prompt log is newer but only a secondary record of the session.
+    fs::write(
+        project.join("logs.json"),
+        r#"[{"sessionId":"gemlog01-0000","type":"user","message":"hi"}]"#,
+    )
+    .unwrap();
+
+    ah_opencode(&home)
+        .env_remove("GEMINI_CLI_HOME")
+        .args(["log", "-a", "-o", "path"])
+        .assert()
+        .success()
+        .stdout(format!("{chat}\n"));
+    ah_opencode(&home)
+        .env_remove("GEMINI_CLI_HOME")
+        .args(["show", "-o", "path", "gemlog01-0000"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout(format!("{chat}\n"));
+}
+
+#[test]
+fn duplicate_session_id_with_equal_mtime_resolves_consistently() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let codex = home.join(".codex");
+    let id = "019c0000-0000-7000-8000-00000000dddd";
+    let a = write_codex_rollout(&codex.join("sessions/a"), "2026-09-27T10-00-00", id);
+    let z = write_codex_rollout(&codex.join("sessions/z"), "2026-09-27T10-00-00", id);
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    for path in [&a, &z] {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+    // Ties are broken by path, the same way in log and in id lookups.
+    for _ in 0..5 {
+        ah_codex(&home)
+            .args(["log", "-a", "-o", "path"])
+            .assert()
+            .success()
+            .stdout(format!("{z}\n"));
+        ah_codex(&home)
+            .args(["show", "-o", "path", id])
+            .write_stdin("")
+            .assert()
+            .success()
+            .stdout(format!("{z}\n"));
+    }
+}
+
+#[test]
+fn no_archived_uses_the_attributed_agent() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    // A custom Codex agent whose files live under a Claude-looking path.
+    let dir = home.join("logs/.claude/projects/archived_sessions");
+    let id = "019c0000-0000-7000-8000-00000000eeee";
+    write_codex_rollout(&dir, "2026-09-27T10-00-00", id);
+    fs::write(
+        home.join(".ahrc"),
+        format!(
+            "[agents.customcodex]\nplugin = \"codex\"\nfile_patterns = [\"{}/*.jsonl\"]\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    ah_codex(&home)
+        .env("CLAUDE_CONFIG_DIR", home.join("logs/.claude"))
+        .args(["log", "-a", "-o", "agent,archived"])
+        .assert()
+        .success()
+        .stdout("customcodex\ttrue\n");
+    ah_codex(&home)
+        .env("CLAUDE_CONFIG_DIR", home.join("logs/.claude"))
+        .args(["log", "-a", "--no-archived", "-o", "agent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No sessions found"));
 }

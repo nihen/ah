@@ -269,9 +269,10 @@ fn collect_project_instructions(dir: &Path) -> Vec<MemoryEntry> {
 }
 
 /// Collect known project cwds from session files (for -a mode).
+/// `--no-archived` hides sessions, not the projects they reveal.
 fn collect_known_project_cwds() -> Vec<String> {
     let home = canonical_home();
-    let files = collector::collect_files(0);
+    let files = collector::collect_all_files(0);
     let resolve_fields = vec![Field::Cwd];
 
     let cwds: HashSet<String> = files

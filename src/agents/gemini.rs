@@ -414,6 +414,10 @@ impl AgentPlugin for GeminiPlugin {
         &["/.gemini/"]
     }
 
+    fn is_secondary_record(&self, path: &Path) -> bool {
+        path.file_name().is_some_and(|name| name == "logs.json")
+    }
+
     /// Resuming a legacy `session-*.json` makes Gemini CLI write the whole
     /// conversation to a sibling `session-*.jsonl` and leave the `.json`
     /// behind; list only the `.jsonl` copy.
