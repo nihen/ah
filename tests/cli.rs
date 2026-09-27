@@ -2534,3 +2534,43 @@ fn opencode_child_sessions_are_listed_only_with_subagents() {
         .assert()
         .stdout(predicate::str::contains("child-only").not());
 }
+
+#[test]
+fn default_search_covers_tool_io_and_raw_search_covers_metadata() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let dir = home.join(".claude/projects/-tmp-proj");
+    fs::create_dir_all(&dir).unwrap();
+    let lines = [
+        r#"{"type":"user","cwd":"/tmp/proj","message":{"role":"user","content":"run the tests"}}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_meta_only","name":"Bash","input":{"command":"cargo test arg-needle"}}]}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_meta_only","content":"out-needle: ok"}]}}"#,
+    ];
+    fs::write(dir.join("s1.jsonl"), lines.join("\n") + "\n").unwrap();
+    let hits = |args: &[&str]| {
+        let output = ah_opencode(&home)
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .args(["log", "-a", "-o", "id"])
+            .args(args)
+            .output()
+            .unwrap();
+        !String::from_utf8(output.stdout).unwrap().trim().is_empty()
+    };
+    // default: messages, tool arguments and tool output, not metadata
+    assert!(hits(&["-q", "run the tests"]));
+    assert!(hits(&["-q", "arg-needle"]));
+    assert!(hits(&["-q", "out-needle"]));
+    assert!(!hits(&["-q", "toolu_meta_only"]));
+    assert!(!hits(&["-q", "tool_use_id"]));
+    // --raw-search: the raw file, metadata included
+    assert!(hits(&["--raw-search", "-q", "toolu_meta_only"]));
+    assert!(hits(&["--raw-search", "-q", "tool_use_id"]));
+    // -p: user prompts only
+    assert!(hits(&["-p", "-q", "run the tests"]));
+    assert!(!hits(&["-p", "-q", "out-needle"]));
+    // -p and --raw-search conflict
+    ah_opencode(&home)
+        .args(["log", "-a", "-p", "--raw-search", "-q", "x"])
+        .assert()
+        .failure();
+}

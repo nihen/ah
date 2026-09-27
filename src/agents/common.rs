@@ -125,6 +125,87 @@ pub fn first_text_part(val: &serde_json::Value) -> Option<&str> {
         })
 }
 
+/// `type`s of content parts whose only text is `text`.
+const TEXT_PART_TYPES: &[&str] = &["text", "input_text", "output_text"];
+
+/// `type`s of content parts that carry encoded media rather than text.
+const MEDIA_PART_TYPES: &[&str] = &["image", "input_image", "image_url", "document"];
+
+/// Visit every string of `val` (e.g. a tool call's arguments, whose keys are
+/// the tool's own and may be named anything). Numbers are not visited: their
+/// parsed form (`1e3` → `1000.0`) need not appear in the raw bytes, which
+/// the raw-bytes prefilters rely on. Returns `false` when `visit` stops.
+pub fn visit_all_strings(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
+    match val {
+        serde_json::Value::String(s) => visit(s),
+        serde_json::Value::Array(items) => items.iter().all(|v| visit_all_strings(v, visit)),
+        serde_json::Value::Object(map) => map.values().all(|v| visit_all_strings(v, visit)),
+        _ => true,
+    }
+}
+
+/// Keys that hold encoded data in any tool output object: Gemini media
+/// parts and encrypted server-tool results.
+const OPAQUE_OUTPUT_KEYS: &[&str] = &["inlineData", "encrypted_content"];
+
+/// Visit the strings of a tool's output. Known content parts are reduced to
+/// their text (`{"type":"text","text":...}`) or skipped when they carry
+/// media (`{"type":"image","source":{...}}`); `OPAQUE_OUTPUT_KEYS` are
+/// skipped; any other object is the tool's own data and is visited in full.
+pub fn visit_tool_output(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
+    match val {
+        serde_json::Value::String(s) => visit(s),
+        serde_json::Value::Array(items) => items.iter().all(|v| visit_tool_output(v, visit)),
+        serde_json::Value::Object(map) => {
+            let kind = map.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if TEXT_PART_TYPES.contains(&kind) {
+                return map.get("text").is_none_or(|v| visit_tool_output(v, visit));
+            }
+            if MEDIA_PART_TYPES.contains(&kind) {
+                return true;
+            }
+            map.iter()
+                .filter(|(key, _)| !OPAQUE_OUTPUT_KEYS.contains(&key.as_str()))
+                .all(|(_, v)| visit_tool_output(v, visit))
+        }
+        _ => true,
+    }
+}
+
+/// Visit a tool call's `name` and every string of its `input`.
+pub fn visit_tool_call(
+    name: Option<&serde_json::Value>,
+    input: Option<&serde_json::Value>,
+    visit: &mut dyn FnMut(&str) -> bool,
+) -> bool {
+    name.and_then(|v| v.as_str()).is_none_or(&mut *visit)
+        && input.is_none_or(|v| visit_all_strings(v, visit))
+}
+
+/// Visit every text of a message body: a string, or the `text` of each part
+/// of an array (or of `content` when `val` is a message object) except
+/// `tool_use` parts. `first_text_part` returns only the first of these.
+pub fn visit_text_parts(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
+    if let Some(text) = val.as_str() {
+        return visit(text);
+    }
+    let parts = val
+        .as_array()
+        .or_else(|| val.get("content").and_then(|v| v.as_array()));
+    parts.is_none_or(|parts| {
+        parts.iter().all(|part| {
+            part.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+                || part
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .is_none_or(&mut *visit)
+        })
+    }) && val
+        .get("content")
+        .and_then(|v| v.as_str())
+        .is_none_or(&mut *visit)
+}
+
 /// Extract the body wrapped in `<tag>…</tag>` from a raw user message.
 /// Several agents wrap the real user text in a tag (Cursor: `user_query`,
 /// Grok: `user_query`, Antigravity: `USER_REQUEST`) and append metadata

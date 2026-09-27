@@ -180,6 +180,46 @@ pub trait AgentPlugin: Sync {
         false
     }
 
+    /// Text searched by the default full-text query: every message from
+    /// `iter_messages` plus tool call inputs (tool name, arguments, file
+    /// paths) and tool outputs. JSON keys and session metadata are not
+    /// included. `visit` returns `false` to stop.
+    fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
+        self.iter_messages(path, &mut |message| visit(&message.text));
+    }
+
+    /// `iter_search_texts` from `session_bytes` (or a subset of its lines
+    /// when `search_texts_per_jsonl_line`), which may differ from the
+    /// session file (e.g. Copilot's `events.jsonl`).
+    fn iter_search_texts_from_bytes(
+        &self,
+        path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(&str) -> bool,
+    ) {
+        self.iter_messages_from_bytes(path, data, &mut |message| visit(&message.text));
+    }
+
+    /// `prompts_in_session_json` for every text from `iter_search_texts`:
+    /// each is a substring of one JSON string value in `session_bytes`.
+    fn search_texts_in_session_json(&self) -> bool {
+        false
+    }
+
+    /// Cheap byte-level check of one session line when
+    /// `search_texts_per_jsonl_line`: `false` only when the line holds no
+    /// search text, so it is skipped without decoding or parsing.
+    fn line_may_hold_search_texts(&self, _line: &[u8]) -> bool {
+        true
+    }
+
+    /// `prompts_per_jsonl_line` for every text from `iter_search_texts`:
+    /// `iter_search_texts_from_bytes` yields a line's texts from that line
+    /// alone.
+    fn search_texts_per_jsonl_line(&self) -> bool {
+        false
+    }
+
     /// Raw session content for `ah show -f raw`.
     fn raw_content(&self, path: &Path) -> Option<String> {
         fs::read_to_string(path).ok()

@@ -12,6 +12,7 @@ use super::Message;
 use super::common::format_mtime;
 use super::common::mmap_file;
 use super::common::strip_home;
+use super::common::{visit_all_strings, visit_tool_call, visit_tool_output};
 use super::{MemoryKind, MemorySource};
 
 static RE_CODEX_SESSIONS: LazyLock<Regex> =
@@ -118,12 +119,6 @@ fn latest_thread_name_in(
 /// before JSON parsing. This matters when the title falls back to the first
 /// prompt: sessions without a real user prompt are scanned to the end.
 fn for_each_message(data: &[u8], visit: &mut dyn FnMut(Message) -> bool) {
-    use memchr::memmem::Finder;
-    static RESPONSE_ITEM: LazyLock<Finder<'static>> =
-        LazyLock::new(|| Finder::new(b"\"response_item\""));
-    static USER: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\"user\""));
-    static ASSISTANT: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\"assistant\""));
-
     for line in data.split(|&b| b == b'\n') {
         if RESPONSE_ITEM.find(line).is_none()
             || (USER.find(line).is_none() && ASSISTANT.find(line).is_none())
@@ -136,6 +131,109 @@ fn for_each_message(data: &[u8], visit: &mut dyn FnMut(Message) -> bool) {
         if !visit_message_value(&val, visit) {
             return;
         }
+    }
+}
+
+static RESPONSE_ITEM: LazyLock<memchr::memmem::Finder<'static>> =
+    LazyLock::new(|| memchr::memmem::Finder::new(b"\"response_item\""));
+static USER: LazyLock<memchr::memmem::Finder<'static>> =
+    LazyLock::new(|| memchr::memmem::Finder::new(b"\"user\""));
+static ASSISTANT: LazyLock<memchr::memmem::Finder<'static>> =
+    LazyLock::new(|| memchr::memmem::Finder::new(b"\"assistant\""));
+
+/// Visit the search texts of a rollout: messages, tool calls and tool
+/// outputs, all of which live in `response_item` lines.
+fn for_each_search_text(data: &[u8], visit: &mut dyn FnMut(&str) -> bool) {
+    for line in data.split(|&b| b == b'\n') {
+        if !may_hold_search_text(line) {
+            continue;
+        }
+        let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if !visit_search_value(&val, visit) {
+            return;
+        }
+    }
+}
+
+/// Cheap check that rules out lines without search texts before JSON
+/// parsing: lines other than `response_item`, developer instructions,
+/// encrypted reasoning, and user messages whose every text is injected
+/// context (starting with `<` or `# `, which `visit_message_value` skips).
+/// Keys are compared in their serialized form; inside a JSON string these
+/// quotes would be escaped, so a match is always a real key. The line and
+/// payload types are looked up in the line's head only (rollouts write
+/// `timestamp`, `type`, then `payload` with its `type` and `role` first);
+/// when the head does not identify the line, it is kept.
+fn may_hold_search_text(line: &[u8]) -> bool {
+    use regex::bytes::Regex as BytesRegex;
+    // JSON allows whitespace around `:`; `\s` also covers it inside the
+    // `{` of `payload`.
+    static TYPE_VALUE: LazyLock<BytesRegex> =
+        LazyLock::new(|| BytesRegex::new(r#""type"\s*:\s*"([^"]*)""#).unwrap());
+    // Roles are matched only in the payload's own message header (`type`,
+    // then scalar fields such as `id`, then `role`), not in nested data.
+    static SKIPPED_PAYLOAD: LazyLock<BytesRegex> = LazyLock::new(|| {
+        BytesRegex::new(concat!(
+            r#""payload"\s*:\s*\{\s*"type"\s*:\s*"message"\s*,[^{}\[\]]*"role"\s*:\s*"developer""#,
+            r#"|"payload"\s*:\s*\{\s*"type"\s*:\s*"reasoning""#,
+        ))
+        .unwrap()
+    });
+    static USER_ROLE: LazyLock<BytesRegex> = LazyLock::new(|| {
+        BytesRegex::new(
+            r#""payload"\s*:\s*\{\s*"type"\s*:\s*"message"\s*,[^{}\[\]]*"role"\s*:\s*"user""#,
+        )
+        .unwrap()
+    });
+    static TEXT_VALUE: LazyLock<BytesRegex> =
+        LazyLock::new(|| BytesRegex::new(r#""text"\s*:\s*""#).unwrap());
+    const HEAD: usize = 512;
+    let head = &line[..line.len().min(HEAD)];
+    let Some(kind) = TYPE_VALUE.captures(head).and_then(|caps| caps.get(1)) else {
+        return true;
+    };
+    // a type written with escapes cannot be read here: keep the line
+    if kind.as_bytes().contains(&b'\\') {
+        return true;
+    }
+    if kind.as_bytes() != b"response_item" || SKIPPED_PAYLOAD.is_match(head) {
+        return false;
+    }
+    if !USER_ROLE.is_match(head) {
+        return true;
+    }
+    TEXT_VALUE.find_iter(line).any(|m| {
+        let text = &line[m.end()..];
+        !(text.starts_with(b"<") || text.starts_with(b"# "))
+    })
+}
+
+/// Search texts of one rollout line: its messages, the name and input of a
+/// `*_call` item, or the output of a `*_call_output` item.
+fn visit_search_value(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
+    if !visit_message_value(val, &mut |message| visit(&message.text)) {
+        return false;
+    }
+    if val.get("type").and_then(|v| v.as_str()) != Some("response_item") {
+        return true;
+    }
+    let Some(payload) = val.get("payload") else {
+        return true;
+    };
+    let kind = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if kind.ends_with("_call") {
+        visit_tool_call(payload.get("name"), None, visit)
+            && ["arguments", "input", "action"]
+                .iter()
+                .all(|key| payload.get(key).is_none_or(|v| visit_all_strings(v, visit)))
+    } else if kind.ends_with("_call_output") {
+        payload
+            .get("output")
+            .is_none_or(|v| visit_tool_output(v, visit))
+    } else {
+        true
     }
 }
 
@@ -269,6 +367,12 @@ impl AgentPlugin for CodexPlugin {
     fn prompts_per_jsonl_line(&self) -> bool {
         true
     }
+    fn search_texts_in_session_json(&self) -> bool {
+        true
+    }
+    fn search_texts_per_jsonl_line(&self) -> bool {
+        true
+    }
 
     fn can_detect_running(&self) -> bool {
         // Needs the kernel lock table (`/proc/locks`).
@@ -326,6 +430,25 @@ impl AgentPlugin for CodexPlugin {
         visit: &mut dyn FnMut(Message) -> bool,
     ) {
         for_each_message(data, visit);
+    }
+
+    fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
+        if let Some(mmap) = mmap_file(path) {
+            for_each_search_text(&mmap, visit);
+        }
+    }
+
+    fn iter_search_texts_from_bytes(
+        &self,
+        _path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(&str) -> bool,
+    ) {
+        for_each_search_text(data, visit);
+    }
+
+    fn line_may_hold_search_texts(&self, line: &[u8]) -> bool {
+        may_hold_search_text(line)
     }
 
     fn resolve_project(&self, path: &Path, home: &Path) -> Option<String> {

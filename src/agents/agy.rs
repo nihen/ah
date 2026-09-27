@@ -12,6 +12,7 @@ use super::common::mmap_file;
 use super::common::percent_decode;
 use super::common::strip_home;
 use super::common::tagged_user_body;
+use super::common::visit_tool_call;
 use super::{MemoryKind, MemorySource};
 
 pub static PLUGIN: AgyPlugin = AgyPlugin;
@@ -153,6 +154,12 @@ impl AgentPlugin for AgyPlugin {
     fn prompts_per_jsonl_line(&self) -> bool {
         true
     }
+    fn search_texts_in_session_json(&self) -> bool {
+        true
+    }
+    fn search_texts_per_jsonl_line(&self) -> bool {
+        true
+    }
 
     fn can_memory(&self) -> bool {
         true
@@ -211,6 +218,46 @@ impl AgentPlugin for AgyPlugin {
 
     fn messages_from_value(&self, val: &serde_json::Value) -> Vec<Message> {
         Self::message_from_value(val).into_iter().collect()
+    }
+
+    fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
+        if let Some(mmap) = mmap_file(path) {
+            self.iter_search_texts_from_bytes(path, &mmap, visit);
+        }
+    }
+
+    /// Messages, the `tool_calls` of planner responses, and the content of
+    /// other model steps (tool results such as file views and command
+    /// output).
+    fn iter_search_texts_from_bytes(
+        &self,
+        _path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(&str) -> bool,
+    ) {
+        for_each_jsonl_value_bytes(data, |val| {
+            if let Some(message) = Self::message_from_value(val) {
+                if !visit(&message.text) {
+                    return false;
+                }
+            }
+            if val.get("source").and_then(|v| v.as_str()) != Some("MODEL") {
+                return true;
+            }
+            if val.get("type").and_then(|v| v.as_str()) == Some("PLANNER_RESPONSE") {
+                return val
+                    .get("tool_calls")
+                    .and_then(|v| v.as_array())
+                    .is_none_or(|calls| {
+                        calls
+                            .iter()
+                            .all(|call| visit_tool_call(call.get("name"), call.get("args"), visit))
+                    });
+            }
+            val.get("content")
+                .and_then(|v| v.as_str())
+                .is_none_or(&mut *visit)
+        });
     }
 
     fn resolve_cwd(&self, path: &Path, _home: &Path) -> Option<String> {

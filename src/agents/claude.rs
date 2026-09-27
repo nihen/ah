@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use super::common::{
     RE_HOME_PREFIX, canonicalize_if_exists, decode_claude_project, for_each_jsonl_value,
     for_each_jsonl_value_bytes, is_pid_alive, json_pid, mmap_file, process_start_ticks,
+    visit_tool_call, visit_tool_output,
 };
 use super::{AgentMemoryFile, AgentPlugin, MemoryKind, MemorySource, Message};
 
@@ -154,6 +155,66 @@ impl ClaudePlugin {
     }
 }
 
+impl ClaudePlugin {
+    /// Search texts of one record: its messages, then `tool_use` inputs and
+    /// `tool_result` contents. Returns `false` when `visit` stops.
+    fn visit_search_texts(
+        &self,
+        val: &serde_json::Value,
+        visit: &mut dyn FnMut(&str) -> bool,
+    ) -> bool {
+        let role = val.get("type").and_then(|v| v.as_str());
+        let Some(content) = val
+            .pointer("/message/content")
+            .or_else(|| val.get("message").filter(|m| m.is_string()))
+        else {
+            return true;
+        };
+        // Every text block, not only the first as in `messages_from_value`;
+        // injected context (`<...>`, `# ...`) in user records is skipped.
+        let texts_ok = match content {
+            serde_json::Value::String(text) => match role {
+                Some("user") => text.starts_with('<') || visit(text),
+                Some("assistant") => visit(text),
+                _ => true,
+            },
+            serde_json::Value::Array(items) => items.iter().all(|item| {
+                let text = match item.get("type").and_then(|v| v.as_str()) {
+                    Some("text" | "input_text") | None => item.get("text").and_then(|v| v.as_str()),
+                    _ => None,
+                };
+                match (role, text) {
+                    (Some("user"), Some(text)) => {
+                        text.starts_with('<') || text.starts_with("# ") || visit(text)
+                    }
+                    (Some("assistant"), Some(text)) => visit(text),
+                    _ => true,
+                }
+            }),
+            _ => true,
+        };
+        if !texts_ok {
+            return false;
+        }
+        let Some(items) = content.as_array() else {
+            return true;
+        };
+        items
+            .iter()
+            .all(|item| match item.get("type").and_then(|v| v.as_str()) {
+                Some("tool_use" | "server_tool_use") => {
+                    visit_tool_call(item.get("name"), item.get("input"), visit)
+                }
+                // `tool_result`, and server-tool results such as
+                // `web_search_tool_result`
+                Some(kind) if kind.ends_with("tool_result") => item
+                    .get("content")
+                    .is_none_or(|content| visit_tool_output(content, visit)),
+                _ => true,
+            })
+    }
+}
+
 impl AgentPlugin for ClaudePlugin {
     fn id(&self) -> &'static str {
         "claude"
@@ -170,6 +231,12 @@ impl AgentPlugin for ClaudePlugin {
         true
     }
     fn prompts_per_jsonl_line(&self) -> bool {
+        true
+    }
+    fn search_texts_in_session_json(&self) -> bool {
+        true
+    }
+    fn search_texts_per_jsonl_line(&self) -> bool {
         true
     }
     fn can_detect_running(&self) -> bool {
@@ -231,6 +298,31 @@ impl AgentPlugin for ClaudePlugin {
             }
             true
         });
+    }
+
+    fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
+        for_each_jsonl_value(path, |val| self.visit_search_texts(val, visit));
+    }
+
+    /// Only `user` and `assistant` records hold search texts. A quoted
+    /// `"type":"user"` outside a JSON string is always a real key.
+    fn line_may_hold_search_texts(&self, line: &[u8]) -> bool {
+        // JSON allows whitespace around `:`; a `type` value with an escape
+        // cannot be read here, so its line is kept.
+        static RECORD_TYPE: std::sync::LazyLock<regex::bytes::Regex> =
+            std::sync::LazyLock::new(|| {
+                regex::bytes::Regex::new(r#""type"\s*:\s*"(?:user"|assistant"|[^"]*\\)"#).unwrap()
+            });
+        RECORD_TYPE.is_match(line)
+    }
+
+    fn iter_search_texts_from_bytes(
+        &self,
+        _path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(&str) -> bool,
+    ) {
+        for_each_jsonl_value_bytes(data, |val| self.visit_search_texts(val, visit));
     }
 
     fn messages_from_value(&self, val: &serde_json::Value) -> Vec<Message> {

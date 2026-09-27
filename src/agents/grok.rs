@@ -14,6 +14,7 @@ use super::common::mmap_file;
 use super::common::percent_decode;
 use super::common::strip_home;
 use super::common::tagged_user_body;
+use super::common::{visit_text_parts, visit_tool_call, visit_tool_output};
 use super::{AgentMemoryFile, MemoryKind, MemorySource};
 
 pub static PLUGIN: GrokPlugin = GrokPlugin;
@@ -86,6 +87,12 @@ impl AgentPlugin for GrokPlugin {
     fn prompts_per_jsonl_line(&self) -> bool {
         true
     }
+    fn search_texts_in_session_json(&self) -> bool {
+        true
+    }
+    fn search_texts_per_jsonl_line(&self) -> bool {
+        true
+    }
 
     fn can_detect_running(&self) -> bool {
         true
@@ -127,6 +134,52 @@ impl AgentPlugin for GrokPlugin {
 
     fn messages_from_value(&self, val: &serde_json::Value) -> Vec<Message> {
         Self::message_from_value(val).into_iter().collect()
+    }
+
+    fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
+        if let Some(mmap) = mmap_file(path) {
+            self.iter_search_texts_from_bytes(path, &mmap, visit);
+        }
+    }
+
+    /// Messages, assistant `tool_calls`, `tool_result` contents and backend
+    /// tool calls (e.g. web search).
+    fn iter_search_texts_from_bytes(
+        &self,
+        _path: &Path,
+        data: &[u8],
+        visit: &mut dyn FnMut(&str) -> bool,
+    ) {
+        for_each_jsonl_value_bytes(data, |val| {
+            match val.get("type").and_then(|v| v.as_str()) {
+                // every `<user_query>` block, not only the first text block
+                Some("user") => val.get("content").is_none_or(|content| {
+                    visit_text_parts(content, &mut |raw| {
+                        tagged_user_body(raw, "user_query").is_none_or(&mut *visit)
+                    })
+                }),
+                Some("assistant") => {
+                    let text_ok =
+                        Self::message_from_value(val).is_none_or(|message| visit(&message.text));
+                    text_ok
+                        && val
+                            .get("tool_calls")
+                            .and_then(|v| v.as_array())
+                            .is_none_or(|calls| {
+                                calls.iter().all(|call| {
+                                    visit_tool_call(call.get("name"), call.get("arguments"), visit)
+                                })
+                            })
+                }
+                Some("tool_result") => val
+                    .get("content")
+                    .is_none_or(|v| visit_tool_output(v, visit)),
+                Some("backend_tool_call") => {
+                    val.get("kind").is_none_or(|v| visit_tool_output(v, visit))
+                }
+                _ => true,
+            }
+        });
     }
 
     fn resolve_cwd(&self, path: &Path, _home: &Path) -> Option<String> {

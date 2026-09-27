@@ -188,6 +188,7 @@ mod tests {
             dir: None,
             query: None,
             prompt_only: false,
+            raw_search: false,
             limit: 0,
             running: false,
             no_archived: false,

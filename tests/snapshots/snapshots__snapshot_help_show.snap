@@ -43,8 +43,9 @@ Global options:
   --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
   --project <NAME>        Filter by project name
   -d, --dir <PATH>        Filter by working directory (default: current directory)
-  -q, --query <REGEX>     Full-text search query (regex, case-insensitive)
+  -q, --query <REGEX>     Search messages and tool input/output (regex, case-insensitive)
   -p, --prompt-only       Search only user prompts (use with -q)
+  --raw-search            Search raw session files incl. metadata (use with -q)
   -n, --limit N           Max session files to scan (default: 0, no limit)
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)

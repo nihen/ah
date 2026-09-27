@@ -274,8 +274,13 @@ impl FromStr for Field {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SearchMode {
-    All,
+    /// User and assistant messages plus tool calls (names, arguments) and
+    /// tool output (default).
+    Text,
+    /// User messages only (`-p`).
     Prompt,
+    /// Raw session bytes, including JSON keys and metadata (`--raw-search`).
+    Raw,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -457,13 +462,17 @@ pub struct FilterArgs {
     #[arg(short = 'A', global = true, conflicts_with = "dir")]
     pub all_remote: bool,
 
-    /// Full-text search query (regex)
+    /// Full-text search over messages and tool input/output (regex)
     #[arg(short = 'q', long = "query", global = true)]
     pub query: Option<String>,
 
     /// Search only user prompts (use with -q)
     #[arg(short = 'p', long = "prompt-only", global = true)]
     pub prompt_only: bool,
+
+    /// Search the raw session files, including metadata (use with -q)
+    #[arg(long = "raw-search", global = true, conflicts_with = "prompt_only")]
+    pub raw_search: bool,
 
     /// Max session files to scan (default: 0, no limit)
     #[arg(short = 'n', long = "limit", default_value_t = 0, global = true)]
@@ -535,8 +544,10 @@ impl FilterArgs {
     pub fn search_mode(&self) -> SearchMode {
         if self.prompt_only {
             SearchMode::Prompt
+        } else if self.raw_search {
+            SearchMode::Raw
         } else {
-            SearchMode::All
+            SearchMode::Text
         }
     }
 
@@ -1576,8 +1587,9 @@ Global options:
   --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
   --project <NAME>        Filter by project name
   -d, --dir <PATH>        Filter by working directory (default: current directory)
-  -q, --query <REGEX>     Full-text search query (regex, case-insensitive)
+  -q, --query <REGEX>     Search messages and tool input/output (regex, case-insensitive)
   -p, --prompt-only       Search only user prompts (use with -q)
+  --raw-search            Search raw session files incl. metadata (use with -q)
   -n, --limit N           Max session files to scan (default: 0, no limit)
   -i, --interactive       Interactive mode via fuzzy finder (fzf/sk)
   -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
@@ -1615,8 +1627,9 @@ const GLOBAL_OPTIONS: &str = r#"Global options:
   --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
   --project <NAME>        Filter by project name
   -d, --dir <PATH>        Filter by working directory (default: current directory)
-  -q, --query <REGEX>     Full-text search query (regex, case-insensitive)
+  -q, --query <REGEX>     Search messages and tool input/output (regex, case-insensitive)
   -p, --prompt-only       Search only user prompts (use with -q)
+  --raw-search            Search raw session files incl. metadata (use with -q)
   -n, --limit N           Max session files to scan (default: 0, no limit)
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
