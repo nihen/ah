@@ -1,0 +1,12 @@
+{"type":"queue-operation","operation":"enqueue","sessionId":"test-session-002"}
+{"type":"mode","mode":"default","sessionId":"test-session-002"}
+{"type":"permission-mode","permissionMode":"default","sessionId":"test-session-002"}
+{"type":"bridge-session","sessionId":"test-session-002"}
+{"type":"atis-latch","sessionId":"test-session-002"}
+{"type":"file-history-snapshot","messageId":"m0","snapshot":{"trackedFileBackups":{}}}
+{"type":"user","cwd":"/Users/test/headers-project","message":{"role":"user","content":"add retry to the uploader"}}
+{"type":"ai-title","aiTitle":"Add uploader retry","sessionId":"test-session-002"}
+{"type":"assistant","cwd":"/Users/test/headers-project","message":{"role":"assistant","content":[{"type":"text","text":"Added exponential backoff."}]}}
+{"type":"user","cwd":"/Users/test/headers-project","message":{"role":"user","content":"also log each attempt"}}
+{"type":"ai-title","aiTitle":"Add uploader retry with logging","sessionId":"test-session-002"}
+{"type":"assistant","cwd":"/Users/test/headers-project","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}

@@ -1,5 +1,3 @@
-use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use memchr::memmem;
@@ -10,19 +8,28 @@ use super::common::{RE_HOME_PREFIX, for_each_jsonl_value, for_each_jsonl_value_b
 
 pub static PLUGIN: ClaudePlugin = ClaudePlugin;
 
+/// Recent Claude Code versions write several header records (`mode`,
+/// `permission-mode`, `bridge-session`, ...) before the first line carrying
+/// `cwd`, so look further than the first few lines.
+const CWD_SCAN_LINES: usize = 50;
+
+/// How far from the end of a session to look for title records. They are
+/// re-appended after every turn and observed within ~40 KiB of the end;
+/// a missed title falls back to the first prompt.
+const TITLE_SCAN_TAIL_BYTES: usize = 128 * 1024;
+
 pub struct ClaudePlugin;
 
 impl ClaudePlugin {
     fn extract_cwd_from_bytes(data: &[u8]) -> Option<String> {
         let cwd_needle = b"\"cwd\"";
-        for (i, line_bytes) in data.split(|&b| b == b'\n').enumerate() {
-            if i >= 5 {
-                break;
-            }
+        for line_bytes in data.split(|&b| b == b'\n').take(CWD_SCAN_LINES) {
             if memchr::memmem::find(line_bytes, cwd_needle).is_none() {
                 continue;
             }
-            let line = std::str::from_utf8(line_bytes).ok()?;
+            let Ok(line) = std::str::from_utf8(line_bytes) else {
+                continue;
+            };
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                 if let Some(cwd) = val.get("cwd").and_then(|v| v.as_str()) {
                     if !cwd.is_empty() {
@@ -34,34 +41,52 @@ impl ClaudePlugin {
         None
     }
 
-    fn extract_title_from_bytes(data: &[u8]) -> Option<String> {
-        // Try custom-title (appended near end of file).
-        // Search only the last 8KB since custom-title is always at the tail.
-        let needle = b"\"type\":\"custom-title\"";
-        let search_start = data.len().saturating_sub(8192);
-        if let Some(rel_pos) = memmem::FinderRev::new(needle).rfind(&data[search_start..]) {
-            let pos = search_start + rel_pos;
-            let line_start = memchr::memrchr(b'\n', &data[..pos])
-                .map(|idx| idx + 1)
-                .unwrap_or(0);
-            let line_end = memchr::memchr(b'\n', &data[pos..])
-                .map(|idx| pos + idx)
+    /// Value of `field` in the latest `record_type` record within the tail of
+    /// the session, or `None` when that record is missing or its value is
+    /// empty. Title records always start a line with their `type` key, so
+    /// anchoring the needle there never matches message text.
+    fn latest_record_value(data: &[u8], record_type: &str, field: &str) -> Option<String> {
+        let needle = format!("\n{{\"type\":\"{record_type}\"");
+        let finder = memmem::FinderRev::new(needle.as_bytes());
+        let tail_start = data.len().saturating_sub(TITLE_SCAN_TAIL_BYTES);
+        // Start one byte early so a line beginning exactly at `tail_start`
+        // still has its preceding newline inside the searched range.
+        let search_start = tail_start.saturating_sub(1);
+        let mut end = data.len();
+        let mut line_starts = std::iter::from_fn(|| {
+            let rel_pos = finder.rfind(&data[search_start..end])?;
+            end = search_start + rel_pos;
+            Some(end + 1)
+        })
+        .chain((tail_start == 0 && data.starts_with(&needle.as_bytes()[1..])).then_some(0));
+        line_starts.find_map(|line_start| {
+            let line_end = memchr::memchr(b'\n', &data[line_start..])
+                .map(|idx| line_start + idx)
                 .unwrap_or(data.len());
-            if let Ok(line) = std::str::from_utf8(&data[line_start..line_end]) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                    if let Some(title) = val
-                        .get("customTitle")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        return Some(title.to_string());
-                    }
-                }
+            // A line that fails to parse (e.g. still being appended) is
+            // skipped in favor of the previous record.
+            let val =
+                serde_json::from_slice::<serde_json::Value>(&data[line_start..line_end]).ok()?;
+            if val.get("type").and_then(|v| v.as_str()) != Some(record_type) {
+                return None;
             }
-        }
+            Some(
+                val.get(field)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string),
+            )
+        })?
+    }
 
-        // Fallback: extract first user prompt (forward scan, exits early)
-        Self::first_user_prompt_from_mmap(data)
+    /// Title priority: user-set custom title, then the title Claude Code
+    /// generates, then the first user prompt. Claude Code re-appends title
+    /// records after each turn, so the latest one of each kind is current
+    /// and sits near the end of the file.
+    fn extract_title_from_bytes(data: &[u8]) -> Option<String> {
+        Self::latest_record_value(data, "custom-title", "customTitle")
+            .or_else(|| Self::latest_record_value(data, "ai-title", "aiTitle"))
+            .or_else(|| Self::first_user_prompt_from_mmap(data))
     }
 
     pub(crate) fn first_user_prompt_from_mmap(mmap: &[u8]) -> Option<String> {
@@ -219,21 +244,8 @@ impl AgentPlugin for ClaudePlugin {
     }
 
     fn resolve_cwd(&self, path: &Path, _home: &Path) -> Option<String> {
-        let file = fs::File::open(path).ok()?;
-        let reader = BufReader::new(file);
-        for line in reader.lines().take(5) {
-            let line = line.ok()?;
-            if line.contains("\"cwd\"") {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(cwd) = val.get("cwd").and_then(|v| v.as_str()) {
-                        if !cwd.is_empty() {
-                            return Some(cwd.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        None
+        let mmap = mmap_file(path)?;
+        Self::extract_cwd_from_bytes(&mmap)
     }
 
     fn resolve_cwd_from_mmap(&self, _path: &Path, _home: &Path, mmap: &[u8]) -> Option<String> {
@@ -260,5 +272,153 @@ impl AgentPlugin for ClaudePlugin {
     fn resume_args(&self, path: &Path, home: &Path) -> Option<Vec<String>> {
         let id = self.resolve_resume_id(path, home)?;
         Some(vec!["claude".to_string(), "--resume".to_string(), id])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn cwd_found_after_header_records() {
+        let data = fixture("claude_session_headers.jsonl");
+        assert_eq!(
+            ClaudePlugin::extract_cwd_from_bytes(&data).as_deref(),
+            Some("/Users/test/headers-project")
+        );
+    }
+
+    #[test]
+    fn cwd_scan_is_bounded() {
+        let mut data = Vec::new();
+        for _ in 0..CWD_SCAN_LINES {
+            data.extend_from_slice(b"{\"type\":\"mode\",\"mode\":\"default\"}\n");
+        }
+        data.extend_from_slice(b"{\"type\":\"user\",\"cwd\":\"/late\"}\n");
+        assert_eq!(ClaudePlugin::extract_cwd_from_bytes(&data), None);
+    }
+
+    #[test]
+    fn title_uses_latest_ai_title() {
+        let data = fixture("claude_session_headers.jsonl");
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(&data).as_deref(),
+            Some("Add uploader retry with logging")
+        );
+    }
+
+    #[test]
+    fn custom_title_wins_over_ai_title_regardless_of_position() {
+        let big = "x".repeat(16 * 1024);
+        let data = format!(
+            "{{\"type\":\"custom-title\",\"customTitle\":\"my-name\"}}\n\
+             {{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{big}\"}}}}\n\
+             {{\"type\":\"ai-title\",\"aiTitle\":\"generated\"}}\n"
+        );
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(data.as_bytes()).as_deref(),
+            Some("my-name")
+        );
+    }
+
+    fn padded_session(title_line: &str, padding: usize) -> Vec<u8> {
+        let mut data =
+            b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"prompt\"}}\n"
+                .to_vec();
+        data.extend_from_slice(title_line.as_bytes());
+        data.push(b'\n');
+        let filler =
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"";
+        let fill_len = padding.saturating_sub(filler.len() + "\"}]}}\n".len());
+        data.extend_from_slice(filler.as_bytes());
+        data.extend(std::iter::repeat_n(b'x', fill_len));
+        data.extend_from_slice(b"\"}]}}\n");
+        data
+    }
+
+    #[test]
+    fn title_starting_at_tail_window_start_is_found() {
+        let title = "{\"type\":\"custom-title\",\"customTitle\":\"in-window\"}";
+        // The title line starts exactly TITLE_SCAN_TAIL_BYTES before the end.
+        let data = padded_session(title, TITLE_SCAN_TAIL_BYTES - title.len() - 1);
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(&data).as_deref(),
+            Some("in-window")
+        );
+    }
+
+    #[test]
+    fn title_outside_tail_window_falls_back_to_first_prompt() {
+        let title = "{\"type\":\"ai-title\",\"aiTitle\":\"too-far\"}";
+        // The title line starts one byte before the window.
+        let data = padded_session(title, TITLE_SCAN_TAIL_BYTES - title.len());
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(&data).as_deref(),
+            Some("prompt")
+        );
+    }
+
+    #[test]
+    fn empty_latest_custom_title_does_not_revive_older_one() {
+        let data = b"{\"type\":\"custom-title\",\"customTitle\":\"old\"}\n\
+{\"type\":\"ai-title\",\"aiTitle\":\"generated\"}\n\
+{\"type\":\"custom-title\",\"customTitle\":\"\"}\n";
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(data).as_deref(),
+            Some("generated")
+        );
+    }
+
+    #[test]
+    fn custom_title_keeps_whitespace_but_blank_is_empty() {
+        let data = b"{\"type\":\"ai-title\",\"aiTitle\":\"generated\"}\n\
+{\"type\":\"custom-title\",\"customTitle\":\" padded \"}\n";
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(data).as_deref(),
+            Some(" padded ")
+        );
+        let blank = b"{\"type\":\"ai-title\",\"aiTitle\":\"generated\"}\n\
+{\"type\":\"custom-title\",\"customTitle\":\"   \"}\n";
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(blank).as_deref(),
+            Some("generated")
+        );
+    }
+
+    #[test]
+    fn message_text_ending_in_title_is_not_a_record() {
+        let data = b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n\
+{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"x\\n{\\\"type\\\":\\\"ai-title\\\",\\\"aiTitle\\\":\\\"fake\\\"}\"}]}}\n";
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(data).as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn title_record_type_must_match() {
+        let data = b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n\
+{\"note\":{\"type\":\"ai-title\",\"aiTitle\":\"nested\"},\"type\":\"summary\"}\n";
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(data).as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn title_falls_back_to_first_prompt() {
+        let data =
+            b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"first prompt\"}}\n";
+        assert_eq!(
+            ClaudePlugin::extract_title_from_bytes(data).as_deref(),
+            Some("first prompt")
+        );
     }
 }
