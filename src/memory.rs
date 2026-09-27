@@ -113,7 +113,14 @@ fn parse_frontmatter(content: &str) -> (MemoryFrontmatter, String) {
 /// unescape `''`. Unquoted or unbalanced values are returned as-is.
 fn unquote_scalar(val: &str) -> String {
     if val.len() >= 2 {
-        if let Some(inner) = val.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        // The closing quote must not itself be escaped (odd backslash run).
+        let closing_escaped =
+            |inner: &str| inner.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1;
+        if let Some(inner) = val
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .filter(|inner| !closing_escaped(inner))
+        {
             let mut out = String::with_capacity(inner.len());
             let mut chars = inner.chars();
             while let Some(c) = chars.next() {
@@ -710,6 +717,8 @@ mod tests {
         assert_eq!(unquote_scalar(r#""a \"b\" \\ c""#), r#"a "b" \ c"#);
         assert_eq!(unquote_scalar("plain"), "plain");
         assert_eq!(unquote_scalar(r#""unbalanced"#), r#""unbalanced"#);
+        assert_eq!(unquote_scalar(r#""foo\""#), r#""foo\""#);
+        assert_eq!(unquote_scalar(r#""foo\\""#), r#"foo\"#);
         assert_eq!(unquote_scalar(r#"""#), r#"""#);
     }
 
