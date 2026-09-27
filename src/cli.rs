@@ -274,7 +274,8 @@ impl FromStr for Field {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SearchMode {
-    /// User and assistant messages (default).
+    /// User and assistant messages plus tool calls (names, arguments) and
+    /// tool output (default).
     Text,
     /// User messages only (`-p`).
     Prompt,

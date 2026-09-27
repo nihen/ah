@@ -172,12 +172,21 @@ fn may_hold_search_text(line: &[u8]) -> bool {
     // `{` of `payload`.
     static TYPE_VALUE: LazyLock<BytesRegex> =
         LazyLock::new(|| BytesRegex::new(r#""type"\s*:\s*"([^"]*)""#).unwrap());
+    // Roles are matched only in the payload's own message header (`type`,
+    // then scalar fields such as `id`, then `role`), not in nested data.
     static SKIPPED_PAYLOAD: LazyLock<BytesRegex> = LazyLock::new(|| {
-        BytesRegex::new(r#""role"\s*:\s*"developer"|"payload"\s*:\s*\{\s*"type"\s*:\s*"reasoning""#)
-            .unwrap()
+        BytesRegex::new(concat!(
+            r#""payload"\s*:\s*\{\s*"type"\s*:\s*"message"\s*,[^{}\[\]]*"role"\s*:\s*"developer""#,
+            r#"|"payload"\s*:\s*\{\s*"type"\s*:\s*"reasoning""#,
+        ))
+        .unwrap()
     });
-    static USER_ROLE: LazyLock<BytesRegex> =
-        LazyLock::new(|| BytesRegex::new(r#""role"\s*:\s*"user""#).unwrap());
+    static USER_ROLE: LazyLock<BytesRegex> = LazyLock::new(|| {
+        BytesRegex::new(
+            r#""payload"\s*:\s*\{\s*"type"\s*:\s*"message"\s*,[^{}\[\]]*"role"\s*:\s*"user""#,
+        )
+        .unwrap()
+    });
     static TEXT_VALUE: LazyLock<BytesRegex> =
         LazyLock::new(|| BytesRegex::new(r#""text"\s*:\s*""#).unwrap());
     const HEAD: usize = 512;

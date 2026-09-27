@@ -91,7 +91,7 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
         // requested. Other fields (`title`, `transcript`, …) don't depend
         // on the query, so an invalid `-q` shouldn't break them. Use the
         // engine `ResolveOpts::new` picks for this search_mode (bytes for
-        // `all`, text for `prompt`) since their syntax differs.
+        // `raw`, text otherwise) since their syntax differs.
         if !query.is_empty() && fields.contains(&crate::cli::Field::Matched) {
             match filter.search_mode() {
                 crate::cli::SearchMode::Raw => regex::bytes::Regex::new(&format!("(?iu){}", query))

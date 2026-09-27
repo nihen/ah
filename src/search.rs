@@ -1042,6 +1042,18 @@ mod tests {
                 ),
                 "needle-page",
             ),
+            // roles inside a tool's output are not the payload's role
+            (
+                "codex",
+                write(
+                    "nested_role.jsonl",
+                    &[
+                        r#"{"timestamp":"t","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":[{"role":"developer","value":"needle here"}]}}"#,
+                        r#"{"timestamp":"t","type":"response_item","payload":{"type":"function_call_output","call_id":"c2","output":[{"role":"user","text":"<x> other needle"}]}}"#,
+                    ],
+                ),
+                "needle",
+            ),
             // a tool's own data with a `type` field is not a content part
             (
                 "claude",
