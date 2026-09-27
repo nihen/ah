@@ -1624,3 +1624,85 @@ fn no_archived_uses_the_attributed_agent() {
         .failure()
         .stderr(predicate::str::contains("No sessions found"));
 }
+
+#[cfg(unix)]
+#[test]
+fn memory_matches_underscore_cwd_dedups_and_lists_shared_agents_md() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let project = home.join("work/my_app");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("AGENTS.md"), "shared rules\n").unwrap();
+    // A symlinked path to the same project must not list its files twice.
+    let link = home.join("link_app");
+    std::os::unix::fs::symlink(&project, &link).unwrap();
+
+    let claude = home.join(".claude");
+    let encoded_dir = claude.join("projects").join(
+        project
+            .to_string_lossy()
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "-"),
+    );
+    // Encoded from the symlinked path: matched through its session's cwd.
+    let link_dir = claude.join("projects/-link-app-recorded-elsewhere");
+    for (dir, cwd) in [(&encoded_dir, &project), (&link_dir, &link)] {
+        fs::create_dir_all(dir.join("memory")).unwrap();
+        fs::write(
+            dir.join("s.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+    }
+    fs::write(
+        encoded_dir.join("memory/note.md"),
+        "---\nname: \"note\"\ndescription: \"quoted desc\"\ntype: feedback\n---\nbody\n",
+    )
+    .unwrap();
+    fs::write(
+        link_dir.join("memory/other.md"),
+        "---\nname: other\ndescription: 'it''s'\ntype: project\n---\nbody\n",
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| {
+        let assert = ah()
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("CODEX_HOME", "/nonexistent")
+            .env("GEMINI_CLI_HOME", "/nonexistent")
+            .env("COPILOT_HOME", "/nonexistent")
+            .env("CURSOR_CONFIG_DIR", "/nonexistent")
+            .env_remove("XDG_DATA_HOME")
+            .args(args)
+            .write_stdin("")
+            .assert()
+            .success();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    };
+
+    let mut rows: Vec<String> = run(&["memory", "--tsv", "-o", "agent,project,name,description"])
+        .lines()
+        .map(String::from)
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            "claude\tmy_app\tnote\tquoted desc",
+            "claude\tmy_app\tother\tit's",
+            "shared\tmy_app\tAGENTS.md\t",
+        ]
+    );
+
+    let all = run(&["memory", "-a", "--tsv", "-o", "agent,name"]);
+    assert_eq!(all.matches("AGENTS.md").count(), 1, "{all}");
+
+    assert_eq!(
+        run(&["memory", "--agent", "codex", "--tsv", "-o", "agent,name"]),
+        "shared\tAGENTS.md\n"
+    );
+}

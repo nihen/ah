@@ -1,6 +1,6 @@
 //! Memory and instruction file listing and search (shared by `ah memory`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -9,7 +9,10 @@ use rayon::prelude::*;
 use regex::Regex;
 
 use crate::agents;
-use crate::agents::common::{canonical_home, decode_claude_project, format_mtime};
+use crate::agents::AgentPlugin;
+use crate::agents::common::{
+    canonical_home, canonicalize_if_exists, decode_claude_project, format_mtime,
+};
 use crate::cli::{Field, FilterArgs, MemoryField, MemoryResolvedArgs, SortOrder};
 use crate::collector;
 use crate::config;
@@ -94,9 +97,9 @@ fn parse_frontmatter(content: &str) -> (MemoryFrontmatter, String) {
             let key = key.trim();
             let val = val.trim();
             match key {
-                "name" => fm.name = val.to_string(),
-                "description" => fm.description = val.to_string(),
-                "type" => fm.memory_type = val.to_string(),
+                "name" => fm.name = unquote_scalar(val),
+                "description" => fm.description = unquote_scalar(val),
+                "type" => fm.memory_type = unquote_scalar(val),
                 _ => {}
             }
         }
@@ -105,10 +108,67 @@ fn parse_frontmatter(content: &str) -> (MemoryFrontmatter, String) {
     (fm, body)
 }
 
+/// Strip one pair of surrounding YAML quotes from a frontmatter scalar.
+/// Double-quoted values unescape `\"` and `\\`; single-quoted values
+/// unescape `''`. Unquoted or unbalanced values are returned as-is.
+fn unquote_scalar(val: &str) -> String {
+    if val.len() >= 2 {
+        if let Some(inner) = val.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+            let mut out = String::with_capacity(inner.len());
+            let mut chars = inner.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    match chars.next() {
+                        Some(n @ ('"' | '\\')) => out.push(n),
+                        Some(n) => {
+                            out.push('\\');
+                            out.push(n);
+                        }
+                        None => out.push('\\'),
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            return out;
+        }
+        if let Some(inner) = val.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+            return inner.replace("''", "'");
+        }
+    }
+    val.to_string()
+}
+
 /// Encode a filesystem path to Claude's project directory naming convention.
-/// `/Users/you/src/github.com/foo` → `-Users-you-src-github-com-foo`
+/// Claude Code replaces every UTF-16 code unit outside `[A-Za-z0-9]` with `-`:
+/// `/Users/you/src/github.com/my_app` → `-Users-you-src-github-com-my-app`
 fn encode_path_for_claude(path: &str) -> String {
-    path.replace(['/', '.'], "-")
+    path.encode_utf16()
+        .map(|u| match char::from_u32(u32::from(u)) {
+            Some(c) if c.is_ascii_alphanumeric() => c,
+            _ => '-',
+        })
+        .collect()
+}
+
+/// Working directory recorded by the newest Claude session in a project
+/// directory. Used to name the project and to match the current directory
+/// when the encoded directory name alone does not (e.g. a truncated name).
+fn claude_project_cwd(project_dir: &Path, home: &Path) -> Option<String> {
+    let newest = fs::read_dir(project_dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .filter_map(|p| {
+            let mtime = fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+            Some((mtime, p))
+        })
+        .max()?
+        .1;
+    agents::claude::PLUGIN
+        .resolve_cwd(&newest, home)
+        .map(|c| canonicalize_if_exists(&c))
 }
 
 /// Get file metadata: (mtime, ctime/birthtime, size)
@@ -126,7 +186,12 @@ fn file_meta(path: &Path) -> (SystemTime, SystemTime, u64) {
     (mtime, ctime, size)
 }
 
-/// Instruction file definitions: (agent, filename)
+/// Agent label for project-level `AGENTS.md`, which many agents read.
+const SHARED_AGENT: &str = "shared";
+
+/// Instruction file definitions: (agent, filename).
+/// A global `AGENTS.md` lives in the agent's own base (`~/.codex/AGENTS.md`)
+/// and stays attributed to it; a project-level one is listed as shared.
 const INSTRUCTION_FILES: &[(&str, &str)] = &[
     ("claude", "CLAUDE.md"),
     ("codex", "AGENTS.md"),
@@ -148,6 +213,7 @@ fn collect_claude_memory_files(all: bool, cwd: &str) -> Vec<MemoryEntry> {
 
     let pattern = format!("{}/*/memory/*.md", projects_dir.display());
     let mut results = Vec::new();
+    let mut project_cwds: HashMap<PathBuf, Option<String>> = HashMap::new();
 
     for entry in glob::glob(&pattern).into_iter().flatten().flatten() {
         // Skip MEMORY.md (index file)
@@ -165,8 +231,15 @@ fn collect_claude_memory_files(all: bool, cwd: &str) -> Vec<MemoryEntry> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        let session_cwd = project_dir.and_then(|dir| {
+            project_cwds
+                .entry(dir.to_path_buf())
+                .or_insert_with(|| claude_project_cwd(dir, &home))
+                .clone()
+        });
+
         if let Some(ref filter) = encoded_cwd {
-            if encoded_name != *filter {
+            if encoded_name != *filter && session_cwd.as_deref() != Some(cwd) {
                 continue;
             }
         }
@@ -185,7 +258,11 @@ fn collect_claude_memory_files(all: bool, cwd: &str) -> Vec<MemoryEntry> {
             ctime,
             size,
             agent: "claude",
-            project: decode_claude_project(&encoded_name),
+            project: session_cwd
+                .as_deref()
+                .and_then(|c| Path::new(c).file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| decode_claude_project(&encoded_name)),
             memory_type: fm.memory_type,
             name: fm.name,
             description: fm.description,
@@ -251,6 +328,11 @@ fn collect_project_instructions(dir: &Path) -> Vec<MemoryEntry> {
         };
         let (mtime, ctime, size) = file_meta(&path);
 
+        let agent = if filename == "AGENTS.md" {
+            SHARED_AGENT
+        } else {
+            agent
+        };
         results.push(MemoryEntry {
             path,
             mtime,
@@ -334,7 +416,7 @@ pub fn build_memory_records(
             if !canonical.starts_with(&home) {
                 continue;
             }
-            if seen.insert(dir.clone()) && p.is_dir() {
+            if canonical.is_dir() && seen.insert(canonical.clone()) {
                 entries.extend(collect_project_instructions(&canonical));
             }
         }
@@ -342,6 +424,16 @@ pub fn build_memory_records(
         // Current directory only
         entries.extend(collect_project_instructions(Path::new(&cwd)));
     }
+
+    // The same file can be reached twice for one agent (e.g. through a
+    // symlinked project path). Keep the first occurrence. One file shared by
+    // several agents (e.g. ~/.codex/AGENTS.md -> ~/AGENTS.md) stays listed
+    // once per agent, since each agent reads it.
+    let mut seen_paths = HashSet::new();
+    entries.retain(|e| {
+        let key = fs::canonicalize(&e.path).unwrap_or_else(|_| e.path.clone());
+        seen_paths.insert((key, e.agent))
+    });
 
     if entries.is_empty() {
         return Err("No memory files found.".to_string());
@@ -365,8 +457,10 @@ pub fn build_memory_records(
         .into_iter()
         .filter_map(|entry| {
             // Agent filter
+            // Shared files (project AGENTS.md) are read by several agents,
+            // so they match any agent filter.
             if let Some(ref agent_filter) = filter.agent {
-                if entry.agent != *agent_filter {
+                if entry.agent != *agent_filter && entry.agent != SHARED_AGENT {
                     return None;
                 }
             }
@@ -580,6 +674,33 @@ mod tests {
             encode_path_for_claude("/Users/you/src/github.com/org/myapp"),
             "-Users-you-src-github-com-org-myapp"
         );
+        assert_eq!(
+            encode_path_for_claude("/data/home/u/src/org/pce_bc_api"),
+            "-data-home-u-src-org-pce-bc-api"
+        );
+        assert_eq!(encode_path_for_claude("/tmp/a b+c"), "-tmp-a-b-c");
+        // one dash per UTF-16 code unit (a surrogate pair becomes two)
+        assert_eq!(encode_path_for_claude("/tmp/日本"), "-tmp---");
+        assert_eq!(encode_path_for_claude("/tmp/😀"), "-tmp---");
+    }
+
+    #[test]
+    fn test_unquote_scalar() {
+        assert_eq!(unquote_scalar(r#""quoted desc""#), "quoted desc");
+        assert_eq!(unquote_scalar("'it''s'"), "it's");
+        assert_eq!(unquote_scalar(r#""a \"b\" \\ c""#), r#"a "b" \ c"#);
+        assert_eq!(unquote_scalar("plain"), "plain");
+        assert_eq!(unquote_scalar(r#""unbalanced"#), r#""unbalanced"#);
+        assert_eq!(unquote_scalar(r#"""#), r#"""#);
+    }
+
+    #[test]
+    fn test_parse_frontmatter_quoted_values() {
+        let content = "---\nname: \"q name\"\ndescription: 'single'\ntype: \"feedback\"\n---\nbody";
+        let (fm, _) = parse_frontmatter(content);
+        assert_eq!(fm.name, "q name");
+        assert_eq!(fm.description, "single");
+        assert_eq!(fm.memory_type, "feedback");
     }
 
     #[test]
