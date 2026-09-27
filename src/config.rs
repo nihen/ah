@@ -18,6 +18,9 @@ pub struct AgentDef {
     /// Extra patterns without a marker of their own: their matches are used
     /// only when they already map back to this agent's plugin.
     pub unattributed_patterns: Vec<String>,
+    /// Built-in locations of subagent transcripts the main patterns miss,
+    /// collected only when subagents are included.
+    pub subagent_patterns: Vec<String>,
     pub disabled: bool,
     pub description: String,
     pub is_builtin: bool,
@@ -229,6 +232,14 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
         .iter()
         .map(|plugin| {
             let id = plugin.id().to_string();
+            let subagent_patterns = match builtin_env_info(&id) {
+                Some(info) => apply_env_override(plugin.subagent_glob_patterns(), home, &info),
+                None => plugin
+                    .subagent_glob_patterns()
+                    .iter()
+                    .map(|p| home.join(p).to_string_lossy().to_string())
+                    .collect(),
+            };
             let (glob_patterns, env_overridden) = if let Some(info) = builtin_env_info(&id) {
                 let patterns = apply_env_override(plugin.glob_patterns(), home, &info);
                 let overridden = std::env::var(info.env_var)
@@ -258,6 +269,7 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
                 glob_patterns,
                 path_markers,
                 unattributed_patterns: Vec::new(),
+                subagent_patterns,
                 disabled: false,
                 description: plugin.description().to_string(),
                 is_builtin: true,
@@ -373,6 +385,7 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
                 glob_patterns,
                 path_markers,
                 unattributed_patterns: Vec::new(),
+                subagent_patterns: Vec::new(),
                 disabled: entry.disabled.unwrap_or(false),
                 description: plugin.description().to_string(),
                 is_builtin: false,

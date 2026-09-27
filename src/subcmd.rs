@@ -346,9 +346,11 @@ fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
     let resolve_fields = [Field::Id];
     let opts = resolver::ResolveOpts::default();
 
-    // Preferred file per session id: exact match, then id-prefix matches.
-    let mut exact: Option<(PathBuf, SystemTime)> = None;
-    let mut prefix_matches: HashMap<String, (PathBuf, SystemTime)> = HashMap::new();
+    // Preferred file per session: exact id matches, then id-prefix matches,
+    // each keyed by (id, parent id). One id under several parents (e.g.
+    // subagent transcripts of different sessions) is ambiguous.
+    let mut exact: HashMap<String, (PathBuf, SystemTime)> = HashMap::new();
+    let mut prefix_matches: HashMap<(String, String), (PathBuf, SystemTime)> = HashMap::new();
     let better = |a: &PathBuf, a_mtime: SystemTime, b: &PathBuf, b_mtime: SystemTime| {
         pipeline::copy_preference(a, a_mtime) > pipeline::copy_preference(b, b_mtime)
     };
@@ -359,35 +361,57 @@ fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
         let Some(v) = fields.get(&Field::Id) else {
             continue;
         };
-        if v == id {
-            // Files come newest first (ties by path, like `copy_preference`),
-            // so the first dedicated session file is the preferred copy; only
-            // a secondary record keeps looking.
-            if !plugin.is_secondary_record(fpath) {
-                return Ok(fpath.clone());
-            }
-            if exact
-                .as_ref()
-                .is_none_or(|(p, m)| better(fpath, *mtime, p, *m))
-            {
-                exact = Some((fpath.clone(), *mtime));
-            }
+        if !v.starts_with(id) {
+            continue;
+        }
+        let parent = plugin.parent_session_id(fpath).unwrap_or_default();
+        // Files come newest first (ties by path, like `copy_preference`), so
+        // the first dedicated file of a top-level session is the preferred
+        // copy. Only subagent ids, which may repeat under other parents, and
+        // secondary records keep looking.
+        if v == id && parent.is_empty() && !plugin.is_secondary_record(fpath) {
+            return Ok(fpath.clone());
+        }
+        let candidates = if v == id {
+            exact.entry(parent)
         } else if v.starts_with(id) {
-            match prefix_matches.get_mut(v) {
-                Some(entry) => {
-                    if better(fpath, *mtime, &entry.0, entry.1) {
-                        *entry = (fpath.clone(), *mtime);
+            match prefix_matches.entry((v.clone(), parent)) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if better(fpath, *mtime, &e.get().0, e.get().1) {
+                        e.insert((fpath.clone(), *mtime));
                     }
+                    continue;
                 }
-                None => {
-                    prefix_matches.insert(v.clone(), (fpath.clone(), *mtime));
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((fpath.clone(), *mtime));
+                    continue;
                 }
+            }
+        } else {
+            continue;
+        };
+        match candidates {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if better(fpath, *mtime, &e.get().0, e.get().1) {
+                    e.insert((fpath.clone(), *mtime));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((fpath.clone(), *mtime));
             }
         }
     }
 
-    if let Some((path, _)) = exact {
-        return Ok(path);
+    let mut exact = exact.into_values();
+    match (exact.next(), exact.next()) {
+        (Some((path, _)), None) => return Ok(path),
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "Ambiguous session id: {} (several sessions; pass the path instead)",
+                id
+            ));
+        }
+        (None, _) => {}
     }
     let mut matches = prefix_matches.into_values();
     match (matches.next(), matches.next()) {

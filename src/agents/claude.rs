@@ -12,6 +12,27 @@ use super::common::{
 };
 use super::{AgentMemoryFile, AgentPlugin, MemoryKind, MemorySource, Message};
 
+/// Parent session id of a subagent transcript
+/// (`projects/<project>/<parent id>/subagents/agent-<id>.jsonl`).
+fn subagent_parent(path: &Path) -> Option<&str> {
+    let dir = path.parent()?;
+    let parent = dir.parent()?;
+    // `projects/subagents/<id>.jsonl` is a top-level transcript of a
+    // project directory named `subagents`.
+    if dir.file_name()? != "subagents" || parent.parent()?.parent()?.file_name()? != "projects" {
+        return None;
+    }
+    parent.file_name()?.to_str()
+}
+
+/// The `projects/<project>` directory a transcript belongs to.
+fn project_dir(path: &Path) -> Option<&Path> {
+    match subagent_parent(path) {
+        Some(_) => path.parent()?.parent()?.parent(),
+        None => path.parent(),
+    }
+}
+
 pub static PLUGIN: ClaudePlugin = ClaudePlugin;
 
 /// Recent Claude Code versions write several header records (`mode`,
@@ -169,6 +190,18 @@ impl AgentPlugin for ClaudePlugin {
         &[".claude/projects/*/*.jsonl"]
     }
 
+    fn subagent_glob_patterns(&self) -> &'static [&'static str] {
+        &[".claude/projects/*/*/subagents/agent-*.jsonl"]
+    }
+
+    fn is_subagent(&self, path: &Path) -> bool {
+        subagent_parent(path).is_some()
+    }
+
+    fn parent_session_id(&self, path: &Path) -> Option<String> {
+        subagent_parent(path).map(str::to_string)
+    }
+
     fn path_markers(&self) -> &'static [&'static str] {
         &["/.claude/"]
     }
@@ -251,7 +284,7 @@ impl AgentPlugin for ClaudePlugin {
     }
 
     fn resolve_project(&self, path: &Path, _home: &Path) -> Option<String> {
-        let raw = path.parent()?.file_name()?.to_string_lossy();
+        let raw = project_dir(path)?.file_name()?.to_string_lossy();
         Some(RE_HOME_PREFIX.replace(&raw, "").replace('-', "/"))
     }
 
@@ -273,12 +306,22 @@ impl AgentPlugin for ClaudePlugin {
         Self::extract_title_from_bytes(mmap)
     }
 
+    // `claude --resume` cannot open a subagent transcript.
     fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
-        if path.to_string_lossy().contains("/subagents/") {
+        if subagent_parent(path).is_some() {
             None
         } else {
             path.file_stem().map(|s| s.to_string_lossy().to_string())
         }
+    }
+
+    /// A subagent is identified by its agent id (`agent-<id>.jsonl`).
+    fn session_id(&self, path: &Path, home: &Path) -> Option<String> {
+        if subagent_parent(path).is_some() {
+            let stem = path.file_stem()?.to_str()?;
+            return Some(stem.strip_prefix("agent-").unwrap_or(stem).to_string());
+        }
+        self.resolve_resume_id(path, home)
     }
 
     fn resume_args(&self, path: &Path, home: &Path) -> Option<Vec<String>> {
@@ -460,6 +503,21 @@ fn running_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_transcripts_are_recognized_by_layout() {
+        let home = Path::new("/h");
+        let child = Path::new("/h/.claude/projects/-tmp-p/sess-1/subagents/agent-a1.jsonl");
+        assert_eq!(subagent_parent(child), Some("sess-1"));
+        assert_eq!(PLUGIN.resume_args(child, home), None);
+        // A project directory named `subagents` holds top-level transcripts.
+        let top = Path::new("/h/.claude/projects/subagents/sess-2.jsonl");
+        assert_eq!(subagent_parent(top), None);
+        assert_eq!(
+            PLUGIN.resolve_resume_id(top, home).as_deref(),
+            Some("sess-2")
+        );
+    }
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))

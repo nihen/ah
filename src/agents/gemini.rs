@@ -19,8 +19,23 @@ use super::{MemoryKind, MemorySource};
 /// Project directory of a session file: `tmp/{project}/chats/session-*` or
 /// `tmp/{project}/logs.json`. Anchored to the end of the path so that a
 /// project named `tmp` (cwd `/tmp`) does not capture `chats`.
+/// Parent session id of a subagent log (`chats/<parent id>/<id>.json` or
+/// `.jsonl`). Main session files are always named `session-*` and subagent
+/// logs never are, so a project named `chats` is not mistaken for a parent
+/// directory, and extra locations (`extra_patterns`) keep the same layout.
+fn subagent_parent(path: &Path) -> Option<&str> {
+    if path.file_name()?.to_str()?.starts_with("session-") {
+        return None;
+    }
+    let dir = path.parent()?;
+    if dir.parent()?.file_name()? != "chats" {
+        return None;
+    }
+    dir.file_name()?.to_str()
+}
+
 static RE_GEMINI_TMP: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"/tmp/([^/]+)/(?:chats/[^/]+|logs\.json)$").unwrap());
+    LazyLock::new(|| Regex::new(r"/tmp/([^/]+)/(?:chats/(?:[^/]+/)?[^/]+|logs\.json)$").unwrap());
 /// Session start time in the file name, written in UTC by Gemini CLI
 /// (`new Date().toISOString()`).
 static RE_GEMINI_DATE: LazyLock<Regex> = LazyLock::new(|| {
@@ -471,6 +486,17 @@ impl AgentPlugin for GeminiPlugin {
         &["/.gemini/"]
     }
 
+    fn subagent_glob_patterns(&self) -> &'static [&'static str] {
+        &[
+            ".gemini/tmp/*/chats/*/*.json",
+            ".gemini/tmp/*/chats/*/*.jsonl",
+        ]
+    }
+
+    fn parent_session_id(&self, path: &Path) -> Option<String> {
+        subagent_parent(path).map(str::to_string)
+    }
+
     fn is_secondary_record(&self, path: &Path) -> bool {
         path.file_name().is_some_and(|name| name == "logs.json")
     }
@@ -584,7 +610,23 @@ impl AgentPlugin for GeminiPlugin {
         None
     }
 
-    fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
+    // `gemini --resume` lists only top-level sessions, not subagent logs.
+    fn resolve_resume_id(&self, path: &Path, home: &Path) -> Option<String> {
+        if subagent_parent(path).is_some() {
+            return None;
+        }
+        self.session_id(path, home)
+    }
+
+    fn session_id(&self, path: &Path, _home: &Path) -> Option<String> {
+        // A subagent log is named after its session id; skip reading it
+        // (id lookups visit every subagent log, some tens of MB).
+        if subagent_parent(path).is_some() {
+            return path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string);
+        }
         let mmap = mmap_file(path)?;
         if is_jsonl(path) {
             return jsonl_session_id(&mmap);
@@ -618,6 +660,42 @@ impl AgentPlugin for GeminiPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_logs_name_their_parent_and_are_not_resumable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chats = tmp.path().join(".gemini/tmp/proj/chats");
+        let child = chats.join("parent-uuid/zut36a.jsonl");
+        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+        std::fs::write(
+            &child,
+            "{\"sessionId\":\"zut36a\",\"projectHash\":\"h\",\"kind\":\"subagent\"}\n",
+        )
+        .unwrap();
+        let home = tmp.path();
+        assert!(PLUGIN.is_subagent(&child));
+        assert_eq!(
+            PLUGIN.parent_session_id(&child).as_deref(),
+            Some("parent-uuid")
+        );
+        assert_eq!(PLUGIN.session_id(&child, home).as_deref(), Some("zut36a"));
+        assert_eq!(PLUGIN.resume_args(&child, home), None);
+        assert_eq!(
+            PLUGIN.resolve_project(&child, home).as_deref(),
+            Some("proj")
+        );
+        let main = chats.join("session-2026-06-11T02-44-acc93477.jsonl");
+        assert!(!PLUGIN.is_subagent(&main));
+        // A base directory named `tmp` with a project named `chats`.
+        let nested = Path::new("/x/tmp/tmp/chats/chats/session-2026-06-11T02-44-acc93477.json");
+        assert!(!PLUGIN.is_subagent(nested));
+        // Extra locations keep the chats/<parent>/<id> layout.
+        let extra = Path::new("/x/gemarchive/proj/chats/parent-uuid/childabc.jsonl");
+        assert_eq!(
+            PLUGIN.parent_session_id(extra).as_deref(),
+            Some("parent-uuid")
+        );
+    }
 
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))

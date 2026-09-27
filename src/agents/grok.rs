@@ -184,6 +184,13 @@ impl AgentPlugin for GrokPlugin {
         Some(vec!["grok".to_string(), "--resume".to_string(), id])
     }
 
+    /// Subagents are marked by `session_kind`; summary.json does not record
+    /// the spawning session.
+    fn is_subagent(&self, path: &Path) -> bool {
+        Self::read_summary(path)
+            .is_some_and(|s| s.get("session_kind").and_then(|v| v.as_str()) == Some("subagent"))
+    }
+
     fn running_sessions(&self) -> Vec<(String, Option<u32>)> {
         crate::config::resolve_agent_base("grok")
             .map(|base| running_in(&base.join("active_sessions.json")))

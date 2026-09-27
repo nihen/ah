@@ -13,22 +13,58 @@ use crate::color;
 use crate::config;
 
 static EXCLUDE_ARCHIVED: AtomicBool = AtomicBool::new(false);
+static INCLUDE_SUBAGENTS: AtomicBool = AtomicBool::new(false);
 
 /// Hide archived sessions from listings (`--no-archived`).
 pub fn init_exclude_archived(exclude: bool) {
     EXCLUDE_ARCHIVED.store(exclude, AtomicOrdering::Relaxed);
 }
 
-/// Collect session files, sorted by mtime descending, limited to top N.
-/// Archived sessions are skipped when `--no-archived` is set.
-pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
-    collect(limit, EXCLUDE_ARCHIVED.load(AtomicOrdering::Relaxed))
+/// List subagent sessions too (`--subagents`).
+pub fn init_include_subagents(include: bool) {
+    INCLUDE_SUBAGENTS.store(include, AtomicOrdering::Relaxed);
 }
 
-/// Like `collect_files`, but always includes archived sessions (for lookups
-/// of an explicit session reference).
+/// How a collection treats subagent sessions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Subagents {
+    /// Skip sessions a plugin reports as subagents (the listing default).
+    Hide,
+    /// Keep what the main patterns matched before subagents could be
+    /// listed: plain files unfiltered, container rows (opencode) without
+    /// their child sessions, and no subagent patterns.
+    Unfiltered,
+    /// Also collect the plugins' subagent patterns (`--subagents`, lookups).
+    Include,
+}
+
+/// Collect session files, sorted by mtime descending, limited to top N.
+/// Archived sessions are skipped when `--no-archived` is set, and subagent
+/// sessions unless `--subagents` is set.
+pub fn collect_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
+    let subagents = if INCLUDE_SUBAGENTS.load(AtomicOrdering::Relaxed) {
+        Subagents::Include
+    } else {
+        Subagents::Hide
+    };
+    collect(
+        limit,
+        EXCLUDE_ARCHIVED.load(AtomicOrdering::Relaxed),
+        subagents,
+    )
+}
+
+/// Like `collect_files`, but always includes archived and subagent sessions
+/// (for lookups of an explicit session reference).
 pub fn collect_all_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
-    collect(limit, false)
+    collect(limit, false, Subagents::Include)
+}
+
+/// Every session the main patterns match, archived and subagent ones
+/// included, for discovering project directories: listing flags hide
+/// sessions, not the projects they reveal.
+pub fn collect_project_files(limit: usize) -> Vec<(PathBuf, SystemTime)> {
+    collect(limit, false, Subagents::Unfiltered)
 }
 
 /// Newest first; equal mtimes by path descending, so the order (and the copy
@@ -37,20 +73,39 @@ fn newest_first(a: &(PathBuf, SystemTime), b: &(PathBuf, SystemTime)) -> Orderin
     b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0))
 }
 
-fn collect(limit: usize, exclude_archived: bool) -> Vec<(PathBuf, SystemTime)> {
+fn collect(
+    limit: usize,
+    exclude_archived: bool,
+    subagents: Subagents,
+) -> Vec<(PathBuf, SystemTime)> {
+    let hide_subagents = subagents == Subagents::Hide;
+    let hide_subagent_rows = subagents != Subagents::Include;
     let debug = color::is_debug();
     let t0 = if debug { Some(Instant::now()) } else { None };
 
     // (plugin, pattern, whether matches must be checked to map back to the plugin)
     let patterns: Vec<(&'static dyn AgentPlugin, String, bool)> = config::active_agents()
         .flat_map(|agent| {
-            agent.glob_patterns.iter().map(move |pattern| {
-                (
-                    agent.plugin,
-                    pattern.clone(),
-                    agent.unattributed_patterns.contains(pattern),
+            let subagent_patterns = if subagents == Subagents::Include {
+                agent.subagent_patterns.as_slice()
+            } else {
+                &[]
+            };
+            agent
+                .glob_patterns
+                .iter()
+                .map(move |pattern| {
+                    (
+                        agent.plugin,
+                        pattern.clone(),
+                        agent.unattributed_patterns.contains(pattern),
+                    )
+                })
+                .chain(
+                    subagent_patterns
+                        .iter()
+                        .map(move |pattern| (agent.plugin, pattern.clone(), false)),
                 )
-            })
         })
         .collect();
 
@@ -95,6 +150,7 @@ fn collect(limit: usize, exclude_archived: bool) -> Vec<(PathBuf, SystemTime)> {
                             // An unowned copy must not win over a good one.
                             if !owned(&session)
                                 || (exclude_archived && plugin.is_archived(&session))
+                                || (hide_subagent_rows && plugin.is_subagent(&session))
                             {
                                 continue;
                             }
@@ -137,6 +193,7 @@ fn collect(limit: usize, exclude_archived: bool) -> Vec<(PathBuf, SystemTime)> {
             // it could not be parsed, and disabled agents stay hidden.
             if plugin.id() == agents::unknown_plugin().id()
                 || (exclude_archived && plugin.is_archived(&path))
+                || (hide_subagents && plugin.is_subagent(&path))
             {
                 return None;
             }
