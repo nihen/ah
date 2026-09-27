@@ -1645,7 +1645,10 @@ fn prompt_only_search_matches_escaped_prompts_only() {
         // the prompt is written verbatim
         ("verbatim", [user("fix the OAuth flow"), assistant("done")]),
         // the prompt is written with `\uXXXX` escapes only
-        ("escaped", [user(r"修正 OAuth"), assistant("ok")]),
+        (
+            "escaped",
+            [user(r"\u4fee\u6b63 \u004fAuth"), assistant("ok")],
+        ),
         // the query appears only outside the prompts
         ("assistant", [user("hello"), assistant("OAuth 修正")]),
     ];

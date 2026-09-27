@@ -201,7 +201,12 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
                         if let (Some(prefilter), Some(m)) = (&prompt_prefilter, mmap.as_deref()) {
                             if plugin.prompts_per_jsonl_line() && is_session_file {
                                 return prefilter.candidate_lines(m).is_some_and(|lines| {
-                                    search::search_prompts_matches(path, plugin, re, Some(&lines))
+                                    search::search_prompts_matches(
+                                        path,
+                                        plugin,
+                                        re,
+                                        Some(lines.as_ref()),
+                                    )
                                 });
                             }
                             if plugin.prompts_in_session_json() && !prefilter.may_match(m) {
