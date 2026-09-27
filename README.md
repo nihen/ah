@@ -127,13 +127,15 @@ gemini           5  2026-03-21 10:50
 | Agent | List | Search | Show | Resume | Running | Memory |
 |-------|------|--------|------|--------|---------|--------|
 | Claude | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Codex | ✓ | ✓ | ✓ | ✓ | | ✓ |
+| Codex | ✓ | ✓ | ✓ | ✓ | ✓¹ | ✓ |
 | Gemini | ✓ | ✓ | ✓ | ✓ | | ✓ |
-| Copilot | ✓ | ✓ | ✓ | ✓ | | ✓ |
+| Copilot | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Cursor | ✓ | ✓ | ✓ | ✓ | | ✓ |
 | Antigravity (agy) | ✓ | ✓ | ✓ | ✓ | | ✓ |
 | Grok | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | opencode | ✓ | ✓ | ✓ | ✓ | | ✓ |
+
+Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.json` (checking `procStart` so a reused PID is not reported), Grok's `active_sessions.json`, Copilot's `session-state/<id>/inuse.<pid>.lock`, and Codex's `thread-writer-locks/<id>.lock`. ¹ Codex is detected on Linux only, from the kernel lock table (`/proc/locks`); its PID is the lock holder, which for the interactive TUI is the Codex app-server. Running detection needs a PID liveness check, which is not implemented on Windows.
 
 ## Features
 
@@ -242,7 +244,7 @@ Global options:
   -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
   --no-preview            Disable preview in interactive mode
   --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
-  --running               Show only currently running sessions (Claude, Grok)
+  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok)
   --no-archived           Hide sessions the agent has archived (Codex)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)

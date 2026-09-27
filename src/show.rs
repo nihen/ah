@@ -222,17 +222,17 @@ pub(crate) fn enrich_running_pid(
     // doesn't know about (no Id, archived, subagent, etc.) reports
     // running=false / pid="" rather than leaving the fields empty, so
     // `ah show -o running` is the same boolean shape as `ah log -o running`.
-    let pid = if id.is_empty() {
+    let entry = if id.is_empty() {
         None
     } else {
-        crate::build_pid_map().get(&id).copied()
+        crate::agents::running_session_map().get(&id).copied()
     };
     if requested.contains(&Field::Running) {
-        let v = if pid.is_some() { "true" } else { "false" };
+        let v = if entry.is_some() { "true" } else { "false" };
         resolved.insert(Field::Running, v.to_string());
     }
     if requested.contains(&Field::Pid) {
-        let v = pid.map(|p| p.to_string()).unwrap_or_default();
+        let v = entry.flatten().map(|p| p.to_string()).unwrap_or_default();
         resolved.insert(Field::Pid, v);
     }
 }
