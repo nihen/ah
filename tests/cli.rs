@@ -2264,3 +2264,164 @@ fn memory_dot_components_do_not_bypass_cycle_protection() {
         .success()
         .stdout("claude\trule\tr.md\n");
 }
+
+#[test]
+fn codex_subagent_sessions_are_hidden_unless_requested() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let dir = home.join(".codex/sessions/2026/09/27");
+    let parent_id = "019c0000-0000-7000-8000-00000000aaaa";
+    let child_id = "019c0000-0000-7000-8000-00000000cccc";
+    write_codex_rollout(&dir, "2026-09-27T10-00-00", parent_id);
+    fs::write(
+        dir.join(format!("rollout-2026-09-27T10-05-00-{child_id}.jsonl")),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{child_id}\",\"cwd\":\"/tmp/proj\",\
+             \"source\":{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"{parent_id}\",\"depth\":1}}}}}}}}}}\n"
+        ),
+    )
+    .unwrap();
+
+    ah_codex(&home)
+        .args(["log", "-a", "-o", "id"])
+        .assert()
+        .success()
+        .stdout(format!("{parent_id}\n"));
+    ah_codex(&home)
+        .args(["agent", "-a", "--tsv"])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("codex\t1\t"));
+    ah_codex(&home)
+        .args([
+            "log",
+            "-a",
+            "--subagents",
+            "-o",
+            "id,parent_id",
+            "-S",
+            "id",
+            "--asc",
+        ])
+        .assert()
+        .success()
+        .stdout(format!("{parent_id}\t\n{child_id}\t{parent_id}\n"));
+    // Spawned Codex threads stay resumable by id.
+    ah_codex(&home)
+        .args(["resume", "--print", child_id])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "'codex' 'resume' '{child_id}'"
+        )));
+}
+
+#[test]
+fn claude_subagent_transcripts_are_listed_with_subagents() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let claude = home.join(".claude");
+    let project = claude.join("projects/-tmp-proj");
+    let parent_id = "11111111-2222-3333-4444-555555555555";
+    let line = |text: &str| {
+        format!(
+            "{{\"type\":\"user\",\"cwd\":\"/tmp/proj\",\"sessionId\":\"{parent_id}\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"{text}\"}}}}\n"
+        )
+    };
+    fs::create_dir_all(project.join(parent_id).join("subagents")).unwrap();
+    fs::write(project.join(format!("{parent_id}.jsonl")), line("parent")).unwrap();
+    let child = project.join(format!("{parent_id}/subagents/agent-a1b2c3.jsonl"));
+    fs::write(&child, line("child")).unwrap();
+    let ah_claude = || {
+        let mut cmd = ah_opencode(&home);
+        cmd.env("CLAUDE_CONFIG_DIR", &claude);
+        cmd
+    };
+
+    ah_claude()
+        .args(["log", "-a", "-o", "id"])
+        .assert()
+        .success()
+        .stdout(format!("{parent_id}\n"));
+    ah_claude()
+        .args([
+            "log",
+            "-a",
+            "--subagents",
+            "-o",
+            "id,parent_id,project",
+            "-S",
+            "id",
+            "--asc",
+        ])
+        .assert()
+        .success()
+        .stdout(format!("{parent_id}\t\tproj\na1b2c3\t{parent_id}\tproj\n"));
+    // The agent id reaches the transcript without --subagents, but a
+    // subagent cannot be resumed on its own.
+    ah_claude()
+        .args(["show", "-o", "path", "a1b2c3"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout(format!("{}\n", child.display()));
+    ah_claude()
+        .args(["resume", "--print", "a1b2c3"])
+        .write_stdin("")
+        .assert()
+        .failure();
+}
+
+#[test]
+fn grok_and_cursor_subagents_are_hidden_by_default() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let grok = home.join(".grok");
+    for (id, kind) in [("0192-main", "interactive"), ("0192-sub", "subagent")] {
+        let dir = grok.join("sessions/%2Ftmp%2Fproj").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("chat_history.jsonl"), "").unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            format!(
+                "{{\"info\":{{\"id\":\"{id}\",\"cwd\":\"/tmp/proj\"}},\"session_kind\":\"{kind}\"}}"
+            ),
+        )
+        .unwrap();
+    }
+    let cursor = home.join(".cursor");
+    let transcripts = cursor.join("projects/tmp-proj/agent-transcripts");
+    fs::create_dir_all(transcripts.join("chat-1/subagents")).unwrap();
+    let message =
+        "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n";
+    fs::write(transcripts.join("chat-1/chat-1.jsonl"), message).unwrap();
+    fs::write(transcripts.join("chat-1/subagents/sub-1.jsonl"), message).unwrap();
+    let ah_both = || {
+        let mut cmd = ah_opencode(&home);
+        cmd.env("GROK_HOME", &grok).env("CURSOR_DATA_DIR", &cursor);
+        cmd
+    };
+
+    ah_both()
+        .args(["log", "-a", "-o", "agent,id", "-S", "id", "--asc"])
+        .assert()
+        .success()
+        .stdout("grok\t0192-main\ncursor\tchat-1\n");
+    ah_both()
+        .args([
+            "log",
+            "-a",
+            "--subagents",
+            "-o",
+            "agent,id,parent_id,resume_cmd",
+            "-S",
+            "id",
+            "--asc",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("grok\t0192-sub\t\t"))
+        .stdout(predicate::str::contains("cursor\tsub-1\tchat-1\t\n"));
+}

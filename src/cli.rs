@@ -108,6 +108,7 @@ pub enum Field {
     Running,
     Pid,
     Archived,
+    ParentId,
 }
 
 impl Field {
@@ -135,6 +136,7 @@ impl Field {
             Field::Running => "running",
             Field::Pid => "pid",
             Field::Archived => "archived",
+            Field::ParentId => "parent_id",
         }
     }
 
@@ -162,11 +164,12 @@ impl Field {
             Field::Running,
             Field::Pid,
             Field::Archived,
+            Field::ParentId,
         ]
     }
 
     pub fn all_names() -> &'static str {
-        "agent, project, project_raw, modified_at, created_at, title, first_prompt, last_prompt, prompts, responses, messages, transcript, matched, path, cwd, id, resume_cmd, turns, size, running, pid, archived"
+        "agent, project, project_raw, modified_at, created_at, title, first_prompt, last_prompt, prompts, responses, messages, transcript, matched, path, cwd, id, resume_cmd, turns, size, running, pid, archived, parent_id"
     }
 
     pub fn description(&self) -> &'static str {
@@ -186,13 +189,14 @@ impl Field {
             Field::Matched => "Matching excerpts for QUERY",
             Field::Path => "Session file path",
             Field::Cwd => "Session working directory",
-            Field::Id => "Agent-specific session id (for resume)",
+            Field::Id => "Agent-specific session id (for show and resume)",
             Field::ResumeCmd => "Shell command to resume",
             Field::Turns => "User prompt count",
             Field::Size => "Session file size in bytes",
             Field::Running => "Whether the session is currently running",
             Field::Pid => "PID of running agent process",
             Field::Archived => "Whether the agent archived the session (Codex)",
+            Field::ParentId => "Id of the session that spawned this subagent session",
         }
     }
 
@@ -222,6 +226,7 @@ impl Field {
             Field::Running => "true",
             Field::Pid => "12345",
             Field::Archived => "false",
+            Field::ParentId => "abc12345-...",
         }
     }
 
@@ -257,6 +262,7 @@ impl FromStr for Field {
             "running" => Ok(Field::Running),
             "pid" => Ok(Field::Pid),
             "archived" => Ok(Field::Archived),
+            "parent_id" => Ok(Field::ParentId),
             _ => Err(format!(
                 "unknown field '{}'. available: {}",
                 s,
@@ -478,6 +484,10 @@ pub struct FilterArgs {
     /// Hide sessions the agent has archived (Codex)
     #[arg(long = "no-archived", global = true)]
     pub no_archived: bool,
+
+    /// Include subagent sessions (spawned by another session)
+    #[arg(long = "subagents", global = true)]
+    pub subagents: bool,
 
     /// Include sessions from a remote host (repeatable; name must match [remotes.*] in ~/.ahrc)
     #[arg(long = "remote", global = true, conflicts_with = "dir")]
@@ -1575,6 +1585,7 @@ Global options:
   --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
   --running               Show only currently running sessions (Claude, Codex, Copilot, Grok)
   --no-archived           Hide sessions the agent has archived (Codex)
+  --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
@@ -1611,6 +1622,7 @@ const GLOBAL_OPTIONS: &str = r#"Global options:
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --running               Show only currently running sessions (Claude, Codex, Copilot, Grok)
   --no-archived           Hide sessions the agent has archived (Codex)
+  --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --color                 Force colored output (even through pipes)
   --no-color              Disable colored output
@@ -1945,7 +1957,7 @@ mod tests {
 
     #[test]
     fn test_field_all_count() {
-        assert_eq!(Field::all().len(), 22);
+        assert_eq!(Field::all().len(), 23);
     }
 
     #[test]

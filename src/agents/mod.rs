@@ -135,6 +135,24 @@ pub trait AgentPlugin: Sync {
         false
     }
 
+    /// Glob patterns (like `glob_patterns`) for subagent transcripts that
+    /// the main patterns do not match. They are collected only with
+    /// `--subagents` and for explicit session references.
+    fn subagent_glob_patterns(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Whether another session spawned this one (a subagent). Subagent
+    /// sessions are hidden from listings unless `--subagents` is given.
+    fn is_subagent(&self, path: &Path) -> bool {
+        self.parent_session_id(path).is_some()
+    }
+
+    /// Id of the session that spawned this subagent session, when recorded.
+    fn parent_session_id(&self, _path: &Path) -> Option<String> {
+        None
+    }
+
     /// Bytes used for full-text search. Defaults to mmapping `search_path`.
     fn session_bytes(&self, path: &Path) -> Option<SessionBytes> {
         mmap_file(&self.search_path(path)).map(SessionBytes::Mmap)
@@ -193,6 +211,13 @@ pub trait AgentPlugin: Sync {
     /// Default falls back to resolve_title.
     fn resolve_title_from_mmap(&self, path: &Path, home: &Path, _mmap: &[u8]) -> Option<String> {
         self.resolve_title(path, home)
+    }
+
+    /// Session id shown as `id` and matched by id lookups. Defaults to the
+    /// resume id; a session that cannot be resumed (e.g. a Claude subagent)
+    /// can still have an id of its own.
+    fn session_id(&self, path: &Path, home: &Path) -> Option<String> {
+        self.resolve_resume_id(path, home)
     }
 
     fn resolve_resume_id(&self, _path: &Path, _home: &Path) -> Option<String> {
