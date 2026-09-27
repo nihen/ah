@@ -93,8 +93,10 @@ $ ah memory -a
 AGENT   PROJECT    TYPE         NAME              MODIFIED_AT       DESCRIPTION
 claude  my-webapp  feedback     always-run-tests  2026-03-23 18:00  Run test suite before committing
 claude  my-webapp  instruction  CLAUDE.md         2026-03-22 10:00
-codex   my-webapp  instruction  AGENTS.md         2026-03-21 15:30
+shared  my-webapp  instruction  AGENTS.md         2026-03-21 15:30
 ```
+
+A project-level `AGENTS.md` is read by several agents, so it is listed as `shared` and matches any `--agent` filter.
 
 Show session summary per agent:
 
@@ -425,6 +427,8 @@ Options:
 
 Default output (when no format flag is given):
   Aligned table with auto-pager on TTY, plain TSV when piped
+
+A project-level AGENTS.md is listed as agent `shared` and matches any --agent filter.
 
 Interactive mode:
   -i, --interactive       Browse memory files via fuzzy finder
