@@ -471,7 +471,7 @@ pub struct FilterArgs {
     #[arg(long = "until", global = true)]
     pub until: Option<String>,
 
-    /// Show only currently running sessions (Claude, Grok)
+    /// Show only currently running sessions (Claude, Codex, Copilot, Grok)
     #[arg(long = "running", global = true)]
     pub running: bool,
 
@@ -1571,7 +1571,7 @@ Global options:
   -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
   --no-preview            Disable preview in interactive mode
   --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
-  --running               Show only currently running sessions (Claude, Grok)
+  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok)
   --no-archived           Hide sessions the agent has archived (Codex)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
@@ -1607,7 +1607,7 @@ const GLOBAL_OPTIONS: &str = r#"Global options:
   -n, --limit N           Max session files to scan (default: 0, no limit)
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
-  --running               Show only currently running sessions (Claude, Grok)
+  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok)
   --no-archived           Hide sessions the agent has archived (Codex)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --color                 Force colored output (even through pipes)

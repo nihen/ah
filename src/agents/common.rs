@@ -196,6 +196,139 @@ pub fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+#[cfg(unix)]
+pub fn is_pid_alive(pid: u32) -> bool {
+    match i32::try_from(pid) {
+        Ok(p) if p > 0 => unsafe { libc::kill(p, 0) == 0 },
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+pub fn is_pid_alive(_pid: u32) -> bool {
+    false
+}
+
+/// Parse the `u32` stored under `key` (JSON number or numeric string).
+pub fn json_pid(val: &serde_json::Value, key: &str) -> Option<u32> {
+    let v = val.get(key)?;
+    let n = v
+        .as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))?;
+    u32::try_from(n).ok().filter(|&p| p > 0)
+}
+
+/// Start time of `pid` in clock ticks since boot (`/proc/<pid>/stat` field
+/// 22). `None` where the kernel does not expose it.
+pub fn process_start_ticks(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+        parse_stat_start_ticks(&stat)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Extract field 22 (starttime) from a `/proc/<pid>/stat` line. The command
+/// name (field 2) may contain spaces and parentheses, so fields are counted
+/// from the last `)`.
+fn parse_stat_start_ticks(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Wall-clock start time of `pid`. `None` where it cannot be determined.
+pub fn process_start_time(pid: u32) -> Option<SystemTime> {
+    #[cfg(target_os = "linux")]
+    {
+        let ticks = process_start_ticks(pid)?;
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if hz <= 0 {
+            return None;
+        }
+        let stat = fs::read_to_string("/proc/stat").ok()?;
+        let btime: u64 = stat
+            .lines()
+            .find_map(|l| l.strip_prefix("btime "))?
+            .trim()
+            .parse()
+            .ok()?;
+        let hz = hz as u64;
+        let since_boot = std::time::Duration::from_secs(ticks / hz)
+            + std::time::Duration::from_nanos((ticks % hz) * 1_000_000_000 / hz);
+        Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(btime) + since_boot)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Holders of file locks, keyed by `(device major, device minor, inode)`,
+/// from `/proc/locks`. Blocked waiters (`->` lines) are ignored. Empty where
+/// the kernel does not expose the table.
+pub fn file_lock_holders() -> std::collections::HashMap<(u64, u64, u64), u32> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/proc/locks")
+            .map(|s| parse_proc_locks(&s))
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::collections::HashMap::new()
+    }
+}
+
+fn parse_proc_locks(text: &str) -> std::collections::HashMap<(u64, u64, u64), u32> {
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        // "1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF"
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 6 || cols[1] == "->" {
+            continue;
+        }
+        let Ok(pid) = cols[4].parse::<u32>() else {
+            continue;
+        };
+        let mut id = cols[5].splitn(3, ':');
+        let (Some(maj), Some(min), Some(ino)) = (id.next(), id.next(), id.next()) else {
+            continue;
+        };
+        if let (Ok(maj), Ok(min), Ok(ino)) = (
+            u64::from_str_radix(maj, 16),
+            u64::from_str_radix(min, 16),
+            ino.parse::<u64>(),
+        ) {
+            map.insert((maj, min, ino), pid);
+        }
+    }
+    map
+}
+
+/// `(device major, device minor, inode)` of `path`, matching the key used by
+/// [`file_lock_holders`].
+#[cfg(unix)]
+pub fn file_lock_key(path: &Path) -> Option<(u64, u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).ok()?;
+    let dev = meta.dev();
+    // Linux `dev_t` encoding (glibc/musl `major()` / `minor()`).
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    Some((major, minor, meta.ino()))
+}
+
+#[cfg(not(unix))]
+pub fn file_lock_key(_path: &Path) -> Option<(u64, u64, u64)> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +374,51 @@ mod tests {
             tagged_user_body("<system>injected</system>", "user_query"),
             None
         );
+    }
+
+    #[test]
+    fn stat_start_ticks_skips_parenthesized_comm() {
+        let mut stat = String::from("1234 (we ird) name) S");
+        for n in 4..=21 {
+            stat.push_str(&format!(" {}", n));
+        }
+        stat.push_str(" 987654 23 24");
+        assert_eq!(parse_stat_start_ticks(&stat), Some(987654));
+        assert_eq!(parse_stat_start_ticks("1 (x) S 1 2"), None);
+        assert_eq!(parse_stat_start_ticks("garbage"), None);
+    }
+
+    #[test]
+    fn proc_locks_parses_holders_and_skips_waiters() {
+        let text = "1: FLOCK  ADVISORY  WRITE 165470 103:02:23794220 0 EOF\n\
+                    1: -> FLOCK  ADVISORY  WRITE 999 103:02:23794220 0 EOF\n\
+                    2: POSIX  ADVISORY  READ 42 00:2c:77 0 EOF\n\
+                    bad line\n";
+        let map = parse_proc_locks(text);
+        assert_eq!(map.get(&(0x103, 0x02, 23794220)), Some(&165470));
+        assert_eq!(map.get(&(0, 0x2c, 77)), Some(&42));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn json_pid_accepts_numbers_and_numeric_strings() {
+        let v = serde_json::json!({"a": 12, "b": "34", "c": 0, "d": "x", "e": -1});
+        assert_eq!(json_pid(&v, "a"), Some(12));
+        assert_eq!(json_pid(&v, "b"), Some(34));
+        assert_eq!(json_pid(&v, "c"), None);
+        assert_eq!(json_pid(&v, "d"), None);
+        assert_eq!(json_pid(&v, "e"), None);
+        assert_eq!(json_pid(&v, "missing"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn own_process_start_is_known_and_in_the_past() {
+        let pid = std::process::id();
+        assert!(is_pid_alive(pid));
+        assert!(process_start_ticks(pid).is_some());
+        let started = process_start_time(pid).unwrap();
+        assert!(started <= SystemTime::now());
     }
 
     #[test]

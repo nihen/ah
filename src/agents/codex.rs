@@ -130,6 +130,11 @@ impl AgentPlugin for CodexPlugin {
         true
     }
 
+    fn can_detect_running(&self) -> bool {
+        // Needs the kernel lock table (`/proc/locks`).
+        cfg!(target_os = "linux")
+    }
+
     fn project_desc(&self) -> &'static str {
         "basename of cwd (raw: home-relative path of cwd)"
     }
@@ -250,6 +255,49 @@ impl AgentPlugin for CodexPlugin {
         let id = self.resolve_resume_id(path, home)?;
         Some(vec!["codex".to_string(), "resume".to_string(), id])
     }
+
+    fn running_sessions(&self) -> Vec<(String, Option<u32>)> {
+        crate::config::resolve_agent_base("codex")
+            .map(|base| {
+                running_in(
+                    &base.join("thread-writer-locks"),
+                    &super::common::file_lock_holders(),
+                )
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Running sessions from `thread-writer-locks/<thread id>.lock`. Codex keeps
+/// an exclusive `flock` on a thread's lock file while a process (the TUI's
+/// app-server or `codex exec`) is writing to it; the files themselves stay
+/// behind afterwards. The kernel lock table is read instead of probing the
+/// lock, so `ah` never contends with Codex for it. The reported pid is the
+/// lock holder, which for the TUI is the Codex app-server.
+fn running_in(
+    lock_dir: &Path,
+    holders: &HashMap<(u64, u64, u64), u32>,
+) -> Vec<(String, Option<u32>)> {
+    if holders.is_empty() {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(lock_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let id = path
+                .file_name()?
+                .to_str()?
+                .strip_suffix(".lock")
+                .filter(|id| !id.is_empty() && !id.starts_with('.'))?
+                .to_string();
+            let pid = *holders.get(&super::common::file_lock_key(&path)?)?;
+            Some((id, Some(pid)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -370,5 +418,25 @@ mod tests {
                 ID.to_string()
             ])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_in_maps_held_lock_files_to_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("0199-held.lock");
+        let free = dir.path().join("0199-free.lock");
+        let coord = dir.path().join(".coordination.lock");
+        for p in [&held, &free, &coord] {
+            fs::write(p, "").unwrap();
+        }
+        let mut holders = HashMap::new();
+        holders.insert(super::super::common::file_lock_key(&held).unwrap(), 4242);
+        holders.insert(super::super::common::file_lock_key(&coord).unwrap(), 4243);
+        assert_eq!(
+            running_in(dir.path(), &holders),
+            vec![("0199-held".to_string(), Some(4242))]
+        );
+        assert!(running_in(dir.path(), &HashMap::new()).is_empty());
     }
 }
