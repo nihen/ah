@@ -34,10 +34,10 @@ impl CopilotPlugin {
         Self::session_dir(path).map(|d| d.join("events.jsonl"))
     }
 
-    fn events_mtime(path: &Path) -> Option<SystemTime> {
-        fs::metadata(Self::events_path(path)?)
-            .and_then(|m| m.modified())
-            .ok()
+    fn workspace_path(path: &Path) -> PathBuf {
+        Self::session_dir(path)
+            .map(|d| d.join("workspace.yaml"))
+            .unwrap_or_else(|| path.to_path_buf())
     }
 
     /// A `workspace.yaml` timestamp (RFC 3339, written in UTC).
@@ -47,8 +47,15 @@ impl CopilotPlugin {
     }
 }
 
+/// Whether a line continues the current value (indented or blank) rather
+/// than starting the next top-level key.
+fn is_continuation(line: &str) -> bool {
+    line.trim().is_empty() || line.starts_with([' ', '\t'])
+}
+
 /// Read a top-level scalar from the flat YAML mapping Copilot writes to
 /// `workspace.yaml`: plain, single-/double-quoted, or block (`|`, `>`) values.
+/// A plain `null` / `~` and a malformed quoted value count as absent.
 fn yaml_scalar(content: &str, field: &str) -> Option<String> {
     let mut lines = content.lines();
     let rest = lines.by_ref().find_map(|line| {
@@ -57,11 +64,10 @@ fn yaml_scalar(content: &str, field: &str) -> Option<String> {
             .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
     })?;
     let rest = rest.trim();
+    let mut continuation = lines.take_while(|line| is_continuation(line));
     if rest.starts_with(['|', '>']) {
         let folded = rest.starts_with('>');
-        let block: Vec<&str> = lines
-            .take_while(|line| line.is_empty() || line.starts_with([' ', '\t']))
-            .collect();
+        let block: Vec<&str> = continuation.collect();
         let indent = block
             .iter()
             .filter(|line| !line.trim().is_empty())
@@ -72,30 +78,46 @@ fn yaml_scalar(content: &str, field: &str) -> Option<String> {
             .iter()
             .map(|line| line.get(indent..).unwrap_or("").trim_end())
             .collect();
-        return Some(
-            body.join(if folded { " " } else { "\n" })
-                .trim()
-                .to_string(),
-        );
+        let text = if folded {
+            // Folded style joins lines with spaces; a blank line is a newline.
+            body.split(|line| line.is_empty())
+                .map(|para| para.join(" "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            body.join("\n")
+        };
+        return Some(text.trim().to_string());
     }
     if let Some(quoted) = rest.strip_prefix('\'') {
-        return Some(unquote(quoted, &mut lines, false));
+        return unquote(quoted, &mut continuation, false);
     }
     if let Some(quoted) = rest.strip_prefix('"') {
-        return Some(unquote(quoted, &mut lines, true));
+        return unquote(quoted, &mut continuation, true);
+    }
+    if matches!(rest, "null" | "Null" | "NULL" | "~") {
+        return None;
     }
     Some(rest.to_string())
 }
 
 /// Body of a quoted scalar: `''` escapes a quote in single-quoted style,
 /// backslash escapes apply in double-quoted style. A scalar that continues
-/// onto following lines is folded with spaces.
-fn unquote<'a>(first: &'a str, rest: &mut impl Iterator<Item = &'a str>, double: bool) -> String {
+/// onto following (indented) lines is folded with spaces. `None` when the
+/// closing quote is missing.
+fn unquote<'a>(
+    first: &'a str,
+    rest: &mut impl Iterator<Item = &'a str>,
+    double: bool,
+) -> Option<String> {
     let quote = if double { '"' } else { '\'' };
     let mut out = String::new();
     let mut line = first;
     loop {
         let mut chars = line.chars().peekable();
+        // A `\` at the end of a double-quoted line joins the next line
+        // without the folding space.
+        let mut escaped_break = false;
         while let Some(c) = chars.next() {
             if c == quote {
                 if !double && chars.peek() == Some(&'\'') {
@@ -103,35 +125,70 @@ fn unquote<'a>(first: &'a str, rest: &mut impl Iterator<Item = &'a str>, double:
                     out.push('\'');
                     continue;
                 }
-                return out;
+                return Some(out);
             }
             if double && c == '\\' {
-                match chars.next() {
-                    Some('n') => out.push('\n'),
-                    Some('t') => out.push('\t'),
-                    Some('u') => {
-                        let hex: String = chars.by_ref().take(4).collect();
-                        if let Some(ch) =
-                            u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
-                        {
-                            out.push(ch);
-                        }
-                    }
-                    Some(other) => out.push(other),
-                    None => {}
+                if chars.peek().is_none() {
+                    escaped_break = true;
+                } else {
+                    push_escape(&mut out, &mut chars)?;
                 }
                 continue;
             }
             out.push(c);
         }
-        match rest.next() {
-            Some(next) => {
-                out.push(' ');
-                line = next.trim_start();
+        // Line folding: blank lines become newlines; otherwise a single break
+        // becomes a space, or nothing after an escaped break.
+        let mut blank_lines = 0;
+        line = loop {
+            let next = rest.next()?;
+            if next.trim().is_empty() {
+                blank_lines += 1;
+            } else {
+                break next.trim_start();
             }
-            None => return out,
+        };
+        if !escaped_break {
+            out.truncate(out.trim_end_matches([' ', '\t']).len());
+        }
+        if blank_lines > 0 {
+            out.extend(std::iter::repeat_n('\n', blank_lines));
+        } else if !escaped_break {
+            out.push(' ');
         }
     }
+}
+
+/// Decode one YAML double-quoted escape (the part after `\`).
+fn push_escape(out: &mut String, chars: &mut impl Iterator<Item = char>) -> Option<()> {
+    let hex = |chars: &mut dyn Iterator<Item = char>, len: usize| {
+        let digits: String = chars.take(len).collect();
+        u32::from_str_radix(&digits, 16)
+            .ok()
+            .and_then(char::from_u32)
+    };
+    let decoded = match chars.next()? {
+        '0' => '\0',
+        'a' => '\x07',
+        'b' => '\x08',
+        't' | '\t' => '\t',
+        'n' => '\n',
+        'v' => '\x0b',
+        'f' => '\x0c',
+        'r' => '\r',
+        'e' => '\x1b',
+        ' ' => ' ',
+        'N' => '\u{85}',
+        '_' => '\u{a0}',
+        'L' => '\u{2028}',
+        'P' => '\u{2029}',
+        'x' => hex(chars, 2)?,
+        'u' => hex(chars, 4)?,
+        'U' => hex(chars, 8)?,
+        other => other,
+    };
+    out.push(decoded);
+    Some(())
 }
 
 impl AgentPlugin for CopilotPlugin {
@@ -166,13 +223,18 @@ impl AgentPlugin for CopilotPlugin {
     /// The session's last activity: `events.jsonl` keeps growing after
     /// `workspace.yaml` stops changing.
     fn session_mtime(&self, path: &Path) -> Option<SystemTime> {
-        let yaml = fs::metadata(path).and_then(|m| m.modified()).ok()?;
-        Some(Self::events_mtime(path).map_or(yaml, |events| events.max(yaml)))
+        let mtime = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+        let yaml = mtime(&Self::workspace_path(path));
+        let events = Self::events_path(path).and_then(|p| mtime(&p));
+        yaml.max(events).or_else(|| mtime(path))
     }
 
     fn session_created(&self, path: &Path) -> Option<SystemTime> {
-        Self::workspace_time(path, "created_at")
-            .or_else(|| fs::metadata(path).and_then(|m| m.created()).ok())
+        Self::workspace_time(path, "created_at").or_else(|| {
+            fs::metadata(Self::workspace_path(path))
+                .and_then(|m| m.created())
+                .ok()
+        })
     }
 
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
@@ -218,8 +280,9 @@ impl AgentPlugin for CopilotPlugin {
     }
 
     /// `name` (set by Copilot or `/rename`) first, then the older `summary`.
-    /// A session that never got an `events.jsonl` has no prompt to fall back
-    /// on, so it is titled by its id rather than the file name `workspace`.
+    /// Without either, the first prompt is used (resolver fallback); a
+    /// session with no prompt at all (e.g. no `events.jsonl`) is titled by its
+    /// id rather than the file name `workspace`.
     fn resolve_title(&self, path: &Path, home: &Path) -> Option<String> {
         ["name", "summary"]
             .iter()
@@ -229,7 +292,12 @@ impl AgentPlugin for CopilotPlugin {
                 Some(first_line.to_string())
             })
             .or_else(|| {
-                if Self::events_path(path)?.exists() {
+                let mut has_prompt = false;
+                self.iter_messages(path, &mut |message| {
+                    has_prompt = message.role == super::MessageRole::User;
+                    !has_prompt
+                });
+                if has_prompt {
                     None
                 } else {
                     self.resolve_resume_id(path, home)
@@ -282,6 +350,34 @@ created_at: 2026-09-27T02:34:43.613Z\n";
         assert_eq!(yaml_scalar(WORKSPACE, "missing"), None);
     }
 
+    #[test]
+    fn yaml_scalar_edge_cases() {
+        let yaml = "esc: \"cr\\rX \\x41 \\U0001F600 nul\\0 q\\\" b\\\\\"\n\
+null_name: null\n\
+tilde: ~\n\
+quoted_null: 'null'\n\
+broken: 'abc def\n\
+next: value\n\
+joined: \"long\\\n  title\"\n\
+joined_blank: \"long\\\n\n  title\"\n\
+folded_quote: 'one  \n  two\n\n  three'\n\
+paras: >\n  one\n  two\n\n  three\n";
+        assert_eq!(
+            yaml_scalar(yaml, "esc").unwrap(),
+            "cr\rX A \u{1F600} nul\0 q\" b\\"
+        );
+        assert_eq!(yaml_scalar(yaml, "null_name"), None);
+        assert_eq!(yaml_scalar(yaml, "tilde"), None);
+        assert_eq!(yaml_scalar(yaml, "quoted_null").unwrap(), "null");
+        // A missing closing quote does not swallow the next key.
+        assert_eq!(yaml_scalar(yaml, "broken"), None);
+        assert_eq!(yaml_scalar(yaml, "next").unwrap(), "value");
+        assert_eq!(yaml_scalar(yaml, "joined").unwrap(), "longtitle");
+        assert_eq!(yaml_scalar(yaml, "joined_blank").unwrap(), "long\ntitle");
+        assert_eq!(yaml_scalar(yaml, "folded_quote").unwrap(), "one two\nthree");
+        assert_eq!(yaml_scalar(yaml, "paras").unwrap(), "one two\nthree");
+    }
+
     fn session(dir: &Path, id: &str, yaml: &str, events: Option<&str>) -> PathBuf {
         let session_dir = dir.join(".copilot/session-state").join(id);
         fs::create_dir_all(&session_dir).unwrap();
@@ -304,12 +400,49 @@ created_at: 2026-09-27T02:34:43.613Z\n";
         );
         let summary_only = session(home, "b", "summary: |-\n  first\n  second\n", Some(""));
         assert_eq!(PLUGIN.resolve_title(&summary_only, home).unwrap(), "first");
-        // With events but no name/summary, the first prompt is used instead.
-        let untitled = session(home, "c", "cwd: /x\n", Some(""));
+        // A null name does not hide the summary.
+        let null_name = session(home, "b2", "name: null\nsummary: useful\n", Some(""));
+        assert_eq!(PLUGIN.resolve_title(&null_name, home).unwrap(), "useful");
+        // With a prompt but no name/summary, the resolver's first-prompt
+        // fallback is used instead.
+        let prompt = r#"{"type":"user.message","data":{"content":"hi"}}"#;
+        let untitled = session(home, "c", "cwd: /x\n", Some(prompt));
         assert_eq!(PLUGIN.resolve_title(&untitled, home), None);
-        // Without events there is no prompt either; the id stands in.
+        // Without any prompt (empty or missing events) the id stands in.
+        let no_prompt = session(home, "c-uuid", "cwd: /x\n", Some(""));
+        assert_eq!(PLUGIN.resolve_title(&no_prompt, home).unwrap(), "c-uuid");
         let empty = session(home, "d-uuid", "cwd: /x\n", None);
         assert_eq!(PLUGIN.resolve_title(&empty, home).unwrap(), "d-uuid");
+    }
+
+    #[test]
+    fn modified_is_the_later_of_workspace_and_events() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let old = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let new = old + std::time::Duration::from_secs(3600);
+        let set = |p: &Path, t: SystemTime| {
+            fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(t)
+                .unwrap()
+        };
+
+        let path = session(tmp.path(), "m", "cwd: /x\n", Some(""));
+        let events = path.with_file_name("events.jsonl");
+        set(&path, old);
+        set(&events, new);
+        assert_eq!(PLUGIN.session_mtime(&path), Some(new));
+        assert_eq!(PLUGIN.resolve_date(&path, old).unwrap(), format_mtime(new));
+        // Addressed through events.jsonl, workspace.yaml still counts.
+        set(&path, new);
+        set(&events, old);
+        assert_eq!(PLUGIN.session_mtime(&events), Some(new));
+
+        let yaml_only = session(tmp.path(), "n", "cwd: /x\n", None);
+        set(&yaml_only, old);
+        assert_eq!(PLUGIN.session_mtime(&yaml_only), Some(old));
     }
 
     #[test]

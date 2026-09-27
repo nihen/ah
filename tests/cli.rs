@@ -982,6 +982,23 @@ fn copilot_title_time_and_resume() {
         "id: cp-empty\ncwd: /nonexistent/proj\ncreated_at: 2026-09-27T02:00:00.000Z\n",
     )
     .unwrap();
+    // workspace.yaml stops changing early; events.jsonl carries the last activity.
+    let at = |rfc3339: &str| -> std::time::SystemTime {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .into()
+    };
+    let set_mtime = |path: &Path, t| {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap()
+    };
+    set_mtime(&named.join("workspace.yaml"), at("2026-09-27T02:34:46Z"));
+    set_mtime(&named.join("events.jsonl"), at("2026-09-27T03:10:00Z"));
+    set_mtime(&empty.join("workspace.yaml"), at("2026-09-27T02:00:05Z"));
 
     let run = || {
         let mut cmd = ah_opencode(&home);
@@ -995,7 +1012,7 @@ fn copilot_title_time_and_resume() {
             "log",
             "-a",
             "-o",
-            "id,title,created_at",
+            "id,title,created_at,modified_at",
             "-S",
             "id",
             "--asc",
@@ -1003,8 +1020,8 @@ fn copilot_title_time_and_resume() {
         .assert()
         .success()
         .stdout(
-            "cp-empty\tcp-empty\t2026-09-27 11:00\n\
-             cp-named\tFix the 'parser'\t2026-09-27 11:34\n",
+            "cp-empty\tcp-empty\t2026-09-27 11:00\t2026-09-27 11:00\n\
+             cp-named\tFix the 'parser'\t2026-09-27 11:34\t2026-09-27 12:10\n",
         );
 
     run()
