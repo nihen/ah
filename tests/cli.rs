@@ -364,7 +364,7 @@ fn log_interactive_with_o_emits_field_tsv_after_selection() {
         .env("CLAUDE_CONFIG_DIR", "/nonexistent")
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
-        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env("CURSOR_DATA_DIR", "/nonexistent")
         .env_remove("XDG_DATA_HOME")
         .args([
             "log",
@@ -498,7 +498,7 @@ fn log_interactive_display_overrides_picker_columns() {
         .env("CLAUDE_CONFIG_DIR", "/nonexistent")
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
-        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env("CURSOR_DATA_DIR", "/nonexistent")
         .env_remove("XDG_DATA_HOME")
         .args([
             "log",
@@ -550,7 +550,7 @@ fn show_interactive_display_allows_matched() {
         .env("CLAUDE_CONFIG_DIR", "/nonexistent")
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
-        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env("CURSOR_DATA_DIR", "/nonexistent")
         .env_remove("XDG_DATA_HOME")
         .args([
             "show",
@@ -621,7 +621,7 @@ fn show_interactive_with_o_emits_field_tsv_after_selection() {
         .env("CLAUDE_CONFIG_DIR", "/nonexistent")
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
-        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env("CURSOR_DATA_DIR", "/nonexistent")
         .env_remove("XDG_DATA_HOME")
         .args([
             "show",
@@ -703,7 +703,7 @@ fn cursor_session_matches_cwd_filter_and_resumes_interactively() {
             .env("CODEX_HOME", "/nonexistent")
             .env("GEMINI_CLI_HOME", "/nonexistent")
             .env("COPILOT_HOME", "/nonexistent")
-            .env("CURSOR_CONFIG_DIR", home.join(".cursor"))
+            .env("CURSOR_DATA_DIR", home.join(".cursor"))
             .env_remove("XDG_DATA_HOME")
             .args(args)
             .write_stdin("")
@@ -722,6 +722,51 @@ fn cursor_session_matches_cwd_filter_and_resumes_interactively() {
             "cd '{}' && 'cursor-agent' '--resume' 'sess-1'\n",
             project.display()
         )
+    );
+}
+
+#[test]
+fn cursor_sessions_follow_cursor_data_dir_not_config_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let project = home.join("work/app");
+    fs::create_dir_all(&project).unwrap();
+    let place = |base: &std::path::Path, id: &str| {
+        let dir = base
+            .join("projects")
+            .join(cursor_slug(&project))
+            .join("agent-transcripts")
+            .join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::copy(
+            fixture_path("cursor_session.jsonl"),
+            dir.join(format!("{id}.jsonl")),
+        )
+        .unwrap();
+    };
+    let data_dir = home.join("cursor-data");
+    let config_dir = home.join("cursor-config");
+    place(&data_dir, "in-data-dir");
+    place(&config_dir, "in-config-dir");
+    place(&home.join(".cursor"), "in-default-dir");
+
+    let assert = ah()
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("CLAUDE_CONFIG_DIR", "/nonexistent")
+        .env("CODEX_HOME", "/nonexistent")
+        .env("GEMINI_CLI_HOME", "/nonexistent")
+        .env("COPILOT_HOME", "/nonexistent")
+        .env("CURSOR_DATA_DIR", &data_dir)
+        .env("CURSOR_CONFIG_DIR", &config_dir)
+        .env_remove("XDG_DATA_HOME")
+        .args(["log", "-o", "agent,id", "--tsv"])
+        .write_stdin("")
+        .assert()
+        .success();
+    assert_eq!(
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap(),
+        "cursor\tin-data-dir\n"
     );
 }
 
@@ -806,7 +851,7 @@ fn ah_opencode(home: &Path) -> Command {
         .env("CODEX_HOME", "/nonexistent")
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
-        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env("CURSOR_DATA_DIR", "/nonexistent")
         .env("GROK_HOME", "/nonexistent");
     cmd
 }

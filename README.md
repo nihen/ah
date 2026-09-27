@@ -136,11 +136,7 @@ Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.j
 brew install nihen/tap/ah
 ```
 
-Supported in the tap today:
-- Apple Silicon macOS
-- Linux x86_64
-
-Intel Mac users should use Cargo or a source build.
+Supported in the tap: macOS (Apple Silicon and Intel) and Linux (x86_64 and arm64).
 
 ### Cargo
 
@@ -152,9 +148,7 @@ cargo install ah-cli
 
 Download a prebuilt binary from [GitHub Releases](https://github.com/nihen/ah/releases).
 
-Available today:
-- macOS arm64
-- Linux x86_64
+Available for macOS (arm64, x86_64) and Linux (x86_64, arm64). The Linux binaries are statically linked (musl).
 
 ### From source
 
@@ -558,7 +552,7 @@ ah log -A -q "deploy"              # search across local + all remotes
 
 ### Environment variables
 
-Each built-in agent respects its CLI's config directory environment variable:
+Each built-in agent respects the environment variable its CLI uses to relocate session storage:
 
 | Agent   | Session Files | Env Var            | Default     |
 |---------|---------------|--------------------|-------------|
@@ -566,7 +560,7 @@ Each built-in agent respects its CLI's config directory environment variable:
 | Codex   | `sessions/**/*.jsonl` | `CODEX_HOME`       | `~/.codex`  |
 | Gemini  | `tmp/*/chats/session-*.jsonl` (`.json` before v0.39) | `GEMINI_CLI_HOME`  | `~/.gemini` |
 | Copilot | `session-state/*/workspace.yaml` | `COPILOT_HOME`     | `~/.copilot`|
-| Cursor  | `projects/*/agent-transcripts/**/*.jsonl` | `CURSOR_CONFIG_DIR`| `~/.cursor` |
+| Cursor  | `projects/*/agent-transcripts/**/*.jsonl` | `CURSOR_DATA_DIR`  | `~/.cursor` |
 | Antigravity (agy) | `antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl` | — | `~/.gemini` |
 | Grok    | `sessions/*/*/chat_history.jsonl` | `GROK_HOME`        | `~/.grok`   |
 | opencode | `opencode/opencode*.db` (SQLite) | `XDG_DATA_HOME` | `~/.local/share` |

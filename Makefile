@@ -1,4 +1,3 @@
-VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 PROFILE := release
 EXE := target/$(PROFILE)/ah
 prefix := /usr/local
@@ -8,7 +7,7 @@ mandir := $(datadir)/man/man1
 exe_name := ah
 SOURCES := $(shell find src -name '*.rs')
 
-.PHONY: build install test lint fmt completions man demo release clean
+.PHONY: build install test lint fmt completions man demo clean
 
 build: $(EXE)
 
@@ -46,12 +45,6 @@ demo: $(EXE)
 	vhs demo/demo-pre.tape
 	bash demo/setup.sh
 	vhs demo/demo.tape
-
-release:
-	@echo "Tagging v$(VERSION) and pushing..."
-	git tag "v$(VERSION)"
-	git push origin "v$(VERSION)"
-	@echo "GitHub Actions will build and create the release."
 
 clean:
 	cargo clean
