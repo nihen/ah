@@ -10,8 +10,16 @@ use crate::resolver::{self, shell_quote};
 use crate::subcmd;
 
 pub fn run(args: ResumeArgs, filter: &FilterArgs) -> Result<(), String> {
+    let explicit_session = subcmd::read_session_ref(args.session.as_deref())?;
+    run_with_session(explicit_session, args, filter)
+}
+
+fn run_with_session(
+    explicit_session: Option<String>,
+    args: ResumeArgs,
+    filter: &FilterArgs,
+) -> Result<(), String> {
     let home = canonical_home();
-    let explicit_session = subcmd::read_session_ref(args.session.as_deref());
 
     if let Some(session) = explicit_session.as_deref() {
         let unquoted = strip_quotes(session);
@@ -246,7 +254,7 @@ mod tests {
         let mut filter = default_filter();
         filter.remote = vec!["mydev".to_string()];
 
-        let result = run(args, &filter);
+        let result = run_with_session(None, args, &filter);
         assert!(result.is_err());
         assert!(
             result

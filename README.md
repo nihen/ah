@@ -300,7 +300,9 @@ Show session transcript
 Usage:
   ah show [OPTIONS] [SESSION]
 
-If SESSION is omitted, ah shows the latest session matching stdin, -q, and other filters.
+If SESSION is omitted, ah reads it from piped stdin (first line); if stdin is
+a terminal or empty, ah shows the latest session matching -q and other filters.
+Use - as SESSION to read it from stdin explicitly.
 
 Transcript output:
   --head N                Show first N messages only
@@ -339,7 +341,9 @@ Resume an agent session
 Usage:
   ah resume [OPTIONS] [SESSION] [-- EXTRA_ARGS...]
 
-If SESSION is omitted, ah resumes the latest session matching stdin, -q, and other filters.
+If SESSION is omitted, ah reads it from piped stdin (first line); if stdin is
+a terminal or empty, ah resumes the latest session matching -q and other filters.
+Use - as SESSION to read it from stdin explicitly.
 
 Arguments after -- are passed directly to the agent command.
 

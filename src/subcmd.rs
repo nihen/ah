@@ -16,9 +16,11 @@ struct ResolveLookupOpts {
 /// Resolve a session file path from the given options.
 ///
 /// Priority:
-/// 1. Stdin pipe (path from pipe)
-/// 2. Session (positional: ID or path)
-/// 3. Query / filters → latest matching session (via pipeline)
+/// 1. Session (ID or path, already read by `read_session_ref`)
+/// 2. Query / filters → latest matching session (via pipeline)
+///
+/// Stdin is not read here: callers resolve it once with `read_session_ref`,
+/// so an empty first line cannot make a second read pick up the next one.
 pub fn resolve_session(
     session: Option<&str>,
     query: Option<&str>,
@@ -73,11 +75,14 @@ fn resolve_session_inner(
     search_mode: SearchMode,
     opts: ResolveLookupOpts,
 ) -> Result<PathBuf, String> {
-    if let Some(session_ref) = read_session_ref(session) {
+    if let Some(session_ref) = session
+        .map(normalize_session_ref)
+        .filter(|session_ref| !session_ref.is_empty())
+    {
         return resolve_session_ref(&session_ref, home);
     }
 
-    // 3. Query / filters → latest via pipeline
+    // 2. Query / filters → latest via pipeline
     let q = query.unwrap_or("");
     let not_found_msg = if q.is_empty() {
         "No session found matching filters".to_string()
@@ -106,32 +111,71 @@ fn resolve_session_inner(
     }
 }
 
-/// Read an explicit session reference from stdin or positional argument.
-/// Stdin takes precedence over the positional argument when present.
+/// Read an explicit session reference from the positional argument or stdin.
+///
+/// A positional session always wins and stdin is left untouched, so
+/// `while read id; do ah show "$id"; done < ids` and callers whose stdin
+/// never closes behave as expected. `-` reads the reference from stdin
+/// explicitly and fails when stdin has no reference. Without a positional
+/// session, a non-terminal stdin is read for one line; an empty line or EOF
+/// falls back to the query/filter lookup.
+///
 /// The returned value is intentionally left raw — TSV escape decoding is
 /// done lazily by `resolve_session_ref` (literal-first, then unescaped
 /// fallback) and by remote dispatch sites, so raw paths piped from
 /// non-`ah` producers (e.g. `echo C:\\temp\\sess.jsonl | ah show`) still
 /// resolve correctly.
-pub fn read_session_ref(session: Option<&str>) -> Option<String> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        let mut line = String::new();
-        let mut stdin = std::io::stdin().lock();
-        if std::io::BufRead::read_line(&mut stdin, &mut line).is_ok() {
-            let line = line.trim();
-            if !line.is_empty() {
-                let first_field = line.split('\t').next().unwrap_or(line);
-                let session_ref = normalize_session_ref(first_field);
-                if !session_ref.is_empty() {
-                    return Some(session_ref);
-                }
-            }
+pub fn read_session_ref(session: Option<&str>) -> Result<Option<String>, String> {
+    Ok(match session {
+        Some("-") => {
+            Some(read_stdin_session_ref().ok_or("No session reference on stdin (SESSION is '-')")?)
+        }
+        Some(session) => Some(normalize_session_ref(session)).filter(|s| !s.is_empty()),
+        None if !std::io::IsTerminal::is_terminal(&std::io::stdin()) => read_stdin_session_ref(),
+        None => None,
+    })
+}
+
+fn read_stdin_session_ref() -> Option<String> {
+    let line = read_stdin_line()?;
+    let line = line.trim();
+    let first_field = line.split('\t').next().unwrap_or(line);
+    Some(normalize_session_ref(first_field)).filter(|s| !s.is_empty())
+}
+
+/// Longest stdin line accepted as a session reference.
+const MAX_STDIN_LINE: usize = 64 * 1024;
+
+/// Read one line from stdin without consuming anything after its newline,
+/// so the rest of a shared stdin (e.g. `{ ah show; ah show; } < refs`) stays
+/// available to the next reader.
+#[cfg(unix)]
+fn read_stdin_line() -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::io::FromRawFd;
+
+    // Bypass std's buffered stdin, which reads ahead past the newline.
+    // ManuallyDrop keeps fd 0 open when the File goes out of scope.
+    let mut stdin = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) });
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while buf.len() < MAX_STDIN_LINE {
+        match stdin.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => buf.push(byte[0]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
         }
     }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
 
-    session
-        .map(normalize_session_ref)
-        .filter(|session_ref| !session_ref.is_empty())
+#[cfg(not(unix))]
+fn read_stdin_line() -> Option<String> {
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).ok()?;
+    Some(line)
 }
 
 /// Resolve a session reference: try as file path first, then as session ID.
