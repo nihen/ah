@@ -115,10 +115,12 @@ fn resolve_session_inner(
 ///
 /// A positional session always wins and stdin is left untouched, so
 /// `while read id; do ah show "$id"; done < ids` and callers whose stdin
-/// never closes behave as expected. `-` reads the reference from stdin
-/// explicitly and fails when stdin has no reference. Without a positional
-/// session, a non-terminal stdin is read for one line; an empty line or EOF
-/// falls back to the query/filter lookup.
+/// never closes behave as expected. An empty positional session (e.g. an
+/// unset `"$id"`) is an error rather than a silent fallback to the latest
+/// session. `-` reads the reference from stdin explicitly and fails when
+/// stdin has no reference. Without a positional session, a non-terminal
+/// stdin is read for one line; an empty line or EOF falls back to the
+/// query/filter lookup.
 ///
 /// The returned value is intentionally left raw — TSV escape decoding is
 /// done lazily by `resolve_session_ref` (literal-first, then unescaped
@@ -126,21 +128,29 @@ fn resolve_session_inner(
 /// non-`ah` producers (e.g. `echo C:\\temp\\sess.jsonl | ah show`) still
 /// resolve correctly.
 pub fn read_session_ref(session: Option<&str>) -> Result<Option<String>, String> {
-    Ok(match session {
-        Some("-") => {
-            Some(read_stdin_session_ref().ok_or("No session reference on stdin (SESSION is '-')")?)
+    match session {
+        Some("-") => read_stdin_session_ref()?
+            .map(Some)
+            .ok_or_else(|| "No session reference on stdin (SESSION is '-')".to_string()),
+        Some(session) => {
+            let session_ref = normalize_session_ref(session);
+            if session_ref.is_empty() {
+                return Err("SESSION is empty".into());
+            }
+            Ok(Some(session_ref))
         }
-        Some(session) => Some(normalize_session_ref(session)).filter(|s| !s.is_empty()),
         None if !std::io::IsTerminal::is_terminal(&std::io::stdin()) => read_stdin_session_ref(),
-        None => None,
-    })
+        None => Ok(None),
+    }
 }
 
-fn read_stdin_session_ref() -> Option<String> {
-    let line = read_stdin_line()?;
+fn read_stdin_session_ref() -> Result<Option<String>, String> {
+    let bytes = read_stdin_line().map_err(|e| format!("Failed to read stdin: {e}"))?;
+    let line = String::from_utf8(bytes)
+        .map_err(|_| "Session reference on stdin is not valid UTF-8".to_string())?;
     let line = line.trim();
     let first_field = line.split('\t').next().unwrap_or(line);
-    Some(normalize_session_ref(first_field)).filter(|s| !s.is_empty())
+    Ok(Some(normalize_session_ref(first_field)).filter(|s| !s.is_empty()))
 }
 
 /// Longest stdin line accepted as a session reference.
@@ -148,9 +158,10 @@ const MAX_STDIN_LINE: usize = 64 * 1024;
 
 /// Read one line from stdin without consuming anything after its newline,
 /// so the rest of a shared stdin (e.g. `{ ah show; ah show; } < refs`) stays
-/// available to the next reader.
+/// available to the next reader. A line longer than `MAX_STDIN_LINE` is
+/// consumed through its newline and rejected.
 #[cfg(unix)]
-fn read_stdin_line() -> Option<String> {
+fn read_stdin_line() -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     use std::os::unix::io::FromRawFd;
 
@@ -158,24 +169,40 @@ fn read_stdin_line() -> Option<String> {
     // ManuallyDrop keeps fd 0 open when the File goes out of scope.
     let mut stdin = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) });
     let mut buf = Vec::new();
+    let mut too_long = false;
     let mut byte = [0u8; 1];
-    while buf.len() < MAX_STDIN_LINE {
+    loop {
         match stdin.read(&mut byte) {
             Ok(0) => break,
             Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => buf.push(byte[0]),
+            Ok(_) if buf.len() < MAX_STDIN_LINE => buf.push(byte[0]),
+            Ok(_) => too_long = true,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(e) => return Err(e),
         }
     }
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    if too_long {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("line longer than {MAX_STDIN_LINE} bytes"),
+        ));
+    }
+    Ok(buf)
 }
 
+/// Non-Unix fallback: std's buffered stdin may read past the first line, so
+/// a stdin shared by several `ah` invocations is not supported here.
 #[cfg(not(unix))]
-fn read_stdin_line() -> Option<String> {
-    let mut line = String::new();
-    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).ok()?;
-    Some(line)
+fn read_stdin_line() -> std::io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    std::io::BufRead::read_until(&mut std::io::stdin().lock(), b'\n', &mut line)?;
+    if line.len() > MAX_STDIN_LINE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("line longer than {MAX_STDIN_LINE} bytes"),
+        ));
+    }
+    Ok(line)
 }
 
 /// Resolve a session reference: try as file path first, then as session ID.

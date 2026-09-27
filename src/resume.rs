@@ -50,7 +50,9 @@ fn run_with_session(
     let full_cmd = if let Some(session) = explicit_session.as_deref() {
         build_resume_command_for_ref(&args, filter, session, &home)?
     } else {
-        build_resume_command(&args, filter)?
+        // `args.session` was already consumed by `read_session_ref`; do not
+        // look at it again here.
+        build_resume_command_for_lookup(&args, filter, &home)?
     };
     if args.print {
         println!("{}", full_cmd);
@@ -59,7 +61,8 @@ fn run_with_session(
     exec_resume(&full_cmd);
 }
 
-pub fn build_resume_command(args: &ResumeArgs, filter: &FilterArgs) -> Result<String, String> {
+#[cfg(test)]
+fn build_resume_command(args: &ResumeArgs, filter: &FilterArgs) -> Result<String, String> {
     let home = canonical_home();
     if let Some(session) = args.session.as_deref() {
         build_resume_command_for_ref(args, filter, session, &home)
