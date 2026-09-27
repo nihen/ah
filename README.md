@@ -550,7 +550,7 @@ ah log -A -q "deploy"              # search across local + all remotes
 
 ### Environment variables
 
-Each built-in agent respects its CLI's config directory environment variable:
+Each built-in agent respects the environment variable its CLI uses to relocate session storage:
 
 | Agent   | Session Files | Env Var            | Default     |
 |---------|---------------|--------------------|-------------|
