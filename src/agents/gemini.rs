@@ -14,7 +14,7 @@ use super::MessageRole;
 use super::common::first_text_part;
 use super::common::format_mtime;
 use super::common::mmap_file;
-use super::common::{visit_string_values, visit_tool_call};
+use super::common::{visit_all_strings, visit_text_parts, visit_tool_call, visit_tool_output};
 use super::{MemoryKind, MemorySource};
 
 /// Project directory of a session file: `tmp/{project}/chats/session-*` or
@@ -314,7 +314,30 @@ fn visit_message(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -> bool
 /// tool calls with their arguments and results. Returns `false` to stop.
 fn visit_search_record(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
     match val.get("type").and_then(|v| v.as_str()) {
-        Some("user") => visit_message(val, &mut |message| visit(&message.text)),
+        // every prompt part (injected context `<...>` is skipped), and tool
+        // results sent back as `functionResponse` parts of a user turn
+        Some("user") => {
+            let prompts_ok = {
+                let mut visit_prompt = |text: &str| text.starts_with('<') || visit(text);
+                val.get("content")
+                    .is_none_or(|content| visit_text_parts(content, &mut visit_prompt))
+                    && val
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(&mut visit_prompt)
+            };
+            prompts_ok
+                && val
+                    .get("content")
+                    .and_then(|v| v.as_array())
+                    .is_none_or(|parts| {
+                        parts.iter().all(|part| {
+                            ["functionCall", "functionResponse"].iter().all(|key| {
+                                part.get(*key).is_none_or(|v| visit_function_part(v, visit))
+                            })
+                        })
+                    })
+        }
         Some("gemini") => {
             let content_ok = match val.get("content") {
                 Some(serde_json::Value::String(text)) => visit(text),
@@ -327,7 +350,7 @@ fn visit_search_record(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> b
                         .is_none_or(&mut *visit)
                         && ["functionCall", "functionResponse"]
                             .iter()
-                            .all(|key| part.get(key).is_none_or(|v| visit_string_values(v, visit)))
+                            .all(|key| part.get(key).is_none_or(|v| visit_function_part(v, visit)))
                 }),
                 _ => true,
             };
@@ -340,12 +363,34 @@ fn visit_search_record(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> b
                             visit_tool_call(call.get("name"), call.get("args"), visit)
                                 && call
                                     .get("result")
-                                    .is_none_or(|v| visit_string_values(v, visit))
+                                    .is_none_or(|result| visit_tool_result(result, visit))
                         })
                     })
         }
         _ => true,
     }
+}
+
+/// A tool call's `result`: `functionResponse` parts or other output.
+fn visit_tool_result(result: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
+    let Some(items) = result.as_array() else {
+        return visit_tool_output(result, visit);
+    };
+    items.iter().all(|item| match item.get("functionResponse") {
+        Some(response) => visit_function_part(response, visit),
+        None => visit_tool_output(item, visit),
+    })
+}
+
+/// A `functionCall` (`name`, `args`) or `functionResponse` (`name`,
+/// `response`) part; its `id` is not searched.
+fn visit_function_part(part: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
+    part.get("name")
+        .and_then(|v| v.as_str())
+        .is_none_or(&mut *visit)
+        && ["args", "response"]
+            .iter()
+            .all(|key| part.get(*key).is_none_or(|v| visit_all_strings(v, visit)))
 }
 
 /// Answer text of a Gemini turn. `content` is a string, or (after a

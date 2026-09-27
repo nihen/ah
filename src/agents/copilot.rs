@@ -10,7 +10,7 @@ use super::AgentPlugin;
 use super::Message;
 use super::common::{
     for_each_jsonl_value, for_each_jsonl_value_bytes, format_mtime, is_pid_alive,
-    process_start_time, strip_home, visit_string_values, visit_tool_call,
+    process_start_time, strip_home, visit_tool_call, visit_tool_output,
 };
 use super::{MemoryKind, MemorySource};
 
@@ -341,7 +341,7 @@ impl AgentPlugin for CopilotPlugin {
                     .is_none_or(|d| visit_tool_call(d.get("toolName"), d.get("arguments"), visit)),
                 Some("tool.execution_complete") => data
                     .and_then(|d| d.get("result"))
-                    .is_none_or(|v| visit_string_values(v, visit)),
+                    .is_none_or(|v| visit_tool_output(v, visit)),
                 _ => true,
             }
         });

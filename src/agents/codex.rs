@@ -12,7 +12,7 @@ use super::Message;
 use super::common::format_mtime;
 use super::common::mmap_file;
 use super::common::strip_home;
-use super::common::{visit_string_values, visit_tool_call};
+use super::common::{visit_all_strings, visit_tool_call, visit_tool_output};
 use super::{MemoryKind, MemorySource};
 
 static RE_CODEX_SESSIONS: LazyLock<Regex> =
@@ -167,31 +167,32 @@ fn for_each_search_text(data: &[u8], visit: &mut dyn FnMut(&str) -> bool) {
 /// `timestamp`, `type`, then `payload` with its `type` and `role` first);
 /// when the head does not identify the line, it is kept.
 fn may_hold_search_text(line: &[u8]) -> bool {
-    use memchr::memmem::Finder;
-    static TYPE_KEY: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\"type\":\""));
-    static DEVELOPER: LazyLock<Finder<'static>> =
-        LazyLock::new(|| Finder::new(b"\"role\":\"developer\""));
-    static REASONING: LazyLock<Finder<'static>> =
-        LazyLock::new(|| Finder::new(b"\"payload\":{\"type\":\"reasoning\""));
-    static USER_ROLE: LazyLock<Finder<'static>> =
-        LazyLock::new(|| Finder::new(b"\"role\":\"user\""));
-    static TEXT_KEY: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\"text\":\""));
+    use regex::bytes::Regex as BytesRegex;
+    // JSON allows whitespace around `:`; `\s` also covers it inside the
+    // `{` of `payload`.
+    static TYPE_VALUE: LazyLock<BytesRegex> =
+        LazyLock::new(|| BytesRegex::new(r#""type"\s*:\s*"([^"]*)""#).unwrap());
+    static SKIPPED_PAYLOAD: LazyLock<BytesRegex> = LazyLock::new(|| {
+        BytesRegex::new(r#""role"\s*:\s*"developer"|"payload"\s*:\s*\{\s*"type"\s*:\s*"reasoning""#)
+            .unwrap()
+    });
+    static USER_ROLE: LazyLock<BytesRegex> =
+        LazyLock::new(|| BytesRegex::new(r#""role"\s*:\s*"user""#).unwrap());
+    static TEXT_VALUE: LazyLock<BytesRegex> =
+        LazyLock::new(|| BytesRegex::new(r#""text"\s*:\s*""#).unwrap());
     const HEAD: usize = 512;
     let head = &line[..line.len().min(HEAD)];
-    let Some(at) = TYPE_KEY.find(head) else {
+    let Some(kind) = TYPE_VALUE.captures(head).and_then(|caps| caps.get(1)) else {
         return true;
     };
-    if !head[at..].starts_with(b"\"type\":\"response_item\"") {
+    if kind.as_bytes() != b"response_item" || SKIPPED_PAYLOAD.is_match(head) {
         return false;
     }
-    if DEVELOPER.find(head).is_some() || REASONING.find(head).is_some() {
-        return false;
-    }
-    if USER_ROLE.find(head).is_none() {
+    if !USER_ROLE.is_match(head) {
         return true;
     }
-    TEXT_KEY.find_iter(line).any(|at| {
-        let text = &line[at + b"\"text\":\"".len()..];
+    TEXT_VALUE.find_iter(line).any(|m| {
+        let text = &line[m.end()..];
         !(text.starts_with(b"<") || text.starts_with(b"# "))
     })
 }
@@ -211,15 +212,13 @@ fn visit_search_value(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bo
     let kind = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if kind.ends_with("_call") {
         visit_tool_call(payload.get("name"), None, visit)
-            && ["arguments", "input", "action"].iter().all(|key| {
-                payload
-                    .get(key)
-                    .is_none_or(|v| visit_string_values(v, visit))
-            })
+            && ["arguments", "input", "action"]
+                .iter()
+                .all(|key| payload.get(key).is_none_or(|v| visit_all_strings(v, visit)))
     } else if kind.ends_with("_call_output") {
         payload
             .get("output")
-            .is_none_or(|v| visit_string_values(v, visit))
+            .is_none_or(|v| visit_tool_output(v, visit))
     } else {
         true
     }

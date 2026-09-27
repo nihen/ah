@@ -357,22 +357,43 @@ fn decode_json_escapes(raw: &[u8], out: &mut Vec<u8>) {
 }
 
 /// Literals one of which starts every match of `query`, extracted from the
-/// case-sensitive pattern: the prefilter compares them case-insensitively,
-/// which covers the case-insensitive search. `None` when the set is unbounded
-/// or a match may start with an empty literal.
+/// pattern under the same `(?i)` flag as the search (class intersections
+/// and inline flags can depend on it), then compared case-insensitively.
+/// `None` when the set is unbounded or a match may start with an empty
+/// literal.
 fn regex_prefixes(query: &str) -> Option<Vec<String>> {
     use regex_syntax::hir::literal::{ExtractKind, Extractor};
-    let hir = regex_syntax::parse(query).ok()?;
+    let hir = regex_syntax::parse(&format!("(?i){query}")).ok()?;
     let mut extractor = Extractor::new();
     extractor.kind(ExtractKind::Prefix);
     let seq = extractor.extract(&hir);
-    seq.literals()?
+    let literals: Vec<String> = seq
+        .literals()?
         .iter()
         .map(|lit| {
             let text = std::str::from_utf8(lit.as_bytes()).ok()?;
             (!text.is_empty()).then(|| text.to_string())
         })
-        .collect()
+        .collect::<Option<_>>()?;
+    Some(dedup_case_variants(literals))
+}
+
+/// Drop literals that a kept literal already matches case-insensitively:
+/// the `(?i)` parse spells out every case variant (`redis`, `Redis`, ...),
+/// and the case-insensitive needle needs only one of them.
+fn dedup_case_variants(literals: Vec<String>) -> Vec<String> {
+    let mut kept: Vec<(String, Option<BytesRegex>)> = Vec::new();
+    for literal in literals {
+        let covered = kept.iter().any(|(_, re)| {
+            re.as_ref()
+                .is_some_and(|re| re.is_match(literal.as_bytes()))
+        });
+        if !covered {
+            let re = BytesRegex::new(&format!("(?iu)^{}$", regex::escape(&literal))).ok();
+            kept.push((literal, re));
+        }
+    }
+    kept.into_iter().map(|(literal, _)| literal).collect()
 }
 
 /// Every character with a case mapping is below this code point (checked in
@@ -885,6 +906,143 @@ mod tests {
         for anchored in ["^fix", "end$", r"\bdone\b", r"(?m)^x"] {
             assert!(LineCheck::new(anchored).is_none(), "{anchored}");
         }
+    }
+
+    /// Search as the pipeline does it: prefilter, per-line keep and line
+    /// check, then the plugin's search texts.
+    fn pipeline_search(agent: &str, path: &Path, query: &str) -> Option<String> {
+        let plugin = find_plugin(agent).unwrap();
+        let pattern = Regex::new(&format!("(?i){query}")).unwrap();
+        let raw = plugin.session_bytes(path).unwrap();
+        let Some(prefilter) = QueryPrefilter::new(query) else {
+            return search_texts(path, plugin, &pattern, Some(&raw));
+        };
+        if plugin.search_texts_per_jsonl_line() {
+            let check = LineCheck::new(query);
+            let keep = |line: &[u8]| plugin.line_may_hold_search_texts(line);
+            let mut found = None;
+            prefilter.for_each_candidate_line(&raw, keep, |line| {
+                if check.as_ref().is_some_and(|c| !c.may_match(line)) {
+                    return true;
+                }
+                found = search_texts(path, plugin, &pattern, Some(line));
+                found.is_none()
+            });
+            return found;
+        }
+        if plugin.search_texts_in_session_json() && !prefilter.may_match(&raw) {
+            return None;
+        }
+        search_texts(path, plugin, &pattern, Some(&raw))
+    }
+
+    #[test]
+    fn default_search_finds_review_regressions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |name: &str, lines: &[&str]| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, lines.join("\n")).unwrap();
+            path
+        };
+        let cases = [
+            // whitespace around `:` in a record
+            (
+                "claude",
+                write(
+                    "spaced.jsonl",
+                    &[r#"{"type": "user", "message": {"content": "needle here"}}"#],
+                ),
+                "needle",
+            ),
+            (
+                "codex",
+                write(
+                    "spaced_codex.jsonl",
+                    &[
+                        r#"{"timestamp": "t", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "needle here"}]}}"#,
+                    ],
+                ),
+                "needle",
+            ),
+            // tool argument keys that are also part-level opaque keys
+            (
+                "claude",
+                write(
+                    "args.jsonl",
+                    &[
+                        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Move","input":{"source":"unique.txt","destination":"target.txt"}}]}}"#,
+                    ],
+                ),
+                "unique",
+            ),
+            // later text blocks of a message
+            (
+                "claude",
+                write(
+                    "blocks.jsonl",
+                    &[
+                        r#"{"type":"user","message":{"content":[{"type":"text","text":"first"},{"type":"text","text":"needle here"}]}}"#,
+                    ],
+                ),
+                "needle",
+            ),
+            (
+                "cursor",
+                write(
+                    "cursor_blocks.jsonl",
+                    &[
+                        r#"{"role":"assistant","message":{"content":[{"type":"text","text":"first"},{"type":"text","text":"needle here"}]}}"#,
+                    ],
+                ),
+                "needle",
+            ),
+            // tool results in a Gemini user turn
+            (
+                "gemini",
+                write(
+                    "session-2026-06-11T02-44-fr.jsonl",
+                    &[
+                        r#"{"sessionId":"g-fr","projectHash":"x","startTime":"2026-06-11T02:44:54.529Z","lastUpdated":"2026-06-11T02:44:54.529Z","kind":"main"}"#,
+                        r#"{"id":"m1","type":"user","content":[{"functionResponse":{"id":"x1","name":"read_file","response":{"output":"needle here"}}}]}"#,
+                    ],
+                ),
+                "needle",
+            ),
+            // numeric tool arguments
+            (
+                "claude",
+                write(
+                    "numbers.jsonl",
+                    &[
+                        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"offset":98765}}]}}"#,
+                    ],
+                ),
+                "98765",
+            ),
+            // prefixes follow the search's case-insensitive flag
+            (
+                "claude",
+                write(
+                    "flags.jsonl",
+                    &[r#"{"type":"user","message":{"content":"afoo"}}"#],
+                ),
+                "[a&&A]foo|bar",
+            ),
+        ];
+        for (agent, path, query) in cases {
+            assert!(
+                pipeline_search(agent, &path, query).is_some(),
+                "{agent} {}: {query}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn case_variant_prefixes_are_deduplicated() {
+        let literals = regex_prefixes("redis|postgres").unwrap();
+        assert_eq!(literals.len(), 2, "{literals:?}");
+        assert!(dedup_case_variants(vec!["ab".into(), "AB".into(), "ac".into()]).len() == 2);
     }
 
     #[test]

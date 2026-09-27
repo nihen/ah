@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use super::common::{
     RE_HOME_PREFIX, canonicalize_if_exists, decode_claude_project, for_each_jsonl_value,
     for_each_jsonl_value_bytes, is_pid_alive, json_pid, mmap_file, process_start_ticks,
-    visit_string_values, visit_tool_call,
+    visit_tool_call, visit_tool_output,
 };
 use super::{AgentMemoryFile, AgentPlugin, MemoryKind, MemorySource, Message};
 
@@ -163,14 +163,40 @@ impl ClaudePlugin {
         val: &serde_json::Value,
         visit: &mut dyn FnMut(&str) -> bool,
     ) -> bool {
-        if !self
-            .messages_from_value(val)
-            .iter()
-            .all(|message| visit(&message.text))
-        {
+        let role = val.get("type").and_then(|v| v.as_str());
+        let Some(content) = val
+            .pointer("/message/content")
+            .or_else(|| val.get("message").filter(|m| m.is_string()))
+        else {
+            return true;
+        };
+        // Every text block, not only the first as in `messages_from_value`;
+        // injected context (`<...>`, `# ...`) in user records is skipped.
+        let texts_ok = match content {
+            serde_json::Value::String(text) => match role {
+                Some("user") => text.starts_with('<') || visit(text),
+                Some("assistant") => visit(text),
+                _ => true,
+            },
+            serde_json::Value::Array(items) => items.iter().all(|item| {
+                let text = match item.get("type").and_then(|v| v.as_str()) {
+                    Some("text" | "input_text") | None => item.get("text").and_then(|v| v.as_str()),
+                    _ => None,
+                };
+                match (role, text) {
+                    (Some("user"), Some(text)) => {
+                        text.starts_with('<') || text.starts_with("# ") || visit(text)
+                    }
+                    (Some("assistant"), Some(text)) => visit(text),
+                    _ => true,
+                }
+            }),
+            _ => true,
+        };
+        if !texts_ok {
             return false;
         }
-        let Some(items) = val.pointer("/message/content").and_then(|v| v.as_array()) else {
+        let Some(items) = content.as_array() else {
             return true;
         };
         items
@@ -181,7 +207,7 @@ impl ClaudePlugin {
                 }
                 Some("tool_result") => item
                     .get("content")
-                    .is_none_or(|content| visit_string_values(content, visit)),
+                    .is_none_or(|content| visit_tool_output(content, visit)),
                 _ => true,
             })
     }
@@ -279,11 +305,12 @@ impl AgentPlugin for ClaudePlugin {
     /// Only `user` and `assistant` records hold search texts. A quoted
     /// `"type":"user"` outside a JSON string is always a real key.
     fn line_may_hold_search_texts(&self, line: &[u8]) -> bool {
-        static USER: std::sync::LazyLock<memmem::Finder<'static>> =
-            std::sync::LazyLock::new(|| memmem::Finder::new(b"\"type\":\"user\""));
-        static ASSISTANT: std::sync::LazyLock<memmem::Finder<'static>> =
-            std::sync::LazyLock::new(|| memmem::Finder::new(b"\"type\":\"assistant\""));
-        USER.find(line).is_some() || ASSISTANT.find(line).is_some()
+        // JSON allows whitespace around `:`.
+        static RECORD_TYPE: std::sync::LazyLock<regex::bytes::Regex> =
+            std::sync::LazyLock::new(|| {
+                regex::bytes::Regex::new(r#""type"\s*:\s*"(?:user|assistant)""#).unwrap()
+            });
+        RECORD_TYPE.is_match(line)
     }
 
     fn iter_search_texts_from_bytes(

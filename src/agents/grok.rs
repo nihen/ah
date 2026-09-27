@@ -14,7 +14,7 @@ use super::common::mmap_file;
 use super::common::percent_decode;
 use super::common::strip_home;
 use super::common::tagged_user_body;
-use super::common::{visit_string_values, visit_tool_call};
+use super::common::{visit_text_parts, visit_tool_call, visit_tool_output};
 use super::{AgentMemoryFile, MemoryKind, MemorySource};
 
 pub static PLUGIN: GrokPlugin = GrokPlugin;
@@ -151,27 +151,32 @@ impl AgentPlugin for GrokPlugin {
         visit: &mut dyn FnMut(&str) -> bool,
     ) {
         for_each_jsonl_value_bytes(data, |val| {
-            if let Some(message) = Self::message_from_value(val) {
-                if !visit(&message.text) {
-                    return false;
-                }
-            }
             match val.get("type").and_then(|v| v.as_str()) {
+                // every `<user_query>` block, not only the first text block
+                Some("user") => val.get("content").is_none_or(|content| {
+                    visit_text_parts(content, &mut |raw| {
+                        tagged_user_body(raw, "user_query").is_none_or(&mut *visit)
+                    })
+                }),
                 Some("assistant") => {
-                    val.get("tool_calls")
-                        .and_then(|v| v.as_array())
-                        .is_none_or(|calls| {
-                            calls.iter().all(|call| {
-                                visit_tool_call(call.get("name"), call.get("arguments"), visit)
+                    let text_ok =
+                        Self::message_from_value(val).is_none_or(|message| visit(&message.text));
+                    text_ok
+                        && val
+                            .get("tool_calls")
+                            .and_then(|v| v.as_array())
+                            .is_none_or(|calls| {
+                                calls.iter().all(|call| {
+                                    visit_tool_call(call.get("name"), call.get("arguments"), visit)
+                                })
                             })
-                        })
                 }
                 Some("tool_result") => val
                     .get("content")
-                    .is_none_or(|v| visit_string_values(v, visit)),
-                Some("backend_tool_call") => val
-                    .get("kind")
-                    .is_none_or(|v| visit_string_values(v, visit)),
+                    .is_none_or(|v| visit_tool_output(v, visit)),
+                Some("backend_tool_call") => {
+                    val.get("kind").is_none_or(|v| visit_tool_output(v, visit))
+                }
                 _ => true,
             }
         });

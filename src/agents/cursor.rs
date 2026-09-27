@@ -12,7 +12,7 @@ use super::common::for_each_jsonl_value_bytes;
 use super::common::is_safe_cli_id;
 use super::common::mmap_file;
 use super::common::tagged_user_body;
-use super::common::visit_tool_call;
+use super::common::{visit_text_parts, visit_tool_call};
 use super::{MemoryKind, MemorySource};
 
 /// Visit the message of one transcript line; `false` stops the iteration.
@@ -394,7 +394,15 @@ impl AgentPlugin for CursorPlugin {
         visit: &mut dyn FnMut(&str) -> bool,
     ) {
         for_each_jsonl_value_bytes(data, |val| {
-            visit_message_value(val, &mut |message| visit(&message.text))
+            // every text part, not only the first as in `visit_message_value`
+            let texts_ok = match (val.get("role").and_then(|v| v.as_str()), val.get("message")) {
+                (Some("user"), Some(message)) => visit_text_parts(message, &mut |raw| {
+                    cursor_user_body(raw).is_none_or(&mut *visit)
+                }),
+                (Some("assistant"), Some(message)) => visit_text_parts(message, visit),
+                _ => true,
+            };
+            texts_ok
                 && val
                     .pointer("/message/content")
                     .and_then(|v| v.as_array())

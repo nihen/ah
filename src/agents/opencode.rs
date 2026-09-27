@@ -492,7 +492,7 @@ fn search_texts_of_export(data: &[u8], visit: &mut dyn FnMut(&str) -> bool) {
                     ) && ["output", "error"].iter().all(|key| {
                         state
                             .and_then(|s| s.get(*key))
-                            .is_none_or(|v| super::common::visit_string_values(v, visit))
+                            .is_none_or(|v| super::common::visit_tool_output(v, visit))
                     })
                 }
                 _ => true,

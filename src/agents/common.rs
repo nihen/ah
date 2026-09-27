@@ -125,9 +125,10 @@ pub fn first_text_part(val: &serde_json::Value) -> Option<&str> {
         })
 }
 
-/// Keys of tool payloads that hold identifiers, type tags or encoded data
-/// (images, signatures) rather than searchable text.
-const OPAQUE_KEYS: &[&str] = &[
+/// Keys of typed content parts (objects with a string `type`, e.g.
+/// `{"type":"image","source":{...}}` or `{"type":"input_text","text":...}`)
+/// that hold identifiers, type tags or encoded data rather than text.
+const PART_OPAQUE_KEYS: &[&str] = &[
     "type",
     "id",
     "call_id",
@@ -143,28 +144,69 @@ const OPAQUE_KEYS: &[&str] = &[
     "media_type",
 ];
 
-/// Visit the string values of a tool call's input or a tool's output,
-/// skipping `OPAQUE_KEYS`. Returns `false` when `visit` stops.
-pub fn visit_string_values(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
+/// Visit every string and number of `val` (e.g. a tool call's arguments,
+/// whose keys are the tool's own and may be named anything). Numbers are
+/// written verbatim in the raw bytes, like unescaped strings. Returns
+/// `false` when `visit` stops.
+pub fn visit_all_strings(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
     match val {
         serde_json::Value::String(s) => visit(s),
-        serde_json::Value::Array(items) => items.iter().all(|v| visit_string_values(v, visit)),
-        serde_json::Value::Object(map) => map
-            .iter()
-            .filter(|(key, _)| !OPAQUE_KEYS.contains(&key.as_str()))
-            .all(|(_, v)| visit_string_values(v, visit)),
+        serde_json::Value::Number(n) => visit(&n.to_string()),
+        serde_json::Value::Array(items) => items.iter().all(|v| visit_all_strings(v, visit)),
+        serde_json::Value::Object(map) => map.values().all(|v| visit_all_strings(v, visit)),
         _ => true,
     }
 }
 
-/// Visit a tool call's `name` and the string values of `payload`.
+/// Visit the string values of a tool's output: a string, or content parts.
+/// In typed parts `PART_OPAQUE_KEYS` are skipped (image data, ids); other
+/// objects are the tool's own data and are visited in full.
+pub fn visit_tool_output(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
+    match val {
+        serde_json::Value::String(s) => visit(s),
+        serde_json::Value::Array(items) => items.iter().all(|v| visit_tool_output(v, visit)),
+        serde_json::Value::Object(map) => {
+            let typed = map.get("type").is_some_and(|v| v.is_string());
+            map.iter()
+                .filter(|(key, _)| !typed || !PART_OPAQUE_KEYS.contains(&key.as_str()))
+                .all(|(_, v)| visit_tool_output(v, visit))
+        }
+        _ => true,
+    }
+}
+
+/// Visit a tool call's `name` and every string of its `input`.
 pub fn visit_tool_call(
     name: Option<&serde_json::Value>,
-    payload: Option<&serde_json::Value>,
+    input: Option<&serde_json::Value>,
     visit: &mut dyn FnMut(&str) -> bool,
 ) -> bool {
     name.and_then(|v| v.as_str()).is_none_or(&mut *visit)
-        && payload.is_none_or(|v| visit_string_values(v, visit))
+        && input.is_none_or(|v| visit_all_strings(v, visit))
+}
+
+/// Visit every text of a message body: a string, or the `text` of each part
+/// of an array (or of `content` when `val` is a message object) except
+/// `tool_use` parts. `first_text_part` returns only the first of these.
+pub fn visit_text_parts(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
+    if let Some(text) = val.as_str() {
+        return visit(text);
+    }
+    let parts = val
+        .as_array()
+        .or_else(|| val.get("content").and_then(|v| v.as_array()));
+    parts.is_none_or(|parts| {
+        parts.iter().all(|part| {
+            part.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+                || part
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .is_none_or(&mut *visit)
+        })
+    }) && val
+        .get("content")
+        .and_then(|v| v.as_str())
+        .is_none_or(&mut *visit)
 }
 
 /// Extract the body wrapped in `<tag>…</tag>` from a raw user message.
