@@ -222,7 +222,7 @@ fn search_rejects_invalid_and_unsupported_options() {
         vec!["["],
         vec!["x", "-q", "y"],
         vec!["x", "--raw-search"],
-        vec!["x", "-i"],
+        vec!["x", "-i", "--json"],
         vec!["x", "--snippet-length", "0"],
         vec!["x", "--json", "--tsv"],
         vec!["x", "--remote", "missing"],
@@ -266,7 +266,9 @@ fn search_tsv_escapes_multiline_text_and_backslashes() {
     let rows: Vec<_> = output.lines().collect();
     assert_eq!(rows.len(), 1);
     let cols: Vec<_> = rows[0].split('\t').collect();
-    assert_eq!(cols.len(), 8);
+    assert_eq!(cols.len(), 10);
+    assert_eq!(cols[8], "user");
+    assert!(cols[9].starts_with("v1:"));
     assert_eq!(cols[7], "needle\\nnext\\twith\\\\literal");
     assert!(Path::new(cols[0]).is_file());
 }
@@ -291,7 +293,7 @@ fn search_remote_runs_on_host_and_merges_with_global_limit() {
     .unwrap();
     let hit = json!({"path":"/remote/one.jsonl", "agent":"claude", "project":"remote",
         "id":"one", "title":"remote session", "modified_at":"2099-01-01 00:00",
-        "text_index":2, "match_start":0, "match_end":6, "snippet":"needle", "_snippet_match":[0,6]});
+        "text_index":2, "match_start":0, "match_end":6, "snippet":"needle", "kind":"user", "position":format!("v1:2:1:0:6:{}", "a".repeat(64)), "_snippet_match":[0,6]});
     let script = bin.join("ssh");
     fs::write(
         &script,
@@ -502,12 +504,12 @@ fn search_terminal_colors_layout_and_pager_obey_color_controls() {
         let out = terminal_search(tmp.path(), &args, &[]);
         assert!(out.starts_with("\x1b[1m\x1b[36msession one"), "{out:?}");
         assert!(
-            out.contains("\n\n    認証 \x1b[1;33mneedle\x1b[0m twice NEEDLE"),
+            out.contains("\n\n    user        認証 \x1b[1;33mneedle\x1b[0m twice NEEDLE"),
             "{out:?}"
         );
         let plain = terminal_search(tmp.path(), &args, &[("NO_COLOR", "1")]);
         assert!(!plain.contains('\x1b'));
-        assert!(plain.contains("\n\n    認証 needle twice NEEDLE"));
+        assert!(plain.contains("\n\n    user        認証 needle twice NEEDLE"));
         assert!(!plain.contains("bytes"));
         assert!(!plain.contains(".jsonl"));
         assert!(!plain.contains("#2"));
@@ -586,7 +588,7 @@ fn search_compact_groups_passages_and_verbose_restores_locations() {
         .unwrap();
     let plain = terminal_search(tmp.path(), &["needle", "--no-color"], &[]);
     assert!(
-        plain.contains("\n    needle A\n    needle B\n\nsession two "),
+        plain.contains("\n    user        needle A\n    assistant   needle B\n\nsession two "),
         "{plain:?}"
     );
     assert_eq!(plain.matches("session one ").count(), 1);
@@ -597,11 +599,423 @@ fn search_compact_groups_passages_and_verbose_restores_locations() {
     assert!(verbose.contains(&path));
     assert!(verbose.contains(&older));
     assert!(
-        verbose
-            .contains("text #2  bytes 0..6\n    needle A\n\n  text #3  bytes 0..6\n    needle B"),
+        verbose.contains("text #2  bytes 0..6\n  at v1:"),
+        "{verbose:?}"
+    );
+    assert!(
+        verbose.contains("    user        needle A\n\n  text #3"),
         "{verbose:?}"
     );
     let colored = terminal_search(tmp.path(), &["needle", "--verbose"], &[]);
     assert!(colored.contains("\x1b[2mtext #2  bytes 0..6\x1b[0m"));
     assert!(colored.contains("\x1b[1;33mneedle\x1b[0m"));
+}
+
+fn show_at(home: &Path, hit: &Value, context: &str) -> Vec<Value> {
+    let out = ah(home)
+        .args([
+            "show",
+            hit["path"].as_str().unwrap(),
+            "--at",
+            hit["position"].as_str().unwrap(),
+            "-C",
+            context,
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect()
+}
+
+#[test]
+fn kinds_filter_before_limits_and_keep_positions_identical() {
+    let tmp = fixture();
+    let all = search(tmp.path(), &["needle", "--max-matches", "0"]);
+    assert_eq!(
+        all.iter()
+            .map(|h| h["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "user",
+            "user",
+            "assistant",
+            "assistant",
+            "tool-input",
+            "tool-output"
+        ]
+    );
+    for (kind, count) in [
+        ("user", 2),
+        ("assistant", 2),
+        ("tool-input", 1),
+        ("tool-output", 1),
+        ("unknown", 0),
+    ] {
+        let hits = search(tmp.path(), &["needle", "--kind", kind]);
+        assert_eq!(hits.len(), count);
+        for h in &hits {
+            assert!(
+                all.iter()
+                    .any(|original| original["position"] == h["position"]
+                        && original["text_index"] == h["text_index"])
+            );
+            let source = show_at(tmp.path(), h, "0");
+            let selected = source.iter().find(|v| v["selected"] == true).unwrap();
+            assert_eq!(selected["kind"], kind);
+            let text = selected["text"].as_str().unwrap();
+            let start = h["match_start"].as_u64().unwrap() as usize;
+            let end = h["match_end"].as_u64().unwrap() as usize;
+            assert_eq!(text[start..end].to_lowercase(), "needle");
+        }
+    }
+    assert_eq!(
+        search(tmp.path(), &["needle", "-p"]),
+        search(tmp.path(), &["needle", "--kind", "user"])
+    );
+    assert_eq!(
+        search(
+            tmp.path(),
+            &["needle", "--kind", "tool-output", "--max-matches", "1"]
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        search(tmp.path(), &["needle", "--kind", "user,assistant"]).len(),
+        4
+    );
+    let tiny = search(tmp.path(), &["needle", "--snippet-length", "1"]);
+    assert_eq!(all[0]["position"], tiny[0]["position"]);
+    for args in [
+        vec!["--kind", "bogus"],
+        vec!["-p", "--kind", "assistant"],
+        vec!["--kind", ""],
+    ] {
+        ah(tmp.path())
+            .args(["search", "needle"])
+            .args(args)
+            .assert()
+            .failure();
+    }
+}
+
+#[test]
+fn show_at_context_includes_tools_and_checks_staleness() {
+    let tmp = fixture();
+    let hit = search(tmp.path(), &["needle", "--kind", "tool-input"]).remove(0);
+    let rows = show_at(tmp.path(), &hit, "1");
+    assert_eq!(rows.iter().filter(|v| v["selected"] == true).count(), 1);
+    assert!(rows.iter().any(|v| v["kind"] == "user"));
+    assert!(rows.iter().any(|v| v["kind"] == "assistant"));
+    assert!(rows.iter().any(|v| v["kind"] == "tool-output"));
+    assert!(!rows.iter().any(|v| v["text"] == "start"));
+    let path = hit["path"].as_str().unwrap();
+    let token = hit["position"].as_str().unwrap();
+    ah(tmp.path())
+        .args(["show", path, "--at", token, "-C", "0", "--no-color"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("> [tool-input]"))
+        .stdout(predicate::str::contains("echo needle"));
+    let mut content = fs::read_to_string(path).unwrap();
+    content.push_str("\n{\"type\":\"assistant\",\"message\":{\"content\":\"appended\"}}\n");
+    fs::write(path, &content).unwrap();
+    assert!(
+        show_at(tmp.path(), &hit, "0")
+            .iter()
+            .any(|v| v["selected"] == true)
+    );
+    fs::write(path, content.replace("echo needle", "echo changed")).unwrap();
+    ah(tmp.path())
+        .args(["show", path, "--at", token])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains("stale"));
+}
+
+#[test]
+fn show_at_unicode_zero_width_and_invalid_options() {
+    let tmp = fixture();
+    for query in ["認証", "^", "$", "NEEDLE"] {
+        let hits = search(tmp.path(), &[query, "--kind", "user"]);
+        for h in &hits {
+            assert!(
+                show_at(tmp.path(), h, "0")
+                    .iter()
+                    .any(|v| v["selected"] == true)
+            );
+        }
+    }
+    let hit = search(tmp.path(), &["認証"]).remove(0);
+    let path = hit["path"].as_str().unwrap();
+    let token = hit["position"].as_str().unwrap();
+    for extra in ["--raw", "--follow", "--tsv"] {
+        ah(tmp.path())
+            .args(["show", path, "--at", token, extra])
+            .assert()
+            .failure();
+    }
+    for extra in [
+        ["--head", "1"],
+        ["-o", "title"],
+        ["--highlight", "x"],
+        ["-C", "1001"],
+    ] {
+        ah(tmp.path())
+            .args(["show", path, "--at", token])
+            .args(extra)
+            .assert()
+            .failure();
+    }
+    ah(tmp.path())
+        .args(["show", path, "-C", "2"])
+        .assert()
+        .failure();
+    for bad in ["1", "v2:1:1:0:1:abcd", "v1:0:0:0:0:a", "v1:1:1:5:1:a"] {
+        ah(tmp.path())
+            .args(["show", path, "--at", bad])
+            .assert()
+            .failure();
+    }
+    // A valid digest does not authorize splitting a UTF-8 codepoint.
+    let parts: Vec<_> = token.split(':').collect();
+    let malformed = format!("v1:{}:{}:1:2:{}", parts[1], parts[2], parts[5]);
+    ah(tmp.path())
+        .args(["show", path, "--at", &malformed])
+        .assert()
+        .failure()
+        .stdout("");
+}
+
+#[cfg(unix)]
+#[test]
+fn interactive_search_selects_occurrence_and_handles_cancel() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = fixture();
+    let selector = tmp.path().join("selector");
+    fs::write(&selector, "#!/bin/sh\nsed -n '1p'\n").unwrap();
+    fs::set_permissions(&selector, fs::Permissions::from_mode(0o755)).unwrap();
+    ah(tmp.path())
+        .args([
+            "search",
+            "needle",
+            "--kind",
+            "tool-output",
+            "-i",
+            "-s",
+            selector.to_str().unwrap(),
+            "--no-pager",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("> [tool-output]"))
+        .stdout(predicate::str::contains("output needle"));
+    fs::write(&selector, "#!/bin/sh\ncat >/dev/null\nexit 130\n").unwrap();
+    ah(tmp.path())
+        .args(["search", "needle", "-i", "-s", selector.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("");
+    fs::write(&selector, "#!/bin/sh\ncat >/dev/null\nprintf 'not-a-row'\n").unwrap();
+    ah(tmp.path())
+        .args(["search", "needle", "-i", "-s", selector.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid search selection"));
+}
+
+#[cfg(unix)]
+#[test]
+fn interactive_preview_roundtrips_hostile_paths_without_shell_evaluation() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = test_tempdir();
+    let home = tmp.path().join("space ' $(touch HACKED)\t\nfolder");
+    fs::create_dir_all(&home).unwrap();
+    write_session(
+        &home,
+        "one",
+        &home,
+        &[json!({"type":"user", "message":{"content":"needle preview"}})],
+    );
+    let selector = tmp.path().join("fzf");
+    fs::write(
+        &selector,
+        r#"#!/usr/bin/env python3
+import os, shlex, subprocess, sys
+rows = sys.stdin.read().splitlines()
+row = rows[0]
+fields = row.split('\t')
+preview = next(arg.split('=', 1)[1] for arg in sys.argv[1:] if arg.startswith('--preview='))
+preview = preview.replace('{1}', shlex.quote(fields[0])).replace('{2}', shlex.quote(fields[1]))
+result = subprocess.run(['/bin/sh', '-c', preview], capture_output=True, text=True)
+assert result.returncode == 0, result.stderr
+assert '> [user]' in result.stdout and 'needle preview' in result.stdout, result.stdout
+print(row)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&selector, fs::Permissions::from_mode(0o755)).unwrap();
+    ah(&home)
+        .args([
+            "search",
+            "needle",
+            "-i",
+            "-s",
+            selector.to_str().unwrap(),
+            "--no-color",
+            "--no-pager",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("needle preview"));
+    assert!(!home.join("HACKED").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_kind_filter_and_navigation_use_the_same_source_position() {
+    use std::os::unix::fs::PermissionsExt;
+    let local = test_tempdir();
+    let remote = fixture();
+    let bin = local.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let binary = assert_cmd::cargo::cargo_bin("ah");
+    let config = format!(
+        "[remotes.test]\nhost = 'example'\nah_path = '{}'\n",
+        binary.display()
+    );
+    fs::write(local.path().join(".ahrc"), config).unwrap();
+    let script = bin.join("ssh");
+    fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
+import os, shlex, sys
+args = shlex.split(sys.argv[-1])
+os.environ['HOME'] = os.environ['TEST_REMOTE_HOME']
+os.chdir(os.environ['HOME'])
+os.execv(args[0], args)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let make = || {
+        let mut c = ah(local.path());
+        c.env("PATH", &path).env("TEST_REMOTE_HOME", remote.path());
+        c
+    };
+    let output = make()
+        .args([
+            "search",
+            "needle",
+            "--remote",
+            "test",
+            "--kind",
+            "tool-output",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let hit: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(hit["kind"], "tool-output");
+    assert!(hit["path"].as_str().unwrap().starts_with("test:"));
+    let output = make()
+        .args([
+            "show",
+            hit["path"].as_str().unwrap(),
+            "--at",
+            hit["position"].as_str().unwrap(),
+            "-C",
+            "0",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let selected: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(selected["kind"], "tool-output");
+    assert_eq!(selected["selected"], true);
+    assert_eq!(selected["text"], "output needle");
+}
+
+#[test]
+fn user_parts_share_locations_and_changed_duplicate_prefix_is_rejected() {
+    let tmp = test_tempdir();
+    let path = write_session(
+        tmp.path(),
+        "one",
+        tmp.path(),
+        &[
+            json!({"type":"user","message":{"content":[
+                {"type":"text","text":"first part"},
+                {"type":"text","text":"needle later part"}
+            ]}}),
+            json!({"type":"user","message":{"content":"needle duplicate"}}),
+            json!({"type":"user","message":{"content":"needle duplicate"}}),
+            json!({"type":"user","message":{"content":"needle duplicate"}}),
+        ],
+    );
+    let all = search(tmp.path(), &["needle"]);
+    let prompts = search(tmp.path(), &["needle", "-p"]);
+    assert_eq!(all, prompts);
+    assert_eq!(all.len(), 4);
+    let hit = &all[2];
+    let original = fs::read_to_string(&path).unwrap();
+    let mut lines: Vec<_> = original.lines().collect();
+    lines.remove(1);
+    fs::write(&path, lines.join("\n")).unwrap();
+    ah(tmp.path())
+        .args(["show", &path, "--at", hit["position"].as_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains("stale"));
+}
+
+#[test]
+fn show_at_highlights_only_the_selected_occurrence_and_preserves_plain_show() {
+    let tmp = fixture();
+    let hits = search(tmp.path(), &["needle", "--kind", "user"]);
+    let second = &hits[1];
+    let path = second["path"].as_str().unwrap();
+    let token = second["position"].as_str().unwrap();
+    ah(tmp.path())
+        .args(["show", path, "--at", token, "-C", "0", "--color"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "認証 needle twice \x1b[1;33mNEEDLE\x1b[0m",
+        ));
+    ah(tmp.path())
+        .args(["show", path, "--at", token, "-C", "0", "--color"])
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\x1b").not());
+    let raw = ah(tmp.path())
+        .args(["show", path, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    for line in String::from_utf8(raw).unwrap().lines() {
+        let value: Value = serde_json::from_str(line).unwrap();
+        assert!(value.get("role").is_some());
+        assert!(value.get("kind").is_none());
+        assert!(value.get("selected").is_none());
+    }
 }

@@ -1,3 +1,4 @@
+use super::entries::{RecordVisitor, SearchKind as K, TypedVisitor};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -312,13 +313,13 @@ fn visit_message(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -> bool
 /// Search texts of one Gemini message record: the user prompt, each answer
 /// part of a turn (visited separately, so each is one JSON string), and its
 /// tool calls with their arguments and results. Returns `false` to stop.
-fn visit_search_record(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
+fn visit_search_record(val: &serde_json::Value, visit: &mut TypedVisitor<'_>) -> bool {
     match val.get("type").and_then(|v| v.as_str()) {
         // every prompt part (injected context `<...>` is skipped), and tool
         // results sent back as `functionResponse` parts of a user turn
         Some("user") => {
             let prompts_ok = {
-                let mut visit_prompt = |text: &str| text.starts_with('<') || visit(text);
+                let mut visit_prompt = |text: &str| text.starts_with('<') || visit(K::User, text);
                 val.get("content")
                     .is_none_or(|content| visit_text_parts(content, &mut visit_prompt))
                     && val
@@ -333,24 +334,46 @@ fn visit_search_record(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> b
                     .is_none_or(|parts| {
                         parts.iter().all(|part| {
                             ["functionCall", "functionResponse"].iter().all(|key| {
-                                part.get(*key).is_none_or(|v| visit_function_part(v, visit))
+                                part.get(*key).is_none_or(|v| {
+                                    visit_function_part(v, &mut |text| {
+                                        visit(
+                                            if *key == "functionCall" {
+                                                K::ToolInput
+                                            } else {
+                                                K::ToolOutput
+                                            },
+                                            text,
+                                        )
+                                    })
+                                })
                             })
                         })
                     })
         }
         Some("gemini") => {
             let content_ok = match val.get("content") {
-                Some(serde_json::Value::String(text)) => visit(text),
+                Some(serde_json::Value::String(text)) => visit(K::Assistant, text),
                 Some(serde_json::Value::Array(parts)) => parts.iter().all(|part| {
                     if part.get("thought").and_then(|v| v.as_bool()) == Some(true) {
                         return true;
                     }
                     part.get("text")
                         .and_then(|v| v.as_str())
-                        .is_none_or(&mut *visit)
-                        && ["functionCall", "functionResponse"]
-                            .iter()
-                            .all(|key| part.get(key).is_none_or(|v| visit_function_part(v, visit)))
+                        .is_none_or(|text| visit(K::Assistant, text))
+                        && ["functionCall", "functionResponse"].iter().all(|key| {
+                            part.get(key).is_none_or(|v| {
+                                visit_function_part(v, &mut |text| {
+                                    visit(
+                                        if *key == "functionCall" {
+                                            K::ToolInput
+                                        } else {
+                                            K::ToolOutput
+                                        },
+                                        text,
+                                    )
+                                })
+                            })
+                        })
                 }),
                 _ => true,
             };
@@ -360,10 +383,11 @@ fn visit_search_record(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> b
                     .and_then(|v| v.as_array())
                     .is_none_or(|calls| {
                         calls.iter().all(|call| {
-                            visit_tool_call(call.get("name"), call.get("args"), visit)
-                                && call
-                                    .get("result")
-                                    .is_none_or(|result| visit_tool_result(result, visit))
+                            visit_tool_call(call.get("name"), call.get("args"), &mut |text| {
+                                visit(K::ToolInput, text)
+                            }) && call.get("result").is_none_or(|result| {
+                                visit_tool_result(result, &mut |text| visit(K::ToolOutput, text))
+                            })
                         })
                     })
         }
@@ -617,8 +641,16 @@ impl AgentPlugin for GeminiPlugin {
         Self::for_each_root_message_bytes(path, data, |val| visit_message(val, visit));
     }
 
+    fn iter_search_records(&self, path: &Path, visit: &mut RecordVisitor<'_>) {
+        Self::for_each_root_message(path, |val| {
+            visit.record(|emit| visit_search_record(val, emit))
+        });
+    }
+
     fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
-        Self::for_each_root_message(path, |val| visit_search_record(val, visit));
+        Self::for_each_root_message(path, |val| {
+            visit_search_record(val, &mut |_, text| visit(text))
+        });
     }
 
     fn iter_search_texts_from_bytes(
@@ -627,7 +659,9 @@ impl AgentPlugin for GeminiPlugin {
         data: &[u8],
         visit: &mut dyn FnMut(&str) -> bool,
     ) {
-        Self::for_each_root_message_bytes(path, data, |val| visit_search_record(val, visit));
+        Self::for_each_root_message_bytes(path, data, |val| {
+            visit_search_record(val, &mut |_, text| visit(text))
+        });
     }
 
     fn search_texts_in_session_json(&self) -> bool {

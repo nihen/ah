@@ -73,6 +73,9 @@ ah search 'OAuth' -a --json       # JSON Lines across all directories
 ah search '認証' -p                # user prompts only
 ah search 'error' --max-matches 20
 ah search 'OAuth' --verbose       # full log paths and match positions on TTY
+ah search 'OAuth' --kind user,assistant  # conversation text only
+ah search 'error' --kind tool-output    # tool results only
+ah search 'OAuth' -i              # pick a hit, preview context, Enter to show
 ```
 
 `log -q` returns one row per session with its first matching excerpt.
@@ -85,7 +88,8 @@ On a terminal, passages are grouped by session with an automatic pager.
 Like `rg --heading` or `git grep --heading --break`, the default display puts
 one heading above each group of passages and a blank line between sessions.
 Session headings are cyan and bold, titles are bold, and dates are dim.
-Each passage appears on its own indented line, with the current occurrence
+Each passage appears on its own indented line with a structural kind label
+(`user`, `assistant`, `tool-input`, `tool-output`, or `unknown`), with the current occurrence
 highlighted in bold yellow. Full log paths and position labels are omitted by
 default so the passages stay compact. Remote session headings keep a
 `remote:NAME` label to distinguish hosts.
@@ -93,7 +97,7 @@ default so the passages stay compact. Remote session headings keep a
 Use `-v` / `--verbose` to show the full log path and a dim position line before
 each passage. Positions are labeled `text #N  bytes START..END`: `text #N`
 is a search-fragment index, **not a transcript line number**. Verbose output
-also separates passages with blank lines. This flag only affects terminal
+also includes an opaque `at POSITION` token and separates passages with blank lines. This flag only affects terminal
 output; JSON/TSV retain all their existing fields and formatting.
 
 If a match is clipped by the snippet limit, only its visible portion is
@@ -101,15 +105,25 @@ highlighted. `--no-color` and
 `NO_COLOR` disable styling; `NO_COLOR` takes precedence over `--color`, as with
 other commands. JSON/TSV output never receives display colors.
 Piped output is TSV without a header, with these columns:
-`path, agent, project, id, text_index, match_start, match_end, snippet`.
+`path, agent, project, id, text_index, match_start, match_end, snippet, kind, position`.
 Tabs, newlines, carriage returns, and backslashes are escaped as `\t`, `\n`,
 `\r`, and `\\`. JSON Lines contains the same fields plus `modified_at` and
 `title`, with numbers represented as JSON numbers.
 
-- `text_index` is a **1-based search-fragment index** within the selected search
-  mode, not a transcript message number. One tool call can yield several
-  fragments; prompt-only mode counts only user prompts. Empty fragments are
-  counted for indexing but never matched. These indices are not persistent IDs.
+- `text_index` is a **1-based index of nonempty search fragments**, counted before
+  kind filtering. It is not a transcript message number. One tool call can yield
+  several fragments. Use `position`, not this index, for navigation.
+- `kind` is derived from log structure, never inferred from the text. Ambiguous
+  records remain `unknown` (for example, Antigravity's generic model records).
+  `--kind` accepts a comma-separated union; the default includes every kind.
+  `-p` is shorthand for `--kind user` and includes all user text parts, but not
+  tool results stored in user-role containers. It cannot be combined with other
+  kinds. `log -p -q` keeps its existing prompt extraction behavior.
+- `position` is an opaque versioned location within the session identified by
+  `path`. It includes a fingerprint of the searchable source prefix. Do not
+  construct it yourself. Filtering and snippet length do not change positions;
+  appending records preserves them. An edited/reordered prefix requires a new
+  search instead of silently opening a different occurrence.
 - `match_start` / `match_end` are **0-based UTF-8 byte offsets**, with an exclusive
   end, in the decoded fragment (not the snippet or raw file).
 - Snippets contain at most `--snippet-length` Unicode characters (default 240),
@@ -128,9 +142,38 @@ Tabs, newlines, carriage returns, and backslashes are escaped as `\t`, `\n`,
   of `ah`. Remote failures are errors, not silently incomplete results.
 - Supply either a positional pattern or `-q`, not both. Empty queries and invalid
   regexes are errors; no matches is success with empty output.
-- This first version does not label speakers/tool kinds or show surrounding
-  messages. Use the result's path with `ah show` to read the complete transcript.
-  `-i` and `--raw-search` remain available through `log`, not `search`.
+- `--raw-search` remains available through `log`, not `search`.
+
+### Open an occurrence with context
+
+```sh
+ah show <session-id-or-path> --at <position-from-search> -C 2
+ah search 'OAuth' -i
+```
+
+`show --at` displays the selected source record and, by default, two searchable
+records on either side. `-C 0` displays only the selected record. A record is a
+message or tool event; it may contain multiple text/argument fragments. Context
+is not counted in lines and is not restricted by the search kind filter. Tool
+inputs and outputs are displayed even though ordinary `show` omits them. The
+selected fragment is marked `>`; its exact occurrence is highlighted when color
+is enabled. Zero-width occurrences select the fragment without coloring a
+character. JSON output with `--at` has `record`, `fragment`, `kind`, `text`,
+`selected`, `match_start`, and `match_end` (offsets are null on context fragments).
+Ordinary `show` and its existing JSON schema are unchanged.
+
+`search -i` uses the existing selector setting (`-s`, `$AH_SELECTOR`, or `fzf`).
+The fzf/sk preview opens the same position with context; Enter displays it and
+Esc cancels. `--no-preview` disables the preview. Structured result formats
+(`--json`, `--tsv`) cannot be combined with `-i`. Remotes execute both search and
+position display on the host that owns the data; both hosts need this version.
+
+**Search output migration:** `kind` and `position` are new JSON fields and are
+appended as TSV columns 9 and 10; existing columns remain in positions 1–8. `text_index`
+now counts nonempty fragments in the unfiltered stream, including with `-p`.
+Consumers requiring the previous eight-column schema should select those
+columns explicitly. `-p` now searches all user text parts, not just the legacy
+transcript reader's first/combined prompt representation.
 
 **Compatibility:** `search` used to be a hidden alias for `log`. For the old
 session-list output and its field-selection options, use `ah log` explicitly.
@@ -396,6 +439,8 @@ Usage:
 Options:
   --json                  One JSON object per occurrence (JSON Lines)
   --tsv                   TSV without a header (default when piped)
+  --kind <KINDS>          Comma-separated: user,assistant,tool-input,tool-output,unknown
+  -i, --interactive       Select an occurrence, preview context, then show it
   -v, --verbose           Show full log paths and match positions on TTY
   --max-matches N         Maximum occurrences across sessions/hosts (default: 100, 0 = unlimited)
   --snippet-length N      Maximum Unicode characters per snippet (default: 240, minimum: 1)
@@ -406,14 +451,17 @@ Default: session headings and compact passages with auto-pager on TTY;
 plain TSV when piped. Paths and positions are hidden on TTY unless --verbose.
 Verbose positions use "text #N" for search fragments, not transcript line numbers.
 --verbose does not change JSON or TSV output.
-TSV columns: path, agent, project, id, text_index, match_start, match_end, snippet.
-Text indices are 1-based search-fragment indices (not transcript message numbers).
+TSV columns: path, agent, project, id, text_index, match_start, match_end, snippet, kind, position.
+Text indices count nonempty source fragments before kind filtering (not transcript messages).
+Use position with `ah show SESSION --at POSITION -C 2` to open the source.
 Match offsets are 0-based UTF-8 byte offsets within the decoded search fragment.
 Empty search fragments are skipped. No matches is successful with empty output.
 
 Use PATTERN or -q, not both. Empty queries are rejected.
--p searches only user prompts. --raw-search and -i are not supported;
-use `ah log -q ... --raw-search` or `ah log -i` instead.
+-p is shorthand for --kind user (all user text parts, excluding tool results).
+-i uses fzf (or -s / $AH_SELECTOR); --no-preview disables the context preview.
+-i cannot be combined with --json or --tsv. --raw-search is not supported;
+use `ah log -q ... --raw-search` instead.
 The former `search` alias for `log` is now this command; use `log` for session lists.
 
 Examples:
@@ -457,12 +505,20 @@ Use - as SESSION to read it from stdin explicitly. An empty SESSION is an error.
 
 Transcript output:
   --head N                Show first N messages only
+  --at <POSITION>         Open a search position, including tool input/output
+  -C, --context N         Surrounding source records with --at (default: 2, max: 1000)
   --pretty                Pretty-print with colors (default)
   --raw                   Output raw session file content
   --json                  Output normalized JSON Lines ({"role":"user","text":"..."})
   --md                    Output as Markdown (## User / ## Assistant headers)
   -f, --follow            Follow session output in real-time (like tail -f)
   --highlight <PATTERN>   Highlight matching text in pretty output (case-insensitive; requires color)
+
+With --at, context counts nonempty searchable source records (a message or tool
+event), not lines. Positions remain stable across kind filters and appends;
+changed source prefixes require a new search. JSON emits record, fragment, kind,
+text, selected, match_start, and match_end. --at conflicts with --head, --follow,
+--raw, metadata output, and --highlight. Ordinary show output is unchanged.
 
 Metadata output:
   -o, --fields <FIELDS>   Output session metadata as TSV instead of transcript
@@ -481,7 +537,26 @@ Examples:
   ah show -o agent,title             # output agent and title as TSV
   ah show -i -o title                # select session, output title
 
-Global options are also available (see ah -h).
+Global options:
+  -a, --all               Show all sessions (disable default cwd filtering)
+  -A                      Show all sessions including all configured remotes
+  --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
+  --project <NAME>        Filter by project name
+  -d, --dir <PATH>        Filter by working directory (default: current directory)
+  -q, --query <REGEX>     Search messages and tool input/output (regex, case-insensitive)
+  -p, --prompt-only       Search only user prompts (use with -q)
+  --raw-search            Search raw session files incl. metadata (use with -q)
+  -n, --limit N           Max session files to scan (default: 0, no limit)
+  --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok)
+  --no-archived           Hide sessions the agent has archived (Codex)
+  --subagents             Include subagent sessions (spawned by another session)
+  --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
+  --color                 Force colored output (even through pipes)
+  --no-color              Disable colored output
+  --no-pager              Disable automatic pager
+  --debug                 Show debug info (glob expansion, scan counts, timing) on stderr
 ```
 
 ### `ah resume --help`

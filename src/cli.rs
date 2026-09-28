@@ -429,6 +429,10 @@ pub enum Commands {
 /// Passage search is separate from the session-listing `SearchArgs`.
 #[derive(Parser, Debug)]
 pub struct MatchSearchArgs {
+    /// Search only these structural kinds (comma-separated)
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub kind: Vec<crate::agents::entries::SearchKind>,
+
     /// Case-insensitive regular expression (or use -q)
     #[arg(value_name = "PATTERN")]
     pub pattern: Option<String>,
@@ -720,6 +724,14 @@ pub enum ShowFormat {
 
 #[derive(Parser, Debug)]
 pub struct ShowArgs {
+    /// Open a position returned by search (includes tool input/output)
+    #[arg(long, conflicts_with_all = ["head", "follow", "raw", "tsv", "fields", "highlight"])]
+    pub at: Option<String>,
+
+    /// Number of surrounding searchable source records (default with --at: 2)
+    #[arg(short = 'C', long, requires = "at", value_parser = clap::value_parser!(u32).range(0..=1000))]
+    pub context: Option<u32>,
+
     #[command(flatten)]
     pub common: CommonArgs,
 
@@ -767,6 +779,8 @@ impl ShowArgs {
         highlight: Option<String>,
     ) -> Self {
         ShowArgs {
+            at: None,
+            context: None,
             common: CommonArgs { fields: None },
             head,
             pretty: false,
@@ -1741,6 +1755,8 @@ Usage:
 Options:
   --json                  One JSON object per occurrence (JSON Lines)
   --tsv                   TSV without a header (default when piped)
+  --kind <KINDS>          Comma-separated: user,assistant,tool-input,tool-output,unknown
+  -i, --interactive       Select an occurrence, preview context, then show it
   -v, --verbose           Show full log paths and match positions on TTY
   --max-matches N         Maximum occurrences across sessions/hosts (default: 100, 0 = unlimited)
   --snippet-length N      Maximum Unicode characters per snippet (default: 240, minimum: 1)
@@ -1751,14 +1767,17 @@ Default: session headings and compact passages with auto-pager on TTY;
 plain TSV when piped. Paths and positions are hidden on TTY unless --verbose.
 Verbose positions use \"text #N\" for search fragments, not transcript line numbers.
 --verbose does not change JSON or TSV output.
-TSV columns: path, agent, project, id, text_index, match_start, match_end, snippet.
-Text indices are 1-based search-fragment indices (not transcript message numbers).
+TSV columns: path, agent, project, id, text_index, match_start, match_end, snippet, kind, position.
+Text indices count nonempty source fragments before kind filtering (not transcript messages).
+Use position with `ah show SESSION --at POSITION -C 2` to open the source.
 Match offsets are 0-based UTF-8 byte offsets within the decoded search fragment.
 Empty search fragments are skipped. No matches is successful with empty output.
 
 Use PATTERN or -q, not both. Empty queries are rejected.
--p searches only user prompts. --raw-search and -i are not supported;
-use `ah log -q ... --raw-search` or `ah log -i` instead.
+-p is shorthand for --kind user (all user text parts, excluding tool results).
+-i uses fzf (or -s / $AH_SELECTOR); --no-preview disables the context preview.
+-i cannot be combined with --json or --tsv. --raw-search is not supported;
+use `ah log -q ... --raw-search` instead.
 The former `search` alias for `log` is now this command; use `log` for session lists.
 
 Examples:
@@ -1819,12 +1838,20 @@ Use - as SESSION to read it from stdin explicitly. An empty SESSION is an error.
 
 Transcript output:
   --head N                Show first N messages only
+  --at <POSITION>         Open a search position, including tool input/output
+  -C, --context N         Surrounding source records with --at (default: 2, max: 1000)
   --pretty                Pretty-print with colors (default)
   --raw                   Output raw session file content
   --json                  Output normalized JSON Lines ({\"role\":\"user\",\"text\":\"...\"})
   --md                    Output as Markdown (## User / ## Assistant headers)
   -f, --follow            Follow session output in real-time (like tail -f)
   --highlight <PATTERN>   Highlight matching text in pretty output (case-insensitive; requires color)
+
+With --at, context counts nonempty searchable source records (a message or tool
+event), not lines. Positions remain stable across kind filters and appends;
+changed source prefixes require a new search. JSON emits record, fragment, kind,
+text, selected, match_start, and match_end. --at conflicts with --head, --follow,
+--raw, metadata output, and --highlight. Ordinary show output is unchanged.
 
 Metadata output:
   -o, --fields <FIELDS>   Output session metadata as TSV instead of transcript

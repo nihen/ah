@@ -1,3 +1,4 @@
+use super::entries::{RecordVisitor, SearchKind as K, TypedVisitor};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -158,11 +159,7 @@ impl ClaudePlugin {
 impl ClaudePlugin {
     /// Search texts of one record: its messages, then `tool_use` inputs and
     /// `tool_result` contents. Returns `false` when `visit` stops.
-    fn visit_search_texts(
-        &self,
-        val: &serde_json::Value,
-        visit: &mut dyn FnMut(&str) -> bool,
-    ) -> bool {
+    fn visit_search_texts(&self, val: &serde_json::Value, visit: &mut TypedVisitor<'_>) -> bool {
         let role = val.get("type").and_then(|v| v.as_str());
         let Some(content) = val
             .pointer("/message/content")
@@ -170,12 +167,11 @@ impl ClaudePlugin {
         else {
             return true;
         };
-        // Every text block, not only the first as in `messages_from_value`;
-        // injected context (`<...>`, `# ...`) in user records is skipped.
+        // Every text block, excluding injected user context.
         let texts_ok = match content {
             serde_json::Value::String(text) => match role {
-                Some("user") => text.starts_with('<') || visit(text),
-                Some("assistant") => visit(text),
+                Some("user") => text.starts_with('<') || visit(K::User, text),
+                Some("assistant") => visit(K::Assistant, text),
                 _ => true,
             },
             serde_json::Value::Array(items) => items.iter().all(|item| {
@@ -185,9 +181,9 @@ impl ClaudePlugin {
                 };
                 match (role, text) {
                     (Some("user"), Some(text)) => {
-                        text.starts_with('<') || text.starts_with("# ") || visit(text)
+                        text.starts_with('<') || text.starts_with("# ") || visit(K::User, text)
                     }
-                    (Some("assistant"), Some(text)) => visit(text),
+                    (Some("assistant"), Some(text)) => visit(K::Assistant, text),
                     _ => true,
                 }
             }),
@@ -203,13 +199,17 @@ impl ClaudePlugin {
             .iter()
             .all(|item| match item.get("type").and_then(|v| v.as_str()) {
                 Some("tool_use" | "server_tool_use") => {
-                    visit_tool_call(item.get("name"), item.get("input"), visit)
+                    visit_tool_call(item.get("name"), item.get("input"), &mut |text| {
+                        visit(K::ToolInput, text)
+                    })
                 }
                 // `tool_result`, and server-tool results such as
                 // `web_search_tool_result`
-                Some(kind) if kind.ends_with("tool_result") => item
-                    .get("content")
-                    .is_none_or(|content| visit_tool_output(content, visit)),
+                Some(kind) if kind.ends_with("tool_result") => {
+                    item.get("content").is_none_or(|content| {
+                        visit_tool_output(content, &mut |text| visit(K::ToolOutput, text))
+                    })
+                }
                 _ => true,
             })
     }
@@ -300,8 +300,16 @@ impl AgentPlugin for ClaudePlugin {
         });
     }
 
+    fn iter_search_records(&self, path: &Path, visit: &mut RecordVisitor<'_>) {
+        for_each_jsonl_value(path, |val| {
+            visit.record(|emit| self.visit_search_texts(val, emit))
+        });
+    }
+
     fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
-        for_each_jsonl_value(path, |val| self.visit_search_texts(val, visit));
+        for_each_jsonl_value(path, |val| {
+            self.visit_search_texts(val, &mut |_, text| visit(text))
+        });
     }
 
     /// Only `user` and `assistant` records hold search texts. A quoted
@@ -322,7 +330,9 @@ impl AgentPlugin for ClaudePlugin {
         data: &[u8],
         visit: &mut dyn FnMut(&str) -> bool,
     ) {
-        for_each_jsonl_value_bytes(data, |val| self.visit_search_texts(val, visit));
+        for_each_jsonl_value_bytes(data, |val| {
+            self.visit_search_texts(val, &mut |_, text| visit(text))
+        });
     }
 
     fn messages_from_value(&self, val: &serde_json::Value) -> Vec<Message> {

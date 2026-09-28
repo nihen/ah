@@ -38,6 +38,9 @@ fn highlight_text(text: &str, re: &regex::Regex) -> String {
 }
 
 pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
+    if let Some(at) = &args.at {
+        crate::location::Location::parse(at)?;
+    }
     let home = canonical_home();
     let explicit_session = subcmd::read_session_ref(args.session.as_deref())?;
 
@@ -105,6 +108,10 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
             }
         }
         return run_meta(&path, &home, &fields, &query, filter.search_mode());
+    }
+
+    if let Some(at) = &args.at {
+        return run_at(&path, at, args.context.unwrap_or(2) as usize, format);
     }
 
     // Validate --follow against plugin capability before displaying anything
@@ -475,4 +482,95 @@ fn run_follow(
             }
         }
     }
+}
+
+/// Navigate the same unfiltered source-record stream used by occurrence search.
+fn run_at(
+    path: &std::path::Path,
+    token: &str,
+    context: usize,
+    format: ShowFormat,
+) -> Result<(), String> {
+    use crate::agents::entries::{RecordVisitor, SearchKind};
+    let loc = crate::location::Location::parse(token)?;
+    let plugin = agents::find_plugin_for_path(path);
+    let lower = loc.record.saturating_sub(context).max(1);
+    let upper = loc.record.saturating_add(context);
+    let mut texts: Vec<(usize, usize, SearchKind, String)> = Vec::new();
+    let mut found = false;
+    let mut valid = false;
+    plugin.iter_search_records(
+        path,
+        &mut RecordVisitor::new(&mut |record, fragment, kind, text, fingerprint| {
+            if record > upper {
+                return false;
+            }
+            if record == loc.record && fragment == loc.fragment {
+                found = true;
+                valid = loc.matches(text, fingerprint);
+                if !valid {
+                    return false;
+                }
+            }
+            if record >= lower {
+                texts.push((record, fragment, kind, text.to_string()));
+            }
+            true
+        }),
+    );
+    if !found || !valid {
+        return Err(
+            "Search position is stale or does not belong to this session; run search again".into(),
+        );
+    }
+    for (record, fragment, kind, text) in texts {
+        let selected = record == loc.record && fragment == loc.fragment;
+        match format {
+            ShowFormat::Json => println!(
+                "{}",
+                serde_json::json!({
+                    "record": record, "fragment": fragment, "kind": kind, "text": text,
+                    "selected": selected,
+                    "match_start": selected.then_some(loc.start), "match_end": selected.then_some(loc.end),
+                })
+            ),
+            ShowFormat::Pretty | ShowFormat::Md => {
+                let marker = if selected { ">" } else { " " };
+                if matches!(format, ShowFormat::Md) {
+                    println!(
+                        "## {} {} ({}.{})\n",
+                        marker,
+                        kind.as_str(),
+                        record,
+                        fragment
+                    );
+                } else {
+                    println!("{} [{}] {}.{}", marker, kind.as_str(), record, fragment);
+                }
+                let safe = |s: &str| {
+                    s.split('\n')
+                        .map(crate::search_hits::display_text)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let rendered =
+                    if selected && color::use_color() && matches!(format, ShowFormat::Pretty) {
+                        format!(
+                            "{}{}{}",
+                            safe(&text[..loc.start]),
+                            color::colorize(
+                                crate::color::BOLD_YELLOW,
+                                &safe(&text[loc.start..loc.end])
+                            ),
+                            safe(&text[loc.end..])
+                        )
+                    } else {
+                        safe(&text)
+                    };
+                println!("{}\n", rendered);
+            }
+            _ => return Err("--at requires pretty, JSON or Markdown output".into()),
+        }
+    }
+    Ok(())
 }

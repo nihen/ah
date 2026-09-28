@@ -11,6 +11,8 @@ Usage:
 Options:
   --json                  One JSON object per occurrence (JSON Lines)
   --tsv                   TSV without a header (default when piped)
+  --kind <KINDS>          Comma-separated: user,assistant,tool-input,tool-output,unknown
+  -i, --interactive       Select an occurrence, preview context, then show it
   -v, --verbose           Show full log paths and match positions on TTY
   --max-matches N         Maximum occurrences across sessions/hosts (default: 100, 0 = unlimited)
   --snippet-length N      Maximum Unicode characters per snippet (default: 240, minimum: 1)
@@ -21,14 +23,17 @@ Default: session headings and compact passages with auto-pager on TTY;
 plain TSV when piped. Paths and positions are hidden on TTY unless --verbose.
 Verbose positions use "text #N" for search fragments, not transcript line numbers.
 --verbose does not change JSON or TSV output.
-TSV columns: path, agent, project, id, text_index, match_start, match_end, snippet.
-Text indices are 1-based search-fragment indices (not transcript message numbers).
+TSV columns: path, agent, project, id, text_index, match_start, match_end, snippet, kind, position.
+Text indices count nonempty source fragments before kind filtering (not transcript messages).
+Use position with `ah show SESSION --at POSITION -C 2` to open the source.
 Match offsets are 0-based UTF-8 byte offsets within the decoded search fragment.
 Empty search fragments are skipped. No matches is successful with empty output.
 
 Use PATTERN or -q, not both. Empty queries are rejected.
--p searches only user prompts. --raw-search and -i are not supported;
-use `ah log -q ... --raw-search` or `ah log -i` instead.
+-p is shorthand for --kind user (all user text parts, excluding tool results).
+-i uses fzf (or -s / $AH_SELECTOR); --no-preview disables the context preview.
+-i cannot be combined with --json or --tsv. --raw-search is not supported;
+use `ah log -q ... --raw-search` instead.
 The former `search` alias for `log` is now this command; use `log` for session lists.
 
 Examples:

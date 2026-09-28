@@ -154,6 +154,17 @@ fn build_remote_search_args(
         "--json".into(),
         "-a".into(),
     ];
+    if !search.kind.is_empty() {
+        args.push("--kind".into());
+        args.push(
+            search
+                .kind
+                .iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
     append_remote_filters(&mut args, filter);
     args.extend([
         "--search-wire".into(),
@@ -187,6 +198,12 @@ pub(crate) fn fetch_search_hits(
                     remote.name
                 ));
             }
+            crate::location::Location::parse(&hit.position).map_err(|_| {
+                format!(
+                    "Invalid search position from remote '{}'. Update ah on the remote host.",
+                    remote.name
+                )
+            })?;
             hit.path = format!("{}:{}", remote.name, hit.path);
             hits.push(hit);
         }
@@ -425,6 +442,12 @@ pub fn exec_remote_show(
     }
     if filter.raw_search {
         ah_args.push("--raw-search".to_string());
+    }
+    if let Some(at) = &args.at {
+        ah_args.push(format!("--at={at}"));
+        if let Some(context) = args.context {
+            ah_args.push(format!("--context={context}"));
+        }
     }
     if let Some(n) = args.head {
         ah_args.push("--head".to_string());

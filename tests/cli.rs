@@ -2591,6 +2591,33 @@ fn occurrence_search_reads_opencode_virtual_sessions() {
         .lines()
         .map(|s| serde_json::from_str(s).unwrap())
         .collect();
+    for hit in &hits {
+        assert!(matches!(hit["kind"].as_str(), Some("user" | "assistant")));
+        let shown = ah_opencode(&home)
+            .args([
+                "show",
+                hit["path"].as_str().unwrap(),
+                "--at",
+                hit["position"].as_str().unwrap(),
+                "-C",
+                "0",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let rows: Vec<serde_json::Value> = String::from_utf8(shown)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert!(
+            rows.iter()
+                .any(|r| r["selected"] == true && r["text"].as_str().unwrap().contains("parser"))
+        );
+    }
     assert!(!hits.is_empty());
     assert!(
         hits.iter()

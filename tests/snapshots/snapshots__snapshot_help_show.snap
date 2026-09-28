@@ -13,12 +13,20 @@ Use - as SESSION to read it from stdin explicitly. An empty SESSION is an error.
 
 Transcript output:
   --head N                Show first N messages only
+  --at <POSITION>         Open a search position, including tool input/output
+  -C, --context N         Surrounding source records with --at (default: 2, max: 1000)
   --pretty                Pretty-print with colors (default)
   --raw                   Output raw session file content
   --json                  Output normalized JSON Lines ({"role":"user","text":"..."})
   --md                    Output as Markdown (## User / ## Assistant headers)
   -f, --follow            Follow session output in real-time (like tail -f)
   --highlight <PATTERN>   Highlight matching text in pretty output (case-insensitive; requires color)
+
+With --at, context counts nonempty searchable source records (a message or tool
+event), not lines. Positions remain stable across kind filters and appends;
+changed source prefixes require a new search. JSON emits record, fragment, kind,
+text, selected, match_start, and match_end. --at conflicts with --head, --follow,
+--raw, metadata output, and --highlight. Ordinary show output is unchanged.
 
 Metadata output:
   -o, --fields <FIELDS>   Output session metadata as TSV instead of transcript
