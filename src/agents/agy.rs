@@ -1,3 +1,4 @@
+use super::entries::{RecordVisitor, SearchKind as K, TypedVisitor};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -220,6 +221,14 @@ impl AgentPlugin for AgyPlugin {
         Self::message_from_value(val).into_iter().collect()
     }
 
+    fn iter_search_records(&self, path: &Path, visit: &mut RecordVisitor<'_>) {
+        if let Some(data) = self.session_bytes(path) {
+            for_each_jsonl_value_bytes(&data, |val| {
+                visit.record(|emit| visit_search_record(val, emit))
+            });
+        }
+    }
+
     fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
         if let Some(mmap) = mmap_file(path) {
             self.iter_search_texts_from_bytes(path, &mmap, visit);
@@ -236,27 +245,7 @@ impl AgentPlugin for AgyPlugin {
         visit: &mut dyn FnMut(&str) -> bool,
     ) {
         for_each_jsonl_value_bytes(data, |val| {
-            if let Some(message) = Self::message_from_value(val) {
-                if !visit(&message.text) {
-                    return false;
-                }
-            }
-            if val.get("source").and_then(|v| v.as_str()) != Some("MODEL") {
-                return true;
-            }
-            if val.get("type").and_then(|v| v.as_str()) == Some("PLANNER_RESPONSE") {
-                return val
-                    .get("tool_calls")
-                    .and_then(|v| v.as_array())
-                    .is_none_or(|calls| {
-                        calls
-                            .iter()
-                            .all(|call| visit_tool_call(call.get("name"), call.get("args"), visit))
-                    });
-            }
-            val.get("content")
-                .and_then(|v| v.as_str())
-                .is_none_or(&mut *visit)
+            visit_search_record(val, &mut |_, text| visit(text))
         });
     }
 
@@ -283,6 +272,34 @@ impl AgentPlugin for AgyPlugin {
         let id = self.resolve_resume_id(path, home)?;
         Some(vec!["agy".to_string(), "--conversation".to_string(), id])
     }
+}
+
+fn visit_search_record(val: &serde_json::Value, visit: &mut TypedVisitor<'_>) -> bool {
+    if let Some(message) = AgyPlugin::message_from_value(val) {
+        if !visit(K::from_role(message.role), &message.text) {
+            return false;
+        }
+    }
+    if val.get("source").and_then(|v| v.as_str()) != Some("MODEL") {
+        return true;
+    }
+    if val.get("type").and_then(|v| v.as_str()) == Some("PLANNER_RESPONSE") {
+        return val
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .is_none_or(|calls| {
+                calls.iter().all(|call| {
+                    visit_tool_call(call.get("name"), call.get("args"), &mut |text| {
+                        visit(K::ToolInput, text)
+                    })
+                })
+            });
+    }
+    val.get("content")
+        .and_then(|v| v.as_str())
+        // MODEL/GENERIC records do not reliably identify a tool result.
+        // Keep them searchable, but do not infer a kind from their text.
+        .is_none_or(|text| visit(K::Unknown, text))
 }
 
 #[cfg(test)]

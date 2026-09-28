@@ -1,3 +1,4 @@
+use super::entries::{RecordVisitor, SearchKind as K, TypedVisitor};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
@@ -464,39 +465,7 @@ fn text_messages(db: &Path, id: &str) -> Result<Vec<Message>, String> {
 /// tool parts. Compaction summaries are skipped like in `message_from_parts`.
 fn search_texts_of_export(data: &[u8], visit: &mut dyn FnMut(&str) -> bool) {
     super::common::for_each_jsonl_value_bytes(data, |line| {
-        if line.pointer("/info/summary").and_then(|v| v.as_bool()) == Some(true) {
-            return true;
-        }
-        let Some(parts) = line.get("parts").and_then(|v| v.as_array()) else {
-            return true;
-        };
-        parts
-            .iter()
-            .all(|part| match part.get("type").and_then(|v| v.as_str()) {
-                Some("text") => {
-                    let injected = ["synthetic", "ignored"]
-                        .iter()
-                        .any(|key| part.get(*key).and_then(|v| v.as_bool()) == Some(true));
-                    injected
-                        || part
-                            .get("text")
-                            .and_then(|v| v.as_str())
-                            .is_none_or(&mut *visit)
-                }
-                Some("tool") => {
-                    let state = part.get("state");
-                    super::common::visit_tool_call(
-                        part.get("tool"),
-                        state.and_then(|s| s.get("input")),
-                        visit,
-                    ) && ["output", "error"].iter().all(|key| {
-                        state
-                            .and_then(|s| s.get(*key))
-                            .is_none_or(|v| super::common::visit_tool_output(v, visit))
-                    })
-                }
-                _ => true,
-            })
+        visit_search_record(line, &mut |_, text| visit(text))
     });
 }
 
@@ -667,6 +636,14 @@ impl AgentPlugin for OpencodePlugin {
         }
     }
 
+    fn iter_search_records(&self, path: &Path, visit: &mut RecordVisitor<'_>) {
+        if let Some(data) = self.session_bytes(path) {
+            super::common::for_each_jsonl_value_bytes(&data, |val| {
+                visit.record(|emit| visit_search_record(val, emit))
+            });
+        }
+    }
+
     fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
         if let Some(bytes) = self.session_bytes(path) {
             search_texts_of_export(&bytes, visit);
@@ -726,6 +703,51 @@ impl AgentPlugin for OpencodePlugin {
     fn parent_session_id(&self, path: &Path) -> Option<String> {
         session_row(path)?.parent_id.filter(|id| !id.is_empty())
     }
+}
+
+fn visit_search_record(line: &serde_json::Value, visit: &mut TypedVisitor<'_>) -> bool {
+    if line.pointer("/info/summary").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    let Some(parts) = line.get("parts").and_then(|v| v.as_array()) else {
+        return true;
+    };
+    parts
+        .iter()
+        .all(|part| match part.get("type").and_then(|v| v.as_str()) {
+            Some("text") => {
+                let injected = ["synthetic", "ignored"]
+                    .iter()
+                    .any(|key| part.get(*key).and_then(|v| v.as_bool()) == Some(true));
+                injected
+                    || part
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|text| {
+                            visit(
+                                match line.pointer("/info/role").and_then(|v| v.as_str()) {
+                                    Some("user") => K::User,
+                                    Some("assistant") => K::Assistant,
+                                    _ => K::Unknown,
+                                },
+                                text,
+                            )
+                        })
+            }
+            Some("tool") => {
+                let state = part.get("state");
+                super::common::visit_tool_call(
+                    part.get("tool"),
+                    state.and_then(|s| s.get("input")),
+                    &mut |text| visit(K::ToolInput, text),
+                ) && ["output", "error"].iter().all(|key| {
+                    state.and_then(|s| s.get(*key)).is_none_or(|v| {
+                        super::common::visit_tool_output(v, &mut |text| visit(K::ToolOutput, text))
+                    })
+                })
+            }
+            _ => true,
+        })
 }
 
 #[cfg(test)]

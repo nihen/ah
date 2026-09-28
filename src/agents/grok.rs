@@ -1,3 +1,4 @@
+use super::entries::{RecordVisitor, SearchKind as K, TypedVisitor};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -136,6 +137,14 @@ impl AgentPlugin for GrokPlugin {
         Self::message_from_value(val).into_iter().collect()
     }
 
+    fn iter_search_records(&self, path: &Path, visit: &mut RecordVisitor<'_>) {
+        if let Some(data) = self.session_bytes(path) {
+            for_each_jsonl_value_bytes(&data, |val| {
+                visit.record(|emit| visit_search_record(val, emit))
+            });
+        }
+    }
+
     fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
         if let Some(mmap) = mmap_file(path) {
             self.iter_search_texts_from_bytes(path, &mmap, visit);
@@ -151,34 +160,7 @@ impl AgentPlugin for GrokPlugin {
         visit: &mut dyn FnMut(&str) -> bool,
     ) {
         for_each_jsonl_value_bytes(data, |val| {
-            match val.get("type").and_then(|v| v.as_str()) {
-                // every `<user_query>` block, not only the first text block
-                Some("user") => val.get("content").is_none_or(|content| {
-                    visit_text_parts(content, &mut |raw| {
-                        tagged_user_body(raw, "user_query").is_none_or(&mut *visit)
-                    })
-                }),
-                Some("assistant") => {
-                    let text_ok =
-                        Self::message_from_value(val).is_none_or(|message| visit(&message.text));
-                    text_ok
-                        && val
-                            .get("tool_calls")
-                            .and_then(|v| v.as_array())
-                            .is_none_or(|calls| {
-                                calls.iter().all(|call| {
-                                    visit_tool_call(call.get("name"), call.get("arguments"), visit)
-                                })
-                            })
-                }
-                Some("tool_result") => val
-                    .get("content")
-                    .is_none_or(|v| visit_tool_output(v, visit)),
-                Some("backend_tool_call") => {
-                    val.get("kind").is_none_or(|v| visit_tool_output(v, visit))
-                }
-                _ => true,
-            }
+            visit_search_record(val, &mut |_, text| visit(text))
         });
     }
 
@@ -433,6 +415,39 @@ fn running_in(active_sessions: &Path) -> Vec<(String, Option<u32>)> {
             (!id.is_empty() && is_pid_alive(pid)).then(|| (id.to_string(), Some(pid)))
         })
         .collect()
+}
+
+fn visit_search_record(val: &serde_json::Value, visit: &mut TypedVisitor<'_>) -> bool {
+    match val.get("type").and_then(|v| v.as_str()) {
+        // every `<user_query>` block, not only the first text block
+        Some("user") => val.get("content").is_none_or(|content| {
+            visit_text_parts(content, &mut |raw| {
+                tagged_user_body(raw, "user_query").is_none_or(|text| visit(K::User, text))
+            })
+        }),
+        Some("assistant") => {
+            let text_ok = GrokPlugin::message_from_value(val)
+                .is_none_or(|message| visit(K::Assistant, &message.text));
+            text_ok
+                && val
+                    .get("tool_calls")
+                    .and_then(|v| v.as_array())
+                    .is_none_or(|calls| {
+                        calls.iter().all(|call| {
+                            visit_tool_call(call.get("name"), call.get("arguments"), &mut |text| {
+                                visit(K::ToolInput, text)
+                            })
+                        })
+                    })
+        }
+        Some("tool_result") => val
+            .get("content")
+            .is_none_or(|v| visit_tool_output(v, &mut |text| visit(K::ToolOutput, text))),
+        Some("backend_tool_call") => val
+            .get("kind")
+            .is_none_or(|v| visit_tool_output(v, &mut |text| visit(K::ToolInput, text))),
+        _ => true,
+    }
 }
 
 #[cfg(test)]

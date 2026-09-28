@@ -1,3 +1,4 @@
+use super::entries::{RecordVisitor, SearchKind as K, TypedVisitor};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -151,7 +152,7 @@ fn for_each_search_text(data: &[u8], visit: &mut dyn FnMut(&str) -> bool) {
         let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) else {
             continue;
         };
-        if !visit_search_value(&val, visit) {
+        if !visit_search_value(&val, &mut |_, text| visit(text)) {
             return;
         }
     }
@@ -212,8 +213,10 @@ fn may_hold_search_text(line: &[u8]) -> bool {
 
 /// Search texts of one rollout line: its messages, the name and input of a
 /// `*_call` item, or the output of a `*_call_output` item.
-fn visit_search_value(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bool) -> bool {
-    if !visit_message_value(val, &mut |message| visit(&message.text)) {
+fn visit_search_value(val: &serde_json::Value, visit: &mut TypedVisitor<'_>) -> bool {
+    if !visit_message_value(val, &mut |message| {
+        visit(K::from_role(message.role), &message.text)
+    }) {
         return false;
     }
     if val.get("type").and_then(|v| v.as_str()) != Some("response_item") {
@@ -224,14 +227,17 @@ fn visit_search_value(val: &serde_json::Value, visit: &mut dyn FnMut(&str) -> bo
     };
     let kind = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if kind.ends_with("_call") {
-        visit_tool_call(payload.get("name"), None, visit)
-            && ["arguments", "input", "action"]
-                .iter()
-                .all(|key| payload.get(key).is_none_or(|v| visit_all_strings(v, visit)))
+        visit_tool_call(payload.get("name"), None, &mut |text| {
+            visit(K::ToolInput, text)
+        }) && ["arguments", "input", "action"].iter().all(|key| {
+            payload
+                .get(key)
+                .is_none_or(|v| visit_all_strings(v, &mut |text| visit(K::ToolInput, text)))
+        })
     } else if kind.ends_with("_call_output") {
         payload
             .get("output")
-            .is_none_or(|v| visit_tool_output(v, visit))
+            .is_none_or(|v| visit_tool_output(v, &mut |text| visit(K::ToolOutput, text)))
     } else {
         true
     }
@@ -430,6 +436,14 @@ impl AgentPlugin for CodexPlugin {
         visit: &mut dyn FnMut(Message) -> bool,
     ) {
         for_each_message(data, visit);
+    }
+
+    fn iter_search_records(&self, path: &Path, visit: &mut RecordVisitor<'_>) {
+        if let Some(data) = mmap_file(path) {
+            super::common::for_each_jsonl_value_bytes(&data, |val| {
+                visit.record(|emit| visit_search_value(val, emit))
+            });
+        }
     }
 
     fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {

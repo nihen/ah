@@ -1,3 +1,4 @@
+use super::entries::{RecordVisitor, SearchKind as K, TypedVisitor};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -379,6 +380,14 @@ impl AgentPlugin for CursorPlugin {
         for_each_jsonl_value_bytes(data, |val| visit_message_value(val, visit));
     }
 
+    fn iter_search_records(&self, path: &Path, visit: &mut RecordVisitor<'_>) {
+        if let Some(data) = self.session_bytes(path) {
+            for_each_jsonl_value_bytes(&data, |val| {
+                visit.record(|emit| visit_search_record(val, emit))
+            });
+        }
+    }
+
     fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
         if let Some(mmap) = mmap_file(path) {
             self.iter_search_texts_from_bytes(path, &mmap, visit);
@@ -394,24 +403,7 @@ impl AgentPlugin for CursorPlugin {
         visit: &mut dyn FnMut(&str) -> bool,
     ) {
         for_each_jsonl_value_bytes(data, |val| {
-            // every text part, not only the first as in `visit_message_value`
-            let texts_ok = match (val.get("role").and_then(|v| v.as_str()), val.get("message")) {
-                (Some("user"), Some(message)) => visit_text_parts(message, &mut |raw| {
-                    cursor_user_body(raw).is_none_or(&mut *visit)
-                }),
-                (Some("assistant"), Some(message)) => visit_text_parts(message, visit),
-                _ => true,
-            };
-            texts_ok
-                && val
-                    .pointer("/message/content")
-                    .and_then(|v| v.as_array())
-                    .is_none_or(|items| {
-                        items.iter().all(|item| {
-                            item.get("type").and_then(|v| v.as_str()) != Some("tool_use")
-                                || visit_tool_call(item.get("name"), item.get("input"), visit)
-                        })
-                    })
+            visit_search_record(val, &mut |_, text| visit(text))
         });
     }
 
@@ -447,6 +439,31 @@ impl AgentPlugin for CursorPlugin {
         let id = self.resolve_resume_id(path, home)?;
         Some(vec!["cursor-agent".to_string(), "--resume".to_string(), id])
     }
+}
+
+fn visit_search_record(val: &serde_json::Value, visit: &mut TypedVisitor<'_>) -> bool {
+    // every text part, not only the first as in `visit_message_value`
+    let texts_ok = match (val.get("role").and_then(|v| v.as_str()), val.get("message")) {
+        (Some("user"), Some(message)) => visit_text_parts(message, &mut |raw| {
+            cursor_user_body(raw).is_none_or(|text| visit(K::User, text))
+        }),
+        (Some("assistant"), Some(message)) => {
+            visit_text_parts(message, &mut |text| visit(K::Assistant, text))
+        }
+        _ => true,
+    };
+    texts_ok
+        && val
+            .pointer("/message/content")
+            .and_then(|v| v.as_array())
+            .is_none_or(|items| {
+                items.iter().all(|item| {
+                    item.get("type").and_then(|v| v.as_str()) != Some("tool_use")
+                        || visit_tool_call(item.get("name"), item.get("input"), &mut |text| {
+                            visit(K::ToolInput, text)
+                        })
+                })
+            })
 }
 
 #[cfg(test)]

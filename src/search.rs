@@ -770,6 +770,34 @@ mod tests {
         let mut count = 0;
         for (agent, path) in fixture_sessions(tmp.path()) {
             let plugin = find_plugin(agent).unwrap();
+            let mut old = Vec::new();
+            plugin.iter_search_texts(&path, &mut |text| {
+                if !text.is_empty() {
+                    old.push(text.to_string());
+                }
+                true
+            });
+            let mut typed = Vec::new();
+            let mut previous = (0, 0);
+            plugin.iter_search_records(
+                &path,
+                &mut crate::agents::entries::RecordVisitor::new(
+                    &mut |record, fragment, kind, text, _fingerprint| {
+                        assert!(
+                            record > previous.0
+                                || (record == previous.0 && fragment == previous.1 + 1)
+                        );
+                        assert!(
+                            kind != crate::agents::entries::SearchKind::Unknown || agent == "agy",
+                            "{agent}: {text}"
+                        );
+                        previous = (record, fragment);
+                        typed.push(text.to_string());
+                        true
+                    },
+                ),
+            );
+            assert_eq!(old, typed, "typed extraction drift: {agent}");
             for query in [
                 "auth",
                 "redis",
@@ -780,13 +808,14 @@ mod tests {
                 let pattern = Regex::new(&format!("(?i){query}")).unwrap();
                 let first = search_texts(&path, plugin, &pattern, None);
                 let mut occurrences = Vec::new();
-                crate::search_hits::visit_occurrences(
+                crate::search_hits::visit_typed_occurrences(
                     &path,
                     plugin,
                     &pattern,
-                    false,
+                    &[],
                     usize::MAX,
-                    &mut |index, start, end, text| {
+                    &mut |index, _kind, loc, text| {
+                        let (start, end) = (loc.start, loc.end);
                         assert!(index > 0);
                         occurrences.push(extract_match_context(text, start, end, 30));
                     },

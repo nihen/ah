@@ -1,3 +1,4 @@
+use super::entries::{RecordVisitor, SearchKind as K, TypedVisitor};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -316,6 +317,14 @@ impl AgentPlugin for CopilotPlugin {
 
     /// Messages plus tool calls (`tool.execution_start`: tool name and
     /// arguments) and tool results (`tool.execution_complete`).
+    fn iter_search_records(&self, path: &Path, visit: &mut RecordVisitor<'_>) {
+        if let Some(data) = self.session_bytes(path) {
+            for_each_jsonl_value_bytes(&data, |val| {
+                visit.record(|emit| visit_search_record(val, emit))
+            });
+        }
+    }
+
     fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
         if let Some(bytes) = self.session_bytes(path) {
             self.iter_search_texts_from_bytes(path, &bytes, visit);
@@ -330,20 +339,7 @@ impl AgentPlugin for CopilotPlugin {
         visit: &mut dyn FnMut(&str) -> bool,
     ) {
         for_each_jsonl_value_bytes(data, |val| {
-            let data = val.get("data");
-            match val.get("type").and_then(|v| v.as_str()) {
-                Some("user.message" | "assistant.message") => data
-                    .and_then(|d| d.get("content"))
-                    .and_then(|v| v.as_str())
-                    .filter(|text| !text.trim().is_empty())
-                    .is_none_or(&mut *visit),
-                Some("tool.execution_start") => data
-                    .is_none_or(|d| visit_tool_call(d.get("toolName"), d.get("arguments"), visit)),
-                Some("tool.execution_complete") => data
-                    .and_then(|d| d.get("result"))
-                    .is_none_or(|v| visit_tool_output(v, visit)),
-                _ => true,
-            }
+            visit_search_record(val, &mut |_, text| visit(text))
         });
     }
 
@@ -461,6 +457,35 @@ fn running_in(
         }
     }
     out
+}
+
+fn visit_search_record(val: &serde_json::Value, visit: &mut TypedVisitor<'_>) -> bool {
+    let data = val.get("data");
+    match val.get("type").and_then(|v| v.as_str()) {
+        Some("user.message" | "assistant.message") => data
+            .and_then(|d| d.get("content"))
+            .and_then(|v| v.as_str())
+            .filter(|text| !text.trim().is_empty())
+            .is_none_or(|text| {
+                visit(
+                    if val.get("type").and_then(|v| v.as_str()) == Some("user.message") {
+                        K::User
+                    } else {
+                        K::Assistant
+                    },
+                    text,
+                )
+            }),
+        Some("tool.execution_start") => data.is_none_or(|d| {
+            visit_tool_call(d.get("toolName"), d.get("arguments"), &mut |text| {
+                visit(K::ToolInput, text)
+            })
+        }),
+        Some("tool.execution_complete") => data
+            .and_then(|d| d.get("result"))
+            .is_none_or(|v| visit_tool_output(v, &mut |text| visit(K::ToolOutput, text))),
+        _ => true,
+    }
 }
 
 #[cfg(test)]

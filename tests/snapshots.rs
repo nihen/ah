@@ -69,3 +69,16 @@ fn snapshot_readme() {
         .expect("README.md should exist");
     insta::assert_snapshot!(readme);
 }
+
+#[test]
+fn readme_search_and_show_help_match_cli() {
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+        .expect("README.md should exist");
+    for command in ["search", "show"] {
+        let heading = format!("### `ah {command} --help`");
+        let section = readme.split_once(&heading).expect("help section").1;
+        let fenced = section.split_once("\n```\n").expect("help fence").1;
+        let documented = fenced.split_once("\n```").expect("closing fence").0;
+        assert_eq!(documented, help_output(&[command, "--help"]).trim_end());
+    }
+}

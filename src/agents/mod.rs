@@ -4,6 +4,7 @@ mod codex;
 pub(crate) mod common;
 mod copilot;
 mod cursor;
+pub(crate) mod entries;
 mod gemini;
 mod grok;
 mod opencode;
@@ -178,6 +179,13 @@ pub trait AgentPlugin: Sync {
     /// lines that may match.
     fn prompts_per_jsonl_line(&self) -> bool {
         false
+    }
+
+    /// Searchable source records with structural kind and stable traversal order.
+    fn iter_search_records(&self, path: &Path, visit: &mut entries::RecordVisitor<'_>) {
+        self.iter_search_texts(path, &mut |text| {
+            visit.record(|emit| emit(entries::SearchKind::Unknown, text))
+        });
     }
 
     /// Text searched by the default full-text query: every message from

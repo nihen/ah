@@ -5,9 +5,11 @@ use std::io::IsTerminal;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::agents::{self, AgentPlugin, MessageRole};
+use crate::agents::entries::{RecordVisitor, SearchKind};
+use crate::agents::{self, AgentPlugin};
 use crate::cli::{Field, FilterArgs, MatchSearchArgs, SortOrder};
 use crate::color::{self, BOLD, BOLD_YELLOW, CYAN, DIM};
+use crate::location::Location;
 use crate::output::escape_tsv_lossless;
 use crate::pipeline::{self, PipelineParams};
 use crate::resolver::ResolveOpts;
@@ -24,6 +26,8 @@ pub(crate) struct SearchHit {
     pub match_start: usize,
     pub match_end: usize,
     pub snippet: String,
+    pub kind: SearchKind,
+    pub position: String,
     // Private SSH transport metadata, omitted from ordinary JSON/TSV output.
     // Keep the original occurrence, rather than re-matching a truncated snippet
     // (which would break anchors, long matches and repeated words).
@@ -31,7 +35,25 @@ pub(crate) struct SearchHit {
     pub snippet_match: Option<[usize; 2]>,
 }
 
-pub fn run(args: MatchSearchArgs, mut filter: FilterArgs) -> Result<(), String> {
+pub fn run(
+    args: MatchSearchArgs,
+    mut filter: FilterArgs,
+    ia: &crate::cli::InteractiveArgs,
+) -> Result<(), String> {
+    if ia.interactive && (args.json || args.tsv || args.search_wire) {
+        return Err("search -i cannot be combined with --json or --tsv".into());
+    }
+    if filter.prompt_only && args.kind.iter().any(|kind| *kind != SearchKind::User) {
+        return Err("-p selects user text; do not combine it with other --kind values".into());
+    }
+    let kinds = if filter.prompt_only {
+        vec![SearchKind::User]
+    } else {
+        args.kind.clone()
+    };
+    // Prompt search now uses the same source fragments/positions as all-kind
+    // search. Prefilter with the superset, not the legacy first-prompt reader.
+    filter.prompt_only = false;
     if filter.raw_search {
         return Err(
             "search does not support --raw-search; use `ah log -q ... --raw-search` instead."
@@ -92,13 +114,14 @@ pub fn run(args: MatchSearchArgs, mut filter: FilterArgs) -> Result<(), String> 
             break;
         }
         let plugin = agents::find_plugin_for_path(&session.path);
-        visit_occurrences(
+        visit_typed_occurrences(
             &session.path,
             plugin,
             &pattern,
-            filter.prompt_only,
+            &kinds,
             remaining,
-            &mut |index, start, end, text| {
+            &mut |index, kind, loc, text| {
+                let (start, end) = (loc.start, loc.end);
                 let field = |f| session.fields.get(&f).cloned().unwrap_or_default();
                 let (snippet, snippet_match) =
                     snippet(text, start, end, args.snippet_length as usize);
@@ -113,11 +136,15 @@ pub fn run(args: MatchSearchArgs, mut filter: FilterArgs) -> Result<(), String> 
                     match_start: start,
                     match_end: end,
                     snippet,
+                    kind,
+                    position: loc.to_string(),
                     snippet_match,
                 });
             },
         );
     }
+    let mut args = args;
+    args.kind = kinds;
     hits.extend(crate::remote::fetch_search_hits(&args, &filter)?);
     // Stable sorting preserves source order inside each session. Paths also
     // distinguish sessions with equal ids on different hosts.
@@ -131,47 +158,51 @@ pub fn run(args: MatchSearchArgs, mut filter: FilterArgs) -> Result<(), String> 
     if args.max_matches != 0 {
         hits.truncate(args.max_matches);
     }
+    if ia.interactive {
+        return crate::fuzzy::run_search_hits(&hits, ia, &filter);
+    }
     print_hits(&hits, &args);
     Ok(())
 }
 
-/// Visit occurrences without collecting a transcript or a list of matches. Indices
-/// refer to the plugin's search fragments in the selected mode; they are not
-/// persistent message ids and cannot be used as `show --head` positions.
-pub(crate) fn visit_occurrences(
+type OccurrenceVisitor<'a> = dyn FnMut(usize, SearchKind, &Location, &str) + 'a;
+
+pub(crate) fn visit_typed_occurrences(
     path: &std::path::Path,
     plugin: &dyn AgentPlugin,
     pattern: &Regex,
-    prompt_only: bool,
+    kinds: &[SearchKind],
     limit: usize,
-    visit: &mut dyn FnMut(usize, usize, usize, &str),
+    visit: &mut OccurrenceVisitor<'_>,
 ) {
     let mut index = 0;
     let mut count = 0;
-    let mut text_visitor = |text: &str| {
-        index += 1;
-        if text.is_empty() {
-            return true;
-        }
-        for m in pattern.find_iter(text) {
-            if count >= limit {
-                return false;
+    plugin.iter_search_records(
+        path,
+        &mut RecordVisitor::new(&mut |record, fragment, kind, text, fingerprint| {
+            index += 1;
+            if !kinds.is_empty() && !kinds.contains(&kind) {
+                return true;
             }
-            visit(index, m.start(), m.end(), text);
-            count += 1;
-            if count >= limit {
-                return false;
+            let mut location: Option<Location> = None;
+            for m in pattern.find_iter(text) {
+                if count >= limit {
+                    return false;
+                }
+                let loc = location.get_or_insert_with(|| {
+                    Location::new(record, fragment, m.start(), m.end(), fingerprint)
+                });
+                loc.start = m.start();
+                loc.end = m.end();
+                visit(index, kind, loc, text);
+                count += 1;
+                if count >= limit {
+                    return false;
+                }
             }
-        }
-        true
-    };
-    if prompt_only {
-        plugin.iter_messages(path, &mut |message| {
-            message.role != MessageRole::User || text_visitor(&message.text)
-        });
-    } else {
-        plugin.iter_search_texts(path, &mut text_visitor);
-    }
+            true
+        }),
+    );
 }
 
 /// Bounded even when the regex itself matches megabytes. UTF-8 boundaries are
@@ -259,7 +290,9 @@ fn print_hits(hits: &[SearchHit], args: &MatchSearchArgs) {
                     hit.text_index.to_string(),
                     hit.match_start.to_string(),
                     hit.match_end.to_string(),
-                    hit.snippet.clone()
+                    hit.snippet.clone(),
+                    hit.kind.as_str().to_string(),
+                    hit.position.clone()
                 ]
                 .iter()
                 .map(|v| escape_tsv_lossless(v))
@@ -318,9 +351,13 @@ fn pretty_hit(hit: &SearchHit, new_session: bool, colored: bool, verbose: bool) 
         )
         .unwrap();
     }
+    if verbose {
+        writeln!(out, "  {}", style(DIM, &format!("at {}", hit.position))).unwrap();
+    }
     writeln!(
         out,
-        "    {}",
+        "    {:<11} {}",
+        hit.kind.as_str(),
         highlighted_snippet(&hit.snippet, hit.snippet_match, colored)
     )
     .unwrap();
@@ -351,7 +388,7 @@ fn highlighted_snippet(text: &str, span: Option<[usize; 2]>, colored: bool) -> S
 
 // Session content is untrusted terminal input. Do not execute embedded escape
 // sequences or allow newlines to masquerade as another result/header.
-fn display_text(s: &str) -> String {
+pub(crate) fn display_text(s: &str) -> String {
     s.chars()
         .flat_map(|c| {
             if c.is_control() {
@@ -422,29 +459,32 @@ mod tests {
         let value = serde_json::json!({"path":"/tmp/a", "agent":"claude", "project":"app",
             "id":"one", "modified_at":"2026-09-28 12:00", "title":"Find auth",
             "text_index":1, "match_start":0, "match_end":6, "snippet":"needle",
-            "_snippet_match":[0,6]});
+            "kind":"user", "position":"test-position", "_snippet_match":[0,6]});
         let hit: SearchHit = serde_json::from_value(value).unwrap();
         let colored = pretty_hit(&hit, true, true, false);
         assert!(colored.contains(&format!("{BOLD}{CYAN}session one")));
         assert!(colored.contains(&format!("{DIM}2026-09-28")));
         assert!(!colored.contains("bytes"));
         assert!(!colored.contains("/tmp/a"));
-        assert!(colored.contains(&format!("\n    {BOLD_YELLOW}needle")));
+        assert!(colored.contains(&format!("\n    user        {BOLD_YELLOW}needle")));
         let plain = pretty_hit(&hit, true, false, false);
         assert!(!plain.contains('\x1b'));
         assert!(plain.starts_with("session one  [claude] app\n"));
         assert!(!plain.contains('·'));
-        assert!(plain.contains("\n\n    needle\n"));
+        assert!(plain.contains("\n\n    user        needle\n"));
         let verbose = pretty_hit(&hit, true, false, true);
         assert!(verbose.contains("/tmp/a"));
         assert!(!verbose.contains('·'));
-        assert!(verbose.contains("\n  text #1  bytes 0..6\n    needle\n"));
+        assert!(
+            verbose
+                .contains("\n  text #1  bytes 0..6\n  at test-position\n    user        needle\n")
+        );
         let styled_verbose = pretty_hit(&hit, true, true, true);
         assert!(styled_verbose.contains(&format!("{DIM}text #1  bytes 0..6")));
         assert!(!pretty_hit(&hit, false, true, false).contains("session one"));
         let public = serde_json::to_value(&hit).unwrap();
         assert!(public.get("_snippet_match").is_none());
-        assert_eq!(public.as_object().unwrap().len(), 10);
+        assert_eq!(public.as_object().unwrap().len(), 12);
     }
 
     #[test]

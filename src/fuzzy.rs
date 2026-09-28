@@ -663,7 +663,9 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
         return print_session_fields(&path_str, fields, &query, filter.search_mode());
     }
 
-    let show_args = ShowArgs::with_session(args.head, Some(path_str), args.highlight.clone());
+    let mut show_args = ShowArgs::with_session(args.head, Some(path_str), args.highlight.clone());
+    show_args.at = args.at.clone();
+    show_args.context = args.context;
     crate::show::run(show_args, filter)
 }
 
@@ -1112,6 +1114,76 @@ fn run_selector(selector: &str, args: &[String], input: &str) -> Result<Option<S
     }
 
     Ok(Some(line))
+}
+
+/// Occurrence picker. Only a numeric row index is trusted on selection; preview
+/// fields are losslessly encoded, shell-quoted by fzf/sk, and never eval'd.
+pub fn run_search_hits(
+    hits: &[crate::search_hits::SearchHit],
+    ia: &InteractiveArgs,
+    filter: &FilterArgs,
+) -> Result<(), String> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let selector = resolve_selector(ia);
+    let input = hits
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            format!(
+                "{}\t{}\t{}\t[{}] {}  {}  {}\n",
+                output::escape_tsv_lossless(&h.path),
+                h.position,
+                i,
+                crate::search_hits::display_text(&h.agent),
+                crate::search_hits::display_text(&h.title),
+                h.kind.as_str(),
+                crate::search_hits::display_text(&h.snippet)
+            )
+        })
+        .collect::<String>();
+    let mut options = vec![
+        "--no-sort".into(),
+        "--delimiter=\t".into(),
+        "--with-nth=4..".into(),
+    ];
+    if use_preview(ia, &selector) {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let color = if crate::color::use_color() {
+            "--color"
+        } else {
+            "--no-color"
+        };
+        let script = format!(
+            "p=$(printf '%bx' \"$1\"); p=${{p%x}}; {} show --no-pager {} --at=\"$2\" -C 2 -- \"$p\"",
+            shell_quote(&exe.to_string_lossy()),
+            color
+        );
+        options.push(format!(
+            "--preview=sh -c {} sh {{1}} {{2}}",
+            shell_quote(&script)
+        ));
+        options.push("--preview-window=right:60%:wrap".into());
+    }
+    let Some(selected) = run_selector(&selector, &options, &input)? else {
+        return Ok(());
+    };
+    let index: usize = selected
+        .split('\t')
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .ok_or("Invalid search selection")?;
+    let hit = hits.get(index).ok_or("Invalid search selection")?;
+    let mut args = ShowArgs::with_session(None, Some(hit.path.clone()), None);
+    args.at = Some(hit.position.clone());
+    args.context = Some(2);
+    let _pager = if filter.no_pager {
+        None
+    } else {
+        crate::pager::setup(false)
+    };
+    crate::show::run(args, filter)
 }
 
 #[cfg(test)]

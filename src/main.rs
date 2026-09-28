@@ -4,6 +4,7 @@ mod collector;
 mod color;
 mod config;
 mod fuzzy;
+mod location;
 mod man;
 mod memory;
 mod output;
@@ -110,11 +111,7 @@ fn main() {
 
     match cli.command {
         Commands::Search(args) => {
-            if ia.interactive {
-                eprintln!("Error: search does not support -i; use `ah log -i` instead.");
-                process::exit(1);
-            }
-            if let Err(e) = search_hits::run(args, filter) {
+            if let Err(e) = search_hits::run(args, filter, &ia) {
                 eprintln!("{}", e);
                 process::exit(1);
             }
