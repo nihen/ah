@@ -342,6 +342,7 @@ pub fn process_start_ticks(pid: u32) -> Option<u64> {
 /// Extract field 22 (starttime) from a `/proc/<pid>/stat` line. The command
 /// name (field 2) may contain spaces and parentheses, so fields are counted
 /// from the last `)`.
+#[cfg(any(target_os = "linux", test))]
 fn parse_stat_start_ticks(stat: &str) -> Option<u64> {
     let rest = &stat[stat.rfind(')')? + 1..];
     rest.split_whitespace().nth(19)?.parse().ok()
@@ -392,6 +393,7 @@ pub fn file_lock_holders() -> std::collections::HashMap<(u64, u64, u64), u32> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_locks(text: &str) -> std::collections::HashMap<(u64, u64, u64), u32> {
     let mut map = std::collections::HashMap::new();
     for line in text.lines() {
