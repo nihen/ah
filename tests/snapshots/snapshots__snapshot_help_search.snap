@@ -1,0 +1,58 @@
+---
+source: tests/snapshots.rs
+expression: "help_output(&[\"search\", \"--help\"])"
+---
+Show matching passages from conversations and tool input/output
+
+Usage:
+  ah search [OPTIONS] <PATTERN>
+  ah search [OPTIONS] -q <REGEX>
+
+Options:
+  --json                  One JSON object per occurrence (JSON Lines)
+  --tsv                   TSV without a header (default when piped)
+  -v, --verbose           Show full log paths and match positions on TTY
+  --max-matches N         Maximum occurrences across sessions/hosts (default: 100, 0 = unlimited)
+  --snippet-length N      Maximum Unicode characters per snippet (default: 240, minimum: 1)
+
+One result per non-overlapping regex occurrence, not per session.
+Sessions are ordered by modified_at descending; occurrences are in source order.
+Default: session headings and compact passages with auto-pager on TTY;
+plain TSV when piped. Paths and positions are hidden on TTY unless --verbose.
+Verbose positions use "text #N" for search fragments, not transcript line numbers.
+--verbose does not change JSON or TSV output.
+TSV columns: path, agent, project, id, text_index, match_start, match_end, snippet.
+Text indices are 1-based search-fragment indices (not transcript message numbers).
+Match offsets are 0-based UTF-8 byte offsets within the decoded search fragment.
+Empty search fragments are skipped. No matches is successful with empty output.
+
+Use PATTERN or -q, not both. Empty queries are rejected.
+-p searches only user prompts. --raw-search and -i are not supported;
+use `ah log -q ... --raw-search` or `ah log -i` instead.
+The former `search` alias for `log` is now this command; use `log` for session lists.
+
+Examples:
+  ah search 'OAuth'              # matching passages in the current directory
+  ah search 'OAuth' -a --json    # occurrences across all directories
+  ah search -p '認証'             # user prompts only
+
+Global options:
+  -a, --all               Show all sessions (disable default cwd filtering)
+  -A                      Show all sessions including all configured remotes
+  --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
+  --project <NAME>        Filter by project name
+  -d, --dir <PATH>        Filter by working directory (default: current directory)
+  -q, --query <REGEX>     Search messages and tool input/output (regex, case-insensitive)
+  -p, --prompt-only       Search only user prompts (use with -q)
+  --raw-search            Search raw session files incl. metadata (use with -q)
+  -n, --limit N           Max session files to scan (default: 0, no limit)
+  --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok)
+  --no-archived           Hide sessions the agent has archived (Codex)
+  --subagents             Include subagent sessions (spawned by another session)
+  --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
+  --color                 Force colored output (even through pipes)
+  --no-color              Disable colored output
+  --no-pager              Disable automatic pager
+  --debug                 Show debug info (glob expansion, scan counts, timing) on stderr

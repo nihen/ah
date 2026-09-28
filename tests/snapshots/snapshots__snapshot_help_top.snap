@@ -12,6 +12,7 @@ Usage:
 
 Commands:
   log                 List sessions
+  search              Show matching passages
   project             List known projects
   show                Show session transcript
   resume              Resume an agent session

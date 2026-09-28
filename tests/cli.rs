@@ -141,11 +141,11 @@ fn list_agents_tsv() {
 // ─── Aliases ───────────────────────────────────────────────────────
 
 #[test]
-fn alias_search_help() {
+fn search_help_is_not_log_alias() {
     ah().args(["search", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("List sessions"));
+        .stdout(predicate::str::contains("Show matching passages"));
 }
 
 #[test]
@@ -2573,4 +2573,27 @@ fn default_search_covers_tool_io_and_raw_search_covers_metadata() {
         .args(["log", "-a", "-p", "--raw-search", "-q", "x"])
         .assert()
         .failure();
+}
+
+#[test]
+fn occurrence_search_reads_opencode_virtual_sessions() {
+    let tmp = opencode_home();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let output = ah_opencode(&home)
+        .args(["search", "parser", "-a", "--json", "--max-matches", "0"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let hits: Vec<serde_json::Value> = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert!(!hits.is_empty());
+    assert!(
+        hits.iter()
+            .all(|h| h["agent"] == "opencode" && h["id"] == "ses_oc1")
+    );
 }

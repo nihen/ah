@@ -9,6 +9,10 @@ use crate::cli::Cli;
 /// Example entry: (command, description)
 pub const EXAMPLES: &[(&str, &str)] = &[
     ("ah log", "List sessions for the current directory"),
+    (
+        "ah search \"auth\"",
+        "Show matching passages in the current directory",
+    ),
     ("ah log -a -q \"auth\"", "Search across all sessions"),
     ("ah log -a --since 3d", "Sessions from the last 3 days"),
     (
@@ -228,6 +232,7 @@ fn render_see_also(w: &mut dyn Write) -> Result<(), std::io::Error> {
 
     let subcmds = [
         "ah-log",
+        "ah-search",
         "ah-show",
         "ah-resume",
         "ah-project",

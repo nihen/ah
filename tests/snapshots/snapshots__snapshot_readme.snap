@@ -65,6 +65,76 @@ cursor  my-webapp    2026-03-23 14:22  fix memory leak in worker pool        ...
 codex   api-server   2026-03-22 11:30  add Redis caching layer              ...cache OAuth tokens with 1h TTL... sess_7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b
 ```
 
+Find the actual passages instead of just the sessions:
+
+```bash
+ah search 'OAuth'                 # every occurrence in the current directory
+ah search 'OAuth' -a --json       # JSON Lines across all directories
+ah search '認証' -p                # user prompts only
+ah search 'error' --max-matches 20
+ah search 'OAuth' --verbose       # full log paths and match positions on TTY
+```
+
+`log -q` returns one row per session with its first matching excerpt.
+`search` returns one row per **non-overlapping regex occurrence**, including
+multiple occurrences in a single message and matches in tool input/output.
+It uses the same case-insensitive regex and content extraction as `log -q`.
+No index or external search service is required.
+
+On a terminal, passages are grouped by session with an automatic pager.
+Like `rg --heading` or `git grep --heading --break`, the default display puts
+one heading above each group of passages and a blank line between sessions.
+Session headings are cyan and bold, titles are bold, and dates are dim.
+Each passage appears on its own indented line, with the current occurrence
+highlighted in bold yellow. Full log paths and position labels are omitted by
+default so the passages stay compact. Remote session headings keep a
+`remote:NAME` label to distinguish hosts.
+
+Use `-v` / `--verbose` to show the full log path and a dim position line before
+each passage. Positions are labeled `text #N  bytes START..END`: `text #N`
+is a search-fragment index, **not a transcript line number**. Verbose output
+also separates passages with blank lines. This flag only affects terminal
+output; JSON/TSV retain all their existing fields and formatting.
+
+If a match is clipped by the snippet limit, only its visible portion is
+highlighted. `--no-color` and
+`NO_COLOR` disable styling; `NO_COLOR` takes precedence over `--color`, as with
+other commands. JSON/TSV output never receives display colors.
+Piped output is TSV without a header, with these columns:
+`path, agent, project, id, text_index, match_start, match_end, snippet`.
+Tabs, newlines, carriage returns, and backslashes are escaped as `\t`, `\n`,
+`\r`, and `\\`. JSON Lines contains the same fields plus `modified_at` and
+`title`, with numbers represented as JSON numbers.
+
+- `text_index` is a **1-based search-fragment index** within the selected search
+  mode, not a transcript message number. One tool call can yield several
+  fragments; prompt-only mode counts only user prompts. Empty fragments are
+  counted for indexing but never matched. These indices are not persistent IDs.
+- `match_start` / `match_end` are **0-based UTF-8 byte offsets**, with an exclusive
+  end, in the decoded fragment (not the snippet or raw file).
+- Snippets contain at most `--snippet-length` Unicode characters (default 240),
+  including ellipses. Even a match longer than the limit is truncated; offsets
+  still describe the full match.
+- Sessions sort by `modified_at` descending, then path ascending for ties.
+  Occurrences within a session follow source order. This is not relevance order
+  or individual-message timestamp order.
+- `--max-matches` caps occurrences across all sessions and hosts (default 100;
+  `0` means unlimited). `-n` still limits session files scanned, **not results**.
+  The cap does not guarantee fewer files scanned; the existing session pipeline
+  first finds candidates, then search enumerates their occurrences.
+- `-a`, `-d`, `--agent`, `--project`, `--since`, `--until`, `--running`,
+  `--no-archived`, and `--subagents` retain their existing filtering semantics.
+  `--remote` / `-A` run search on the remote host, which also needs this version
+  of `ah`. Remote failures are errors, not silently incomplete results.
+- Supply either a positional pattern or `-q`, not both. Empty queries and invalid
+  regexes are errors; no matches is success with empty output.
+- This first version does not label speakers/tool kinds or show surrounding
+  messages. Use the result's path with `ah show` to read the complete transcript.
+  `-i` and `--raw-search` remain available through `log`, not `search`.
+
+**Compatibility:** `search` used to be a hidden alias for `log`. For the old
+session-list output and its field-selection options, use `ah log` explicitly.
+
 Show a session transcript:
 
 ```console
@@ -224,6 +294,7 @@ Usage:
 
 Commands:
   log                 List sessions
+  search              Show matching passages
   project             List known projects
   show                Show session transcript
   resume              Resume an agent session
@@ -311,6 +382,65 @@ Interactive mode:
   --no-preview            Disable transcript preview (enabled by default for fzf, sk)
 
 Global options are also available (see ah -h).
+```
+
+### `ah search --help`
+
+```
+Show matching passages from conversations and tool input/output
+
+Usage:
+  ah search [OPTIONS] <PATTERN>
+  ah search [OPTIONS] -q <REGEX>
+
+Options:
+  --json                  One JSON object per occurrence (JSON Lines)
+  --tsv                   TSV without a header (default when piped)
+  -v, --verbose           Show full log paths and match positions on TTY
+  --max-matches N         Maximum occurrences across sessions/hosts (default: 100, 0 = unlimited)
+  --snippet-length N      Maximum Unicode characters per snippet (default: 240, minimum: 1)
+
+One result per non-overlapping regex occurrence, not per session.
+Sessions are ordered by modified_at descending; occurrences are in source order.
+Default: session headings and compact passages with auto-pager on TTY;
+plain TSV when piped. Paths and positions are hidden on TTY unless --verbose.
+Verbose positions use "text #N" for search fragments, not transcript line numbers.
+--verbose does not change JSON or TSV output.
+TSV columns: path, agent, project, id, text_index, match_start, match_end, snippet.
+Text indices are 1-based search-fragment indices (not transcript message numbers).
+Match offsets are 0-based UTF-8 byte offsets within the decoded search fragment.
+Empty search fragments are skipped. No matches is successful with empty output.
+
+Use PATTERN or -q, not both. Empty queries are rejected.
+-p searches only user prompts. --raw-search and -i are not supported;
+use `ah log -q ... --raw-search` or `ah log -i` instead.
+The former `search` alias for `log` is now this command; use `log` for session lists.
+
+Examples:
+  ah search 'OAuth'              # matching passages in the current directory
+  ah search 'OAuth' -a --json    # occurrences across all directories
+  ah search -p '認証'             # user prompts only
+
+Global options:
+  -a, --all               Show all sessions (disable default cwd filtering)
+  -A                      Show all sessions including all configured remotes
+  --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
+  --project <NAME>        Filter by project name
+  -d, --dir <PATH>        Filter by working directory (default: current directory)
+  -q, --query <REGEX>     Search messages and tool input/output (regex, case-insensitive)
+  -p, --prompt-only       Search only user prompts (use with -q)
+  --raw-search            Search raw session files incl. metadata (use with -q)
+  -n, --limit N           Max session files to scan (default: 0, no limit)
+  --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
+  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok)
+  --no-archived           Hide sessions the agent has archived (Codex)
+  --subagents             Include subagent sessions (spawned by another session)
+  --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
+  --color                 Force colored output (even through pipes)
+  --no-color              Disable colored output
+  --no-pager              Disable automatic pager
+  --debug                 Show debug info (glob expansion, scan counts, timing) on stderr
 ```
 
 ### `ah show --help`

@@ -14,6 +14,7 @@ mod remote;
 mod resolver;
 mod resume;
 mod search;
+mod search_hits;
 mod session;
 mod show;
 mod subcmd;
@@ -95,6 +96,7 @@ fn main() {
     let _pager = if !filter.no_pager && !ia.interactive {
         match &cli.command {
             Commands::Log(args) if args.wants_pager() => pager::setup(false),
+            Commands::Search(args) if !args.json && !args.tsv => pager::setup(false),
             Commands::Show(args) if args.wants_pager() => pager::setup(false),
             Commands::Project(args) if args.wants_pager() => pager::setup(false),
             Commands::Memory(args) if args.wants_pager() => pager::setup(false),
@@ -107,6 +109,16 @@ fn main() {
     };
 
     match cli.command {
+        Commands::Search(args) => {
+            if ia.interactive {
+                eprintln!("Error: search does not support -i; use `ah log -i` instead.");
+                process::exit(1);
+            }
+            if let Err(e) = search_hits::run(args, filter) {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
         Commands::Log(search_args) => {
             if search_args.field_list {
                 print_field_list(
