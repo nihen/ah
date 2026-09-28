@@ -5,6 +5,11 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
+fn test_tempdir() -> TempDir {
+    // macOS exposes /var through /private/var; cwd uses the physical path.
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+}
+
 fn ah(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ah").unwrap();
     cmd.env("HOME", home).current_dir(home);
@@ -38,7 +43,7 @@ fn write_session(home: &Path, id: &str, cwd: &Path, texts: &[Value]) -> String {
 }
 
 fn fixture() -> TempDir {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = test_tempdir();
     write_session(
         tmp.path(),
         "one",
@@ -150,7 +155,7 @@ fn search_limits_occurrences_and_snippet_size() {
 
 #[test]
 fn search_zero_width_is_bounded_and_skips_empty_fragments() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = test_tempdir();
     write_session(
         tmp.path(),
         "one",
@@ -210,7 +215,7 @@ fn search_filters_and_session_order() {
 
 #[test]
 fn search_rejects_invalid_and_unsupported_options() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = test_tempdir();
     for args in [
         vec![],
         vec![""],
@@ -243,7 +248,7 @@ fn search_rejects_invalid_and_unsupported_options() {
 
 #[test]
 fn search_tsv_escapes_multiline_text_and_backslashes() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = test_tempdir();
     write_session(
         tmp.path(),
         "one",
@@ -268,7 +273,7 @@ fn search_tsv_escapes_multiline_text_and_backslashes() {
 
 #[test]
 fn search_empty_home_is_success() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = test_tempdir();
     assert!(search(tmp.path(), &["needle", "-a"]).is_empty());
 }
 
@@ -367,7 +372,7 @@ fn search_remote_runs_on_host_and_merges_with_global_limit() {
 
 #[test]
 fn search_order_is_deterministic_at_the_limit_for_equal_session_dates() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = test_tempdir();
     let mut paths = Vec::new();
     for id in ["z", "a", "b"] {
         paths.push(write_session(
@@ -401,7 +406,7 @@ fn search_order_is_deterministic_at_the_limit_for_equal_session_dates() {
 
 #[test]
 fn search_default_cap_is_one_hundred_occurrences() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = test_tempdir();
     write_session(
         tmp.path(),
         "many",
@@ -557,7 +562,7 @@ fn search_structured_output_stays_plain_even_with_color_forced() {
 #[cfg(unix)]
 #[test]
 fn search_compact_groups_passages_and_verbose_restores_locations() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = test_tempdir();
     let path = write_session(
         tmp.path(),
         "one",
