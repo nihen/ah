@@ -22,6 +22,11 @@ fn snapshot_help_log() {
 }
 
 #[test]
+fn snapshot_help_search() {
+    insta::assert_snapshot!(help_output(&["search", "--help"]));
+}
+
+#[test]
 fn snapshot_help_show() {
     insta::assert_snapshot!(help_output(&["show", "--help"]));
 }

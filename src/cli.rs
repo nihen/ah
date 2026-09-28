@@ -386,8 +386,12 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// List sessions
-    #[command(alias = "search", alias = "ls", override_help = LOG_HELP_TEXT)]
+    #[command(alias = "ls", override_help = LOG_HELP_TEXT)]
     Log(SearchArgs),
+
+    /// Show matching passages from conversations and tool input/output
+    #[command(override_help = MATCH_SEARCH_HELP_TEXT)]
+    Search(MatchSearchArgs),
 
     /// List known projects
     #[command(name = "project", alias = "projects", override_help = PROJECT_HELP_TEXT)]
@@ -420,6 +424,38 @@ pub enum Commands {
     /// Generate man page
     #[command(name = "man", override_help = MAN_HELP_TEXT)]
     Man(ManArgs),
+}
+
+/// Passage search is separate from the session-listing `SearchArgs`.
+#[derive(Parser, Debug)]
+pub struct MatchSearchArgs {
+    /// Case-insensitive regular expression (or use -q)
+    #[arg(value_name = "PATTERN")]
+    pub pattern: Option<String>,
+
+    /// Output one JSON object per occurrence
+    #[arg(long, conflicts_with = "tsv")]
+    pub json: bool,
+
+    /// Output TSV without a header (default when piped)
+    #[arg(long)]
+    pub tsv: bool,
+
+    /// Show full log paths and search-fragment/byte positions in terminal output
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+
+    /// Private SSH transport: include the match range within the excerpt.
+    #[arg(long, hide = true, requires = "json")]
+    pub(crate) search_wire: bool,
+
+    /// Maximum occurrences across all sessions and hosts (0 = unlimited)
+    #[arg(long, default_value_t = 100)]
+    pub max_matches: usize,
+
+    /// Maximum Unicode characters per snippet, including ellipses
+    #[arg(long, default_value_t = 240, value_parser = clap::value_parser!(u32).range(1..))]
+    pub snippet_length: u32,
 }
 
 #[derive(Parser, Debug)]
@@ -1570,6 +1606,7 @@ Usage:
 
 Commands:
   log                 List sessions
+  search              Show matching passages
   project             List known projects
   show                Show session transcript
   resume              Resume an agent session
@@ -1692,6 +1729,45 @@ const AGENT_GLOBAL_OPTIONS: &str = concatcp!(
 
 "#,
     DISPLAY_OPTIONS
+);
+
+const MATCH_SEARCH_HELP_TEXT: &str = concatcp!(
+    "Show matching passages from conversations and tool input/output
+
+Usage:
+  ah search [OPTIONS] <PATTERN>
+  ah search [OPTIONS] -q <REGEX>
+
+Options:
+  --json                  One JSON object per occurrence (JSON Lines)
+  --tsv                   TSV without a header (default when piped)
+  -v, --verbose           Show full log paths and match positions on TTY
+  --max-matches N         Maximum occurrences across sessions/hosts (default: 100, 0 = unlimited)
+  --snippet-length N      Maximum Unicode characters per snippet (default: 240, minimum: 1)
+
+One result per non-overlapping regex occurrence, not per session.
+Sessions are ordered by modified_at descending; occurrences are in source order.
+Default: session headings and compact passages with auto-pager on TTY;
+plain TSV when piped. Paths and positions are hidden on TTY unless --verbose.
+Verbose positions use \"text #N\" for search fragments, not transcript line numbers.
+--verbose does not change JSON or TSV output.
+TSV columns: path, agent, project, id, text_index, match_start, match_end, snippet.
+Text indices are 1-based search-fragment indices (not transcript message numbers).
+Match offsets are 0-based UTF-8 byte offsets within the decoded search fragment.
+Empty search fragments are skipped. No matches is successful with empty output.
+
+Use PATTERN or -q, not both. Empty queries are rejected.
+-p searches only user prompts. --raw-search and -i are not supported;
+use `ah log -q ... --raw-search` or `ah log -i` instead.
+The former `search` alias for `log` is now this command; use `log` for session lists.
+
+Examples:
+  ah search 'OAuth'              # matching passages in the current directory
+  ah search 'OAuth' -a --json    # occurrences across all directories
+  ah search -p '認証'             # user prompts only
+
+",
+    GLOBAL_OPTIONS
 );
 
 const LOG_HELP_TEXT: &str = concatcp!(

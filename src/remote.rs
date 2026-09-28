@@ -31,6 +31,14 @@ fn build_remote_args(remote: &RemoteDef, fields: &[Field], filter: &FilterArgs) 
     }
     args.push("-o".to_string());
     args.push(field_names.join(","));
+    append_remote_filters(&mut args, filter);
+
+    args
+}
+
+/// Filters shared by remote session and occurrence search. Cwd and recursive
+/// remote selection are deliberately not forwarded.
+fn append_remote_filters(args: &mut Vec<String>, filter: &FilterArgs) {
     if let Some(ref q) = filter.query {
         args.push("-q".to_string());
         args.push(q.clone());
@@ -70,8 +78,6 @@ fn build_remote_args(remote: &RemoteDef, fields: &[Field], filter: &FilterArgs) 
     if filter.subagents {
         args.push("--subagents".to_string());
     }
-
-    args
 }
 
 /// Parse JSON lines from remote `ah log --json` output into Sessions.
@@ -134,6 +140,58 @@ fn fetch_one(
     let ah_args = build_remote_args(remote, fields, filter);
     let stdout = run_ssh_capture(&remote.name, &remote.host, &ah_args)?;
     parse_remote_sessions(&remote.name, &stdout)
+}
+
+/// Occurrence search runs on the data-owning host; never fetch full transcripts.
+fn build_remote_search_args(
+    remote: &RemoteDef,
+    search: &crate::cli::MatchSearchArgs,
+    filter: &FilterArgs,
+) -> Vec<String> {
+    let mut args = vec![
+        remote.ah_path.clone(),
+        "search".into(),
+        "--json".into(),
+        "-a".into(),
+    ];
+    append_remote_filters(&mut args, filter);
+    args.extend([
+        "--search-wire".into(),
+        "--max-matches".into(),
+        search.max_matches.to_string(),
+        "--snippet-length".into(),
+        search.snippet_length.to_string(),
+    ]);
+    args
+}
+
+pub(crate) fn fetch_search_hits(
+    search: &crate::cli::MatchSearchArgs,
+    filter: &FilterArgs,
+) -> Result<Vec<crate::search_hits::SearchHit>, String> {
+    let mut hits = Vec::new();
+    for remote in resolve_remotes(&filter.remote)? {
+        let args = build_remote_search_args(remote, search, filter);
+        let stdout = run_ssh_capture_impl(&remote.name, &remote.host, &args, false)?;
+        for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+            let mut hit: crate::search_hits::SearchHit =
+                serde_json::from_str(line).map_err(|e| {
+                    format!(
+                        "Invalid search result from remote '{}': {}. Update ah on the remote host.",
+                        remote.name, e
+                    )
+                })?;
+            if hit.path.is_empty() || hit.text_index == 0 || hit.match_start > hit.match_end {
+                return Err(format!(
+                    "Invalid search result from remote '{}'",
+                    remote.name
+                ));
+            }
+            hit.path = format!("{}:{}", remote.name, hit.path);
+            hits.push(hit);
+        }
+    }
+    Ok(hits)
 }
 
 /// Resolve remote names to RemoteDefs, validating they exist in config.
@@ -888,6 +946,15 @@ fn quote_remote_command(args: &[String]) -> String {
 
 /// Run SSH command, capture stdout. Returns stdout as String.
 fn run_ssh_capture(remote_name: &str, host: &str, args: &[String]) -> Result<String, String> {
+    run_ssh_capture_impl(remote_name, host, args, true)
+}
+
+fn run_ssh_capture_impl(
+    remote_name: &str,
+    host: &str,
+    args: &[String],
+    allow_legacy_empty: bool,
+) -> Result<String, String> {
     let remote_cmd = quote_remote_command(args);
     let debug = color::is_debug();
     if debug {
@@ -921,10 +988,11 @@ fn run_ssh_capture(remote_name: &str, host: &str, args: &[String]) -> Result<Str
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
-        if stderr.contains("No sessions found")
-            || stderr.contains("No projects found")
-            || stderr.contains("No memory files found")
-            || stderr.contains("No session files found")
+        if allow_legacy_empty
+            && (stderr.contains("No sessions found")
+                || stderr.contains("No projects found")
+                || stderr.contains("No memory files found")
+                || stderr.contains("No session files found"))
         {
             return Ok(String::new());
         }

@@ -473,6 +473,6 @@ fn compile_bytes_regex(query: &str) -> Result<BytesRegex, String> {
         .map_err(|e| format!("Invalid regex '{}': {}", query, e))
 }
 
-fn compile_text_regex(query: &str) -> Result<Regex, String> {
+pub(crate) fn compile_text_regex(query: &str) -> Result<Regex, String> {
     Regex::new(&format!("(?i){}", query)).map_err(|e| format!("Invalid regex '{}': {}", query, e))
 }

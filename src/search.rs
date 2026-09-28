@@ -764,6 +764,40 @@ mod tests {
         cases
     }
 
+    #[test]
+    fn occurrence_search_covers_all_file_plugins_and_matches_log_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut count = 0;
+        for (agent, path) in fixture_sessions(tmp.path()) {
+            let plugin = find_plugin(agent).unwrap();
+            for query in [
+                "auth",
+                "redis",
+                "tool-arg-needle",
+                "tool-out-needle",
+                "(?s).+",
+            ] {
+                let pattern = Regex::new(&format!("(?i){query}")).unwrap();
+                let first = search_texts(&path, plugin, &pattern, None);
+                let mut occurrences = Vec::new();
+                crate::search_hits::visit_occurrences(
+                    &path,
+                    plugin,
+                    &pattern,
+                    false,
+                    usize::MAX,
+                    &mut |index, start, end, text| {
+                        assert!(index > 0);
+                        occurrences.push(extract_match_context(text, start, end, 30));
+                    },
+                );
+                assert_eq!(first.as_ref(), occurrences.first(), "{agent}: {query}");
+                count += occurrences.len();
+            }
+        }
+        assert!(count > 20);
+    }
+
     /// The prefilter never rejects a session that the message search accepts,
     /// for prompt-only and full-text searches and for literal and regex queries.
     #[test]
