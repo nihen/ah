@@ -177,6 +177,12 @@ pub(crate) fn visit_occurrences(
 /// Bounded even when the regex itself matches megabytes. UTF-8 boundaries are
 /// preserved. The Unicode ellipses are included in the character budget.
 fn snippet(text: &str, start: usize, end: usize, limit: usize) -> (String, Option<[usize; 2]>) {
+    // With tiny budgets, matched text takes precedence over truncation markers.
+    if limit <= 2 && start < end {
+        let result: String = text[start..end].chars().take(limit).collect();
+        let span = (!result.is_empty()).then_some([0, result.len()]);
+        return (result, span);
+    }
     let match_chars = text[start..end].chars().take(limit).count();
     let before = limit.saturating_sub(match_chars) / 2;
     let from = text[..start]
@@ -449,6 +455,14 @@ mod tests {
             for end in [start, start + "認証".len(), text.len()] {
                 let (s, _) = snippet(text, start, end, limit);
                 assert!(s.chars().count() <= limit, "{s:?} at {limit}");
+            }
+        }
+        for (text, start, end) in [("abcNEEDLExyz", 3, 9), ("前認証後", 3, 9)] {
+            for limit in 1..=2 {
+                let (s, span) = snippet(text, start, end, limit);
+                assert_eq!(s, text[start..end].chars().take(limit).collect::<String>());
+                assert_eq!(span, Some([0, s.len()]));
+                assert!(s.chars().count() <= limit);
             }
         }
         assert_eq!(snippet("needle", 0, 6, 20).0, "needle");

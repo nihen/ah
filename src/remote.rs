@@ -172,7 +172,7 @@ pub(crate) fn fetch_search_hits(
     let mut hits = Vec::new();
     for remote in resolve_remotes(&filter.remote)? {
         let args = build_remote_search_args(remote, search, filter);
-        let stdout = run_ssh_capture(&remote.name, &remote.host, &args)?;
+        let stdout = run_ssh_capture_impl(&remote.name, &remote.host, &args, false)?;
         for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
             let mut hit: crate::search_hits::SearchHit =
                 serde_json::from_str(line).map_err(|e| {
@@ -946,6 +946,15 @@ fn quote_remote_command(args: &[String]) -> String {
 
 /// Run SSH command, capture stdout. Returns stdout as String.
 fn run_ssh_capture(remote_name: &str, host: &str, args: &[String]) -> Result<String, String> {
+    run_ssh_capture_impl(remote_name, host, args, true)
+}
+
+fn run_ssh_capture_impl(
+    remote_name: &str,
+    host: &str,
+    args: &[String],
+    allow_legacy_empty: bool,
+) -> Result<String, String> {
     let remote_cmd = quote_remote_command(args);
     let debug = color::is_debug();
     if debug {
@@ -979,10 +988,11 @@ fn run_ssh_capture(remote_name: &str, host: &str, args: &[String]) -> Result<Str
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
-        if stderr.contains("No sessions found")
-            || stderr.contains("No projects found")
-            || stderr.contains("No memory files found")
-            || stderr.contains("No session files found")
+        if allow_legacy_empty
+            && (stderr.contains("No sessions found")
+                || stderr.contains("No projects found")
+                || stderr.contains("No memory files found")
+                || stderr.contains("No session files found"))
         {
             return Ok(String::new());
         }

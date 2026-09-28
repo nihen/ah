@@ -337,6 +337,15 @@ fn search_remote_runs_on_host_and_merges_with_global_limit() {
     assert!(terminal.contains("\x1b[1;33mneedle\x1b[0m"));
     assert!(!ssh_args.contains("'--remote'"));
     assert!(!ssh_args.contains("'-A'"));
+    // Search succeeds on empty results; every failed SSH command is an error,
+    // even if stderr includes an older command's empty-result message.
+    fs::write(&script, "#!/bin/sh\necho 'No sessions found' >&2\nexit 1\n").unwrap();
+    ah(tmp.path())
+        .env("PATH", &path)
+        .args(["search", "needle", "--remote", "test"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No sessions found"));
     // A remote running an old version must not be silently treated as zero matches.
     fs::write(&script, "#!/bin/sh\necho unsupported >&2\nexit 2\n").unwrap();
     ah(tmp.path())
@@ -420,8 +429,8 @@ fn terminal_search(home: &Path, args: &[&str], env: &[(&str, &str)]) -> String {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0
