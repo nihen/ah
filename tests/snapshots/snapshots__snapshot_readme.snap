@@ -241,18 +241,20 @@ gemini           5  2026-03-21 10:50
 
 ## Support Matrix
 
-| Agent | List | Search | Show | Resume | Running | Memory |
-|-------|------|--------|------|--------|---------|--------|
-| Claude | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Codex | ✓ | ✓ | ✓ | ✓ | ✓¹ | ✓ |
-| Gemini | ✓ | ✓ | ✓ | ✓ | | ✓ |
-| Copilot | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Cursor | ✓ | ✓ | ✓ | ✓ | | ✓ |
-| Antigravity (agy) | ✓ | ✓ | ✓ | ✓ | | ✓ |
-| Grok | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| opencode | ✓ | ✓ | ✓ | ✓ | | ✓ |
+| Agent | List | Search | Show | Resume | Running | Memory | Model |
+|-------|------|--------|------|--------|---------|--------|-------|
+| Claude | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Codex | ✓ | ✓ | ✓ | ✓ | ✓¹ | ✓ | ✓ |
+| Gemini | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
+| Copilot | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Cursor | ✓ | ✓ | ✓ | ✓ | | ✓ | |
+| Antigravity (agy) | ✓ | ✓ | ✓ | ✓ | | ✓ | |
+| Grok | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| opencode | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
 
 Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.json` (checking `procStart` so a reused PID is not reported), Grok's `active_sessions.json`, Copilot's `session-state/<id>/inuse.<pid>.lock`, and Codex's `thread-writer-locks/<id>.lock`. ¹ Codex is detected on Linux only, from the kernel lock table (`/proc/locks`); its PID is the lock holder, which for the interactive TUI is the Codex app-server. Running detection needs a PID liveness check, which is not implemented on Windows.
+
+The `model` field (`-o model`) lists the models that answered in a session, comma-separated in first-use order. For Copilot this is the model that actually answered, not the `auto` selection. It is empty when the session records no model (e.g. older Codex and Grok logs, or a session with no reply).
 
 ## Features
 

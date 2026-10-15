@@ -295,6 +295,47 @@ impl AgentPlugin for CopilotPlugin {
         })
     }
 
+    /// The models that actually answered; `session.start` only records the
+    /// selection, which may be `auto`. Older logs name the model on tool
+    /// executions and at shutdown but not on assistant messages. At shutdown
+    /// the models that received requests are the keys of `modelMetrics`
+    /// (`currentModel` is only the selection, even with no reply).
+    fn resolve_model(&self, path: &Path) -> Option<String> {
+        let data = super::common::mmap_file(&Self::events_path(path)?)?;
+        let finder = memchr::memmem::Finder::new(b"odel");
+        let mut models = super::common::ModelList::default();
+        // `modelMetrics` keys: models that received requests, in first-use
+        // order. They fill in models older replies do not name.
+        let mut metered = Vec::new();
+        for line in data.split(|&b| b == b'\n') {
+            if finder.find(line).is_none() {
+                continue;
+            }
+            let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(data) = val.get("data") else {
+                continue;
+            };
+            match val.get("type").and_then(|v| v.as_str()) {
+                Some("assistant.message" | "tool.execution_complete") => {
+                    if let Some(model) = data.get("model").and_then(|v| v.as_str()) {
+                        models.push(model);
+                    }
+                }
+                Some("session.shutdown") if data.get("modelMetrics").is_some() => {
+                    // `Value` sorts object keys; read them in written order.
+                    if let Ok(event) = serde_json::from_slice::<ShutdownEvent>(line) {
+                        metered.extend(event.data.model_metrics.0);
+                    }
+                }
+                _ => {}
+            }
+        }
+        models.merge_ordered(&metered);
+        models.joined()
+    }
+
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
         let Some(events_path) = Self::events_path(path) else {
             return;
@@ -485,6 +526,45 @@ fn visit_search_record(val: &serde_json::Value, visit: &mut TypedVisitor<'_>) ->
             .and_then(|d| d.get("result"))
             .is_none_or(|v| visit_tool_output(v, &mut |text| visit(K::ToolOutput, text))),
         _ => true,
+    }
+}
+
+/// A `session.shutdown` event, reading only the `modelMetrics` keys.
+#[derive(serde::Deserialize)]
+struct ShutdownEvent {
+    data: ShutdownData,
+}
+
+#[derive(serde::Deserialize)]
+struct ShutdownData {
+    #[serde(rename = "modelMetrics", default)]
+    model_metrics: KeysInOrder,
+}
+
+/// Keys of a JSON object in the order they are written.
+#[derive(Default)]
+struct KeysInOrder(Vec<String>);
+
+impl<'de> serde::Deserialize<'de> for KeysInOrder {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Keys;
+        impl<'de> serde::de::Visitor<'de> for Keys {
+            type Value = KeysInOrder;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<KeysInOrder, A::Error> {
+                let mut keys = Vec::new();
+                while let Some((key, serde::de::IgnoredAny)) = map.next_entry::<String, _>()? {
+                    keys.push(key);
+                }
+                Ok(KeysInOrder(keys))
+            }
+        }
+        deserializer.deserialize_map(Keys)
     }
 }
 
@@ -690,5 +770,96 @@ paras: >\n  one\n  two\n\n  three\n";
         let future = SystemTime::now() + Duration::from_secs(3600);
         assert!(running_in(dir.path(), |_| Some(future)).is_empty());
         assert!(running_in(&dir.path().join("missing"), |_| None).is_empty());
+    }
+
+    #[test]
+    fn model_is_the_answering_model_not_the_selection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let events = concat!(
+            r#"{"type":"session.start","data":{"selectedModel":"auto"}}"#,
+            "\n",
+            r#"{"type":"tool.execution_complete","data":{"model": "claude-opus-4.6"}}"#,
+            "\n",
+            r#"{"type":"assistant.message","data":{"model":"gpt-6-luna","content":"x"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"currentModel":"gpt-6-luna"}}"#,
+            "\n",
+        );
+        let path = session(tmp.path(), "m1", WORKSPACE, Some(events));
+        assert_eq!(
+            PLUGIN.resolve_model(&path).as_deref(),
+            Some("claude-opus-4.6,gpt-6-luna")
+        );
+        let auto_only = r#"{"type":"session.start","data":{"selectedModel":"auto"}}"#;
+        let path = session(tmp.path(), "m2", WORKSPACE, Some(auto_only));
+        assert_eq!(PLUGIN.resolve_model(&path), None);
+        let path = session(tmp.path(), "m3", WORKSPACE, None);
+        assert_eq!(PLUGIN.resolve_model(&path), None);
+        // Closed before any reply: shutdown only repeats the selection.
+        let no_reply = concat!(
+            r#"{"type":"session.start","data":{"selectedModel":"gpt-6-luna"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"currentModel":"gpt-6-luna"}}"#,
+        );
+        let path = session(tmp.path(), "m4", WORKSPACE, Some(no_reply));
+        assert_eq!(PLUGIN.resolve_model(&path), None);
+        // Older log: the reply names no model, shutdown does.
+        let legacy = concat!(
+            r#"{"type":"assistant.message","data":{"content":"x"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"currentModel":"claude-opus-4.6","modelMetrics":{"claude-opus-4.6":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m5", WORKSPACE, Some(legacy));
+        assert_eq!(
+            PLUGIN.resolve_model(&path).as_deref(),
+            Some("claude-opus-4.6")
+        );
+        // Switched to another model after the last reply.
+        let switched = concat!(
+            r#"{"type":"assistant.message","data":{"model":"gpt-6-luna","content":"x"}}"#,
+            "\n",
+            r#"{"type":"session.model_change","data":{"newModel":"claude-opus-4.6"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"currentModel":"claude-opus-4.6","modelMetrics":{"gpt-6-luna":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m6", WORKSPACE, Some(switched));
+        assert_eq!(PLUGIN.resolve_model(&path).as_deref(), Some("gpt-6-luna"));
+        // Older log with text-only replies from two models.
+        let legacy_two = concat!(
+            r#"{"type":"assistant.message","data":{"content":"x"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"currentModel":"claude-opus-4.6","modelMetrics":{"gpt-5.6-luna":{},"claude-opus-4.6":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m7", WORKSPACE, Some(legacy_two));
+        assert_eq!(
+            PLUGIN.resolve_model(&path).as_deref(),
+            Some("gpt-5.6-luna,claude-opus-4.6")
+        );
+        // A text-only reply from one model, then a tool run by another.
+        let legacy_tool = concat!(
+            r#"{"type":"assistant.message","data":{"content":"x"}}"#,
+            "\n",
+            r#"{"type":"tool.execution_complete","data":{"model":"gpt-5.6-luna"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"modelMetrics":{"claude-opus-4.6":{},"gpt-5.6-luna":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m8", WORKSPACE, Some(legacy_tool));
+        assert_eq!(
+            PLUGIN.resolve_model(&path).as_deref(),
+            Some("claude-opus-4.6,gpt-5.6-luna")
+        );
+        // Replies name both models; shutdown metrics name only the last.
+        let mixed = concat!(
+            r#"{"type":"assistant.message","data":{"model":"claude-opus-4.6","content":"x"}}"#,
+            "\n",
+            r#"{"type":"assistant.message","data":{"model":"gpt-5.6-luna","content":"y"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"modelMetrics":{"gpt-5.6-luna":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m9", WORKSPACE, Some(mixed));
+        assert_eq!(
+            PLUGIN.resolve_model(&path).as_deref(),
+            Some("claude-opus-4.6,gpt-5.6-luna")
+        );
     }
 }

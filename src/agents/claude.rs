@@ -269,6 +269,18 @@ impl AgentPlugin for ClaudePlugin {
         subagent_parent(path).map(str::to_string)
     }
 
+    /// `<synthetic>` marks messages Claude Code wrote itself (e.g. API errors).
+    fn resolve_model(&self, path: &Path) -> Option<String> {
+        super::common::jsonl_models(path, b"\"model\"", |val| {
+            if val.get("type")?.as_str()? != "assistant" {
+                return None;
+            }
+            val.pointer("/message/model")?
+                .as_str()
+                .filter(|model| *model != "<synthetic>")
+        })
+    }
+
     fn path_markers(&self) -> &'static [&'static str] {
         &["/.claude/"]
     }
@@ -816,5 +828,25 @@ mod tests {
         got.sort();
         let ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["alive", "no-start", "reused"]);
+    }
+
+    #[test]
+    fn model_lists_assistant_models_in_first_use_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let lines = [
+            r#"{"type":"user","message":{"role":"user","content":"hi","model":"ignored"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5","content":[]}}"#,
+            r#"{"type":"assistant","message":{"model":"<synthetic>","content":[]}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[]}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5","content":[]}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+        assert_eq!(
+            PLUGIN.resolve_model(&path).as_deref(),
+            Some("claude-sonnet-5,claude-opus-5-5")
+        );
+        fs::write(&path, lines[0]).unwrap();
+        assert_eq!(PLUGIN.resolve_model(&path), None);
     }
 }

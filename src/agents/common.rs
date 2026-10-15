@@ -93,6 +93,65 @@ pub fn for_each_jsonl_value(path: &Path, visit: impl FnMut(&serde_json::Value) -
     for_each_jsonl_value_bytes(&mmap, visit);
 }
 
+/// Distinct model names in first-use order, for `AgentPlugin::resolve_model`.
+/// `auto` is a selection, not a model, and is skipped.
+#[derive(Default)]
+pub struct ModelList(Vec<String>);
+
+impl ModelList {
+    pub fn push(&mut self, model: &str) {
+        let model = model.trim();
+        if !model.is_empty() && model != "auto" && !self.0.iter().any(|m| m == model) {
+            self.0.push(model.to_string());
+        }
+    }
+
+    /// Merge `ordered`, a first-use ordering that may include models not
+    /// seen here: each new model goes before the first known model that
+    /// follows it in `ordered`, or last.
+    pub fn merge_ordered(&mut self, ordered: &[String]) {
+        let mut order = ModelList::default();
+        ordered.iter().for_each(|model| order.push(model));
+        for (i, model) in order.0.iter().enumerate() {
+            if self.0.contains(model) {
+                continue;
+            }
+            let at = order.0[i + 1..]
+                .iter()
+                .find_map(|next| self.0.iter().position(|m| m == next))
+                .unwrap_or(self.0.len());
+            self.0.insert(at, model.clone());
+        }
+    }
+
+    pub fn joined(self) -> Option<String> {
+        (!self.0.is_empty()).then(|| self.0.join(","))
+    }
+}
+
+/// Models from the JSONL lines that contain `needle`; other lines are
+/// skipped without parsing.
+pub fn jsonl_models(
+    path: &Path,
+    needle: &[u8],
+    model_of: impl for<'a> Fn(&'a serde_json::Value) -> Option<&'a str>,
+) -> Option<String> {
+    let data = mmap_file(path)?;
+    let finder = memchr::memmem::Finder::new(needle);
+    let mut models = ModelList::default();
+    for line in data.split(|&b| b == b'\n') {
+        if finder.find(line).is_none() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) {
+            if let Some(model) = model_of(&val) {
+                models.push(model);
+            }
+        }
+    }
+    models.joined()
+}
+
 pub fn for_each_jsonl_value_bytes(data: &[u8], mut visit: impl FnMut(&serde_json::Value) -> bool) {
     for line_bytes in data.split(|&b| b == b'\n') {
         if line_bytes.len() < 2 {
@@ -440,6 +499,30 @@ pub fn file_lock_key(_path: &Path) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+
+    fn models(list: &[&str]) -> ModelList {
+        let mut models = ModelList::default();
+        list.iter().for_each(|m| models.push(m));
+        models
+    }
+
+    #[test]
+    fn merge_ordered_places_new_models_by_their_successors() {
+        let order = |list: &[&str]| list.iter().map(|m| m.to_string()).collect::<Vec<_>>();
+        let merged = |seen: &[&str], ordered: &[&str]| {
+            let mut list = models(seen);
+            list.merge_ordered(&order(ordered));
+            list.joined()
+        };
+        assert_eq!(merged(&["B"], &["A", "B"]).as_deref(), Some("A,B"));
+        assert_eq!(merged(&["A", "B"], &["B"]).as_deref(), Some("A,B"));
+        assert_eq!(merged(&[], &["A", "B", "A", "B"]).as_deref(), Some("A,B"));
+        assert_eq!(
+            merged(&["C"], &["A", "auto", "", "B"]).as_deref(),
+            Some("C,A,B")
+        );
+        assert_eq!(merged(&[], &[]), None);
+    }
     use super::*;
 
     #[test]

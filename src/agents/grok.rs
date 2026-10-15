@@ -192,6 +192,10 @@ impl AgentPlugin for GrokPlugin {
             .or_else(|| Self::encoded_cwd(path))
     }
 
+    fn resolve_model(&self, path: &Path) -> Option<String> {
+        super::common::jsonl_models(path, b"\"model_id\"", |val| val.get("model_id")?.as_str())
+    }
+
     fn resolve_title(&self, path: &Path, _home: &Path) -> Option<String> {
         let summary = Self::read_summary(path)?;
         for key in ["generated_title", "session_summary"] {
@@ -627,5 +631,23 @@ mod tests {
         .unwrap();
         assert_eq!(running_in(&file), vec![("live".to_string(), Some(me))]);
         assert!(running_in(&dir.path().join("missing.json")).is_empty());
+    }
+
+    #[test]
+    fn model_comes_from_model_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let history = concat!(
+            r#"{"type":"user","content":"hi"}"#,
+            "\n",
+            r#"{"type":"assistant","content":"a","model_id":"grok-4.6-build"}"#,
+            "\n",
+            r#"{"type":"assistant","content":"b","model_id":"grok-4.7-build"}"#,
+            "\n",
+        );
+        let path = write_session(&tmp.path().join("s"), history, None);
+        assert_eq!(
+            PLUGIN.resolve_model(&path).as_deref(),
+            Some("grok-4.6-build,grok-4.7-build")
+        );
     }
 }

@@ -109,6 +109,7 @@ pub enum Field {
     Pid,
     Archived,
     ParentId,
+    Model,
 }
 
 impl Field {
@@ -137,6 +138,7 @@ impl Field {
             Field::Pid => "pid",
             Field::Archived => "archived",
             Field::ParentId => "parent_id",
+            Field::Model => "model",
         }
     }
 
@@ -165,11 +167,12 @@ impl Field {
             Field::Pid,
             Field::Archived,
             Field::ParentId,
+            Field::Model,
         ]
     }
 
     pub fn all_names() -> &'static str {
-        "agent, project, project_raw, modified_at, created_at, title, first_prompt, last_prompt, prompts, responses, messages, transcript, matched, path, cwd, id, resume_cmd, turns, size, running, pid, archived, parent_id"
+        "agent, project, project_raw, modified_at, created_at, title, first_prompt, last_prompt, prompts, responses, messages, transcript, matched, path, cwd, id, resume_cmd, turns, size, running, pid, archived, parent_id, model"
     }
 
     pub fn description(&self) -> &'static str {
@@ -197,6 +200,7 @@ impl Field {
             Field::Pid => "PID of running agent process",
             Field::Archived => "Whether the agent archived the session (Codex)",
             Field::ParentId => "Id of the session that spawned this subagent session",
+            Field::Model => "Models that answered, comma-separated in first-use order",
         }
     }
 
@@ -227,6 +231,7 @@ impl Field {
             Field::Pid => "12345",
             Field::Archived => "false",
             Field::ParentId => "abc12345-...",
+            Field::Model => "claude-opus-5-5",
         }
     }
 
@@ -263,6 +268,7 @@ impl FromStr for Field {
             "pid" => Ok(Field::Pid),
             "archived" => Ok(Field::Archived),
             "parent_id" => Ok(Field::ParentId),
+            "model" => Ok(Field::Model),
             _ => Err(format!(
                 "unknown field '{}'. available: {}",
                 s,
@@ -2114,7 +2120,7 @@ mod tests {
 
     #[test]
     fn test_field_all_count() {
-        assert_eq!(Field::all().len(), 23);
+        assert_eq!(Field::all().len(), 24);
     }
 
     #[test]

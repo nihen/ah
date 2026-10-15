@@ -628,6 +628,19 @@ impl AgentPlugin for GeminiPlugin {
         None
     }
 
+    fn resolve_model(&self, path: &Path) -> Option<String> {
+        let mut models = super::common::ModelList::default();
+        Self::for_each_root_message(path, |val| {
+            if val.get("type").and_then(|v| v.as_str()) == Some("gemini") {
+                if let Some(model) = val.get("model").and_then(|v| v.as_str()) {
+                    models.push(model);
+                }
+            }
+            true
+        });
+        models.joined()
+    }
+
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
         Self::for_each_root_message(path, |val| visit_message(val, visit));
     }
@@ -1005,5 +1018,39 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn model_comes_from_gemini_messages_in_json_and_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chats = tmp.path().join(".gemini/tmp/proj/chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let json = chats.join("session-2026-01-01T00-00-aaaa.json");
+        std::fs::write(
+            &json,
+            r#"{"sessionId":"aaaa","messages":[{"type":"user","content":"hi"},{"type":"gemini","content":"yo","model":"gemini-3-flash-preview"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            PLUGIN.resolve_model(&json).as_deref(),
+            Some("gemini-3-flash-preview")
+        );
+        let jsonl = chats.join("session-2026-01-02T00-00-bbbb.jsonl");
+        std::fs::write(
+            &jsonl,
+            concat!(
+                r#"{"sessionId":"bbbb","projectHash":"h"}"#,
+                "\n",
+                r#"{"id":"1","type":"user","content":"hi"}"#,
+                "\n",
+                r#"{"id":"2","type":"gemini","content":"yo","model":"gemini-3.1-pro-preview"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            PLUGIN.resolve_model(&jsonl).as_deref(),
+            Some("gemini-3.1-pro-preview")
+        );
     }
 }
