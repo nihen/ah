@@ -513,14 +513,39 @@ impl AgentPlugin for CodexPlugin {
         session_meta(path)?.parent_id
     }
 
-    /// Each turn's settings, including the model, are logged as `turn_context`.
+    /// Each turn's settings, including the model, are logged as
+    /// `turn_context`. A turn's model counts only once the model produced
+    /// output in it, so a turn aborted before any reply adds nothing.
     fn resolve_model(&self, path: &Path) -> Option<String> {
-        super::common::jsonl_models(path, b"\"turn_context\"", |val| {
-            if val.get("type")?.as_str()? != "turn_context" {
-                return None;
+        let data = mmap_file(path)?;
+        let turn = memchr::memmem::Finder::new(b"\"turn_context\"");
+        let item = memchr::memmem::Finder::new(b"\"response_item\"");
+        let mut models = super::common::ModelList::default();
+        let mut pending: Option<String> = None;
+        for line in data.split(|&b| b == b'\n') {
+            let is_turn = turn.find(line).is_some();
+            if !is_turn && (pending.is_none() || item.find(line).is_none()) {
+                continue;
             }
-            val.pointer("/payload/model")?.as_str()
-        })
+            let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) else {
+                continue;
+            };
+            match val.get("type").and_then(|v| v.as_str()) {
+                Some("turn_context") => {
+                    pending = val
+                        .pointer("/payload/model")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                }
+                Some("response_item") if is_model_output(val.get("payload")) => {
+                    if let Some(model) = pending.take() {
+                        models.push(&model);
+                    }
+                }
+                _ => {}
+            }
+        }
+        models.joined()
     }
 
     // `codex resume <id>` also finds archived sessions, so they keep their id.
@@ -585,6 +610,20 @@ fn running_in(
             Some((id, Some(pid)))
         })
         .collect()
+}
+
+/// Whether a `response_item` payload was produced by the model: an
+/// assistant message, reasoning or a tool call, but not user or developer
+/// messages and not tool outputs.
+fn is_model_output(payload: Option<&serde_json::Value>) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    match payload.get("type").and_then(|v| v.as_str()) {
+        Some("message") => payload.get("role").and_then(|v| v.as_str()) == Some("assistant"),
+        Some(kind) => !kind.ends_with("_output"),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -911,8 +950,33 @@ mod tests {
         body.push('\n');
         body.push_str(r#"{"type":"event_msg","payload":{"type":"x","model":"not-this"}}"#);
         body.push('\n');
-        body.push_str(r#"{"type":"turn_context","payload":{"model":"gpt-6-astra"}}"#);
+        body.push('\n');
+        body.push_str(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}"#,
+        );
+        body.push('\n');
+        body.push_str(
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"shell"}}"#,
+        );
+        body.push('\n');
+        // Aborted before any reply: user input and tool output only.
+        body.push_str(r#"{"type":"turn_context","payload":{"model":"gpt-aborted"}}"#);
+        body.push('\n');
+        body.push_str(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}"#,
+        );
+        body.push('\n');
+        body.push_str(
+            r#"{"type":"response_item","payload":{"type":"function_call_output","output":"x"}}"#,
+        );
+        body.push('\n');
+        body.push_str(r#"{"type":"turn_context","payload":{"model":"gpt-6-sol"}}"#);
+        body.push('\n');
+        body.push_str(r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}"#);
         fs::write(&path, body).unwrap();
-        assert_eq!(PLUGIN.resolve_model(&path).as_deref(), Some("gpt-6-astra"));
+        assert_eq!(
+            PLUGIN.resolve_model(&path).as_deref(),
+            Some("gpt-6-astra,gpt-6-sol")
+        );
     }
 }

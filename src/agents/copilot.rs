@@ -299,7 +299,7 @@ impl AgentPlugin for CopilotPlugin {
     /// selection, which may be `auto`. Older logs name the model on tool
     /// executions and at shutdown but not on assistant messages.
     fn resolve_model(&self, path: &Path) -> Option<String> {
-        super::common::jsonl_models(&Self::events_path(path)?, b"odel\":\"", |val| {
+        super::common::jsonl_models(&Self::events_path(path)?, b"odel\"", |val| {
             let key = match val.get("type")?.as_str()? {
                 "assistant.message" | "tool.execution_complete" => "/data/model",
                 "session.shutdown" => "/data/currentModel",
@@ -712,7 +712,7 @@ paras: >\n  one\n  two\n\n  three\n";
         let events = concat!(
             r#"{"type":"session.start","data":{"selectedModel":"auto"}}"#,
             "\n",
-            r#"{"type":"tool.execution_complete","data":{"model":"claude-opus-4.6"}}"#,
+            r#"{"type":"tool.execution_complete","data":{"model": "claude-opus-4.6"}}"#,
             "\n",
             r#"{"type":"assistant.message","data":{"model":"gpt-6-luna","content":"x"}}"#,
             "\n",

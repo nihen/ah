@@ -467,6 +467,7 @@ fn session_models(db: &Path, id: &str) -> Result<Option<String>, String> {
             "SELECT json_extract(data, '$.modelID') FROM message \
              WHERE session_id = ?1 AND json_valid(data) \
                AND json_extract(data, '$.role') = 'assistant' \
+               AND json_type(data, '$.modelID') = 'text' \
              ORDER BY time_created, id",
         )?;
         let mut rows = stmt.query([id])?;
@@ -1156,6 +1157,8 @@ mod tests {
                 WHERE id = 'msg_2';
             UPDATE message SET data = '{"role":"assistant","modelID":"deepseek-v4-pro"}'
                 WHERE id = 'msg_3';
+            UPDATE message SET data = '{"role":"assistant","modelID":123}'
+                WHERE id = 'msg_4';
             "#,
         )
         .unwrap();
