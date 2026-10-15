@@ -584,6 +584,9 @@ pub fn resolve_fields_with_mmap(
     let message_results = if needs_heavy {
         let mut collected = Vec::new();
         iter_msgs!(plugin, path, &mut |message| {
+            if crate::cancel::requested() {
+                return false;
+            }
             collected.push(message);
             true
         });
@@ -599,6 +602,9 @@ pub fn resolve_fields_with_mmap(
         let mut turn_count: usize = 0;
 
         iter_msgs!(plugin, path, &mut |message| {
+            if crate::cancel::requested() {
+                return false;
+            }
             if message.role == MessageRole::User {
                 turn_count += 1;
                 if first_prompt.is_none() && needs_first_prompt {

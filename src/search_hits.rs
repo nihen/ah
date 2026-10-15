@@ -165,6 +165,11 @@ pub(crate) fn collect_hits(
             },
         );
     }
+    // A cancelled call is discarded by the caller: skip the remote fetch,
+    // the sort and the serialization of what was collected so far.
+    if crate::cancel::requested() {
+        return Ok((Vec::new(), false));
+    }
     hits.extend(crate::remote::fetch_search_hits(args, filter)?);
     // Stable sorting preserves source order inside each session. Paths also
     // distinguish sessions with equal ids on different hosts.
@@ -218,7 +223,9 @@ pub(crate) fn visit_typed_occurrences(
             }
             let mut location: Option<Location> = None;
             for m in pattern.find_iter(text) {
-                if count >= limit {
+                // A huge fragment can hold many occurrences: stop allocating
+                // hits as soon as the limit is reached or the call is cancelled.
+                if count >= limit || crate::cancel::requested() {
                     return false;
                 }
                 let loc = location.get_or_insert_with(|| {
