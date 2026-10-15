@@ -27,11 +27,29 @@ pub struct ToolOutput {
 }
 
 impl ToolOutput {
-    /// Pretty JSON as the text block, the same value as structured content.
-    fn json(structured: Value) -> Self {
-        let text = serde_json::to_string_pretty(&structured).unwrap_or_default();
+    /// JSON Lines as the text block: the first line holds every field of
+    /// `structured` except the list under `items`, then one compact line
+    /// per item. Smaller than pretty JSON, and each line parses on its own.
+    fn jsonl(structured: Value, items: &str) -> Self {
+        let text = jsonl_text(&structured, items);
         Self { text, structured }
     }
+}
+
+/// Render `structured` as JSON Lines (see `ToolOutput::jsonl`).
+fn jsonl_text(structured: &Value, items: &str) -> String {
+    let mut head = structured.clone();
+    let list = head
+        .as_object_mut()
+        .and_then(|m| m.remove(items))
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let mut out = serde_json::to_string(&head).unwrap_or_default();
+    for item in &list {
+        out.push('\n');
+        out.push_str(&serde_json::to_string(item).unwrap_or_default());
+    }
+    out
 }
 
 pub const TOOL_NAMES: [&str; 7] = [
@@ -338,12 +356,15 @@ fn tool_log(p: &Params<'_>, base: &FilterArgs) -> Result<ToolOutput, String> {
         .iter()
         .map(|s| Value::Object(crate::output::session_to_json(s, &fields)))
         .collect();
-    Ok(ToolOutput::json(json!({
-        "scope": args::scope_json(&filter),
-        "sessions": rows,
-        "total": total,
-        "truncated": truncated,
-    })))
+    Ok(ToolOutput::jsonl(
+        json!({
+            "scope": args::scope_json(&filter),
+            "sessions": rows,
+            "total": total,
+            "truncated": truncated,
+        }),
+        "sessions",
+    ))
 }
 
 // ─── search ───────────────────────────────────────────────────────────
@@ -400,11 +421,14 @@ fn tool_search(p: &Params<'_>, base: &FilterArgs) -> Result<ToolOutput, String> 
     };
     apply_collector_flags(&filter);
     let (hits, truncated) = search_hits::collect_hits(&search_args, &mut filter)?;
-    Ok(ToolOutput::json(json!({
-        "scope": args::scope_json(&filter),
-        "hits": hits,
-        "truncated": truncated,
-    })))
+    Ok(ToolOutput::jsonl(
+        json!({
+            "scope": args::scope_json(&filter),
+            "hits": hits,
+            "truncated": truncated,
+        }),
+        "hits",
+    ))
 }
 
 // ─── show ─────────────────────────────────────────────────────────────
@@ -562,7 +586,7 @@ fn tool_show(p: &Params<'_>) -> Result<ToolOutput, String> {
             "records": records,
             "truncated": truncated,
         });
-        let mut text = serde_json::to_string_pretty(&structured).unwrap_or_default();
+        let mut text = jsonl_text(&structured, "records");
         if truncated {
             text.push_str(&truncation_note("records", AT_ADVICE));
         }
@@ -581,7 +605,7 @@ fn tool_show(p: &Params<'_>) -> Result<ToolOutput, String> {
             "messages": messages,
             "truncated": truncated,
         });
-        let mut text = serde_json::to_string_pretty(&structured).unwrap_or_default();
+        let mut text = jsonl_text(&structured, "messages");
         if truncated {
             text.push_str(&truncation_note("messages", HEAD_ADVICE));
         }
@@ -633,10 +657,13 @@ fn tool_project(p: &Params<'_>, base: &FilterArgs) -> Result<ToolOutput, String>
         .iter()
         .map(|r| Value::Object(crate::output::project_to_json(r, &fields)))
         .collect();
-    Ok(ToolOutput::json(json!({
-        "scope": args::dir_only_scope_json(&filter),
-        "projects": rows,
-    })))
+    Ok(ToolOutput::jsonl(
+        json!({
+            "scope": args::dir_only_scope_json(&filter),
+            "projects": rows,
+        }),
+        "projects",
+    ))
 }
 
 // ─── memory ───────────────────────────────────────────────────────────
@@ -700,11 +727,14 @@ fn tool_memory(p: &Params<'_>, base: &FilterArgs) -> Result<ToolOutput, String> 
         }
     }
     let rows: Vec<Value> = rows.into_iter().map(Value::Object).collect();
-    Ok(ToolOutput::json(json!({
-        "scope": args::scope_json(&filter),
-        "memory": rows,
-        "truncated": truncated,
-    })))
+    Ok(ToolOutput::jsonl(
+        json!({
+            "scope": args::scope_json(&filter),
+            "memory": rows,
+            "truncated": truncated,
+        }),
+        "memory",
+    ))
 }
 
 // ─── agent ────────────────────────────────────────────────────────────
@@ -719,19 +749,25 @@ fn tool_agent(p: &Params<'_>, base: &FilterArgs) -> Result<ToolOutput, String> {
         &filter,
         scope_dir.as_deref(),
     ))?;
-    Ok(ToolOutput::json(json!({
-        "scope": scope,
-        "agents": stats,
-    })))
+    Ok(ToolOutput::jsonl(
+        json!({
+            "scope": scope,
+            "agents": stats,
+        }),
+        "agents",
+    ))
 }
 
 // ─── list_agents ──────────────────────────────────────────────────────
 
 fn tool_list_agents(p: &Params<'_>) -> Result<ToolOutput, String> {
     p.check_allowed(&[])?;
-    Ok(ToolOutput::json(json!({
-        "agents": list_agents::agent_defs_to_json(),
-    })))
+    Ok(ToolOutput::jsonl(
+        json!({
+            "agents": list_agents::agent_defs_to_json(),
+        }),
+        "agents",
+    ))
 }
 
 #[cfg(test)]
@@ -784,6 +820,23 @@ mod tests {
         assert!(fit_chars(&mut v, 6, |s| s.len()));
         assert_eq!(v, vec!["aaaa".to_string(), "bb".to_string()]);
         assert!(!fit_chars(&mut v, 0, |s| s.len()));
+    }
+
+    #[test]
+    fn jsonl_text_puts_meta_first_then_one_item_per_line() {
+        let v = json!({"scope": {"all": true}, "sessions": [{"id": "a"}, {"id": "b"}], "total": 2});
+        let text = jsonl_text(&v, "sessions");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[0]).unwrap(),
+            json!({"scope": {"all": true}, "total": 2})
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[2]).unwrap(),
+            json!({"id": "b"})
+        );
+        assert_eq!(jsonl_text(&json!({"agents": []}), "agents"), "{}");
     }
 
     #[test]
