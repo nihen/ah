@@ -71,6 +71,22 @@ impl Request {
             .get("io.modelcontextprotocol/protocolVersion")?
             .as_str()
     }
+
+    /// Whether `_meta` carries the per-request envelope keys of 2026-07-28
+    /// (version, identity, capabilities, log level). Other reserved keys,
+    /// such as `related-task` from 2025-11-25, do not mark a modern client.
+    pub fn has_modern_meta(&self) -> bool {
+        const MODERN_KEYS: [&str; 4] = [
+            "io.modelcontextprotocol/protocolVersion",
+            "io.modelcontextprotocol/clientInfo",
+            "io.modelcontextprotocol/clientCapabilities",
+            "io.modelcontextprotocol/logLevel",
+        ];
+        self.params
+            .get("_meta")
+            .and_then(Value::as_object)
+            .is_some_and(|m| MODERN_KEYS.iter().any(|k| m.contains_key(*k)))
+    }
 }
 
 /// A protocol-level error (as opposed to a tool execution error, which is

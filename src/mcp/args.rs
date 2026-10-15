@@ -199,7 +199,7 @@ pub fn common_schema(name: &str) -> Value {
             json!({"type": "string", "description": "Only this agent (e.g. claude, codex, gemini); see list_agents"})
         }
         PROJECT => {
-            json!({"type": "string", "description": "Only this project name (usually the basename of the working directory)"})
+            json!({"type": "string", "description": "Only this project name (usually the basename of the working directory). In log, search and memory it narrows within the directory scope, like the CLI's --project; add all: true there to search every directory"})
         }
         SINCE => {
             json!({"type": "string", "description": "Only sessions modified after this time: YYYY-MM-DD, 'YYYY-MM-DD HH:MM', or relative like 3d, 1w, 12h, 2m (~60 days)"})

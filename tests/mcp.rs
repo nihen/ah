@@ -245,8 +245,27 @@ fn modern_discover_and_version_errors() {
             json!({"jsonrpc": "2.0", "id": 5, "method": "ping", "params": {"_meta": meta}}),
             json!({"jsonrpc": "2.0", "id": 6, "method": "tools/list",
                 "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}}),
+            json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list",
+                "params": {"_meta": {"io.modelcontextprotocol/clientCapabilities": {}}}}),
+            json!({"jsonrpc": "2.0", "id": 8, "method": "tools/list",
+                "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": 7,
+                    "io.modelcontextprotocol/clientCapabilities": {}}}}),
         ],
     );
+    // A modern envelope without a string protocol version is malformed,
+    // not a legacy request.
+    assert_eq!(by_id(&out, 7)["error"]["code"], json!(-32602));
+    assert_eq!(by_id(&out, 8)["error"]["code"], json!(-32602));
+    // Legacy _meta keys (progress tokens, trace context) are not an envelope.
+    let legacy = home.batch(
+        &[],
+        &[
+            init(),
+            json!({"jsonrpc": "2.0", "id": 9, "method": "ping",
+                "params": {"_meta": {"progressToken": "p1", "traceparent": "00-x-y-01"}}}),
+        ],
+    );
+    assert_eq!(by_id(&legacy, 9)["result"], json!({}));
     assert_eq!(by_id(&out, 5)["result"]["resultType"], json!("complete"));
     assert_eq!(
         by_id(&out, 6)["error"]["code"],

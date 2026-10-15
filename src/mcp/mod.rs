@@ -177,8 +177,19 @@ fn handle_line(shared: &Shared, base: &FilterArgs, line: &str) {
         return;
     };
 
-    // Modern requests name their protocol version per request.
+    // Modern requests name their protocol version per request. A modern
+    // envelope whose version is missing or not a string is malformed, not
+    // a legacy request.
     let modern = req.meta_protocol_version().is_some();
+    if !modern && req.has_modern_meta() {
+        shared.write(&rpc::error(
+            &id,
+            &RpcError::invalid_params(
+                "_meta is missing a string io.modelcontextprotocol/protocolVersion",
+            ),
+        ));
+        return;
+    }
     if let Some(version) = req.meta_protocol_version() {
         if !MODERN_VERSIONS.contains(&version) {
             let mut err = RpcError::new(
