@@ -613,15 +613,17 @@ fn running_in(
 }
 
 /// Whether a `response_item` payload was produced by the model: an
-/// assistant message, reasoning or a tool call, but not user or developer
-/// messages and not tool outputs.
+/// assistant message, reasoning or a tool call (`*_call`). User and
+/// developer messages, tool outputs, messages from other agents and local
+/// records such as `ghost_snapshot` are not.
 fn is_model_output(payload: Option<&serde_json::Value>) -> bool {
     let Some(payload) = payload else {
         return false;
     };
     match payload.get("type").and_then(|v| v.as_str()) {
         Some("message") => payload.get("role").and_then(|v| v.as_str()) == Some("assistant"),
-        Some(kind) => !kind.ends_with("_output"),
+        Some("reasoning") => true,
+        Some(kind) => kind.ends_with("_call"),
         None => false,
     }
 }
@@ -959,12 +961,17 @@ mod tests {
             r#"{"type":"response_item","payload":{"type":"function_call","name":"shell"}}"#,
         );
         body.push('\n');
-        // Aborted before any reply: user input and tool output only.
+        // Aborted before any reply: user input, a local undo snapshot, a
+        // message from another agent and tool output only.
         body.push_str(r#"{"type":"turn_context","payload":{"model":"gpt-aborted"}}"#);
         body.push('\n');
         body.push_str(
             r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}"#,
         );
+        body.push('\n');
+        body.push_str(r#"{"type":"response_item","payload":{"type":"ghost_snapshot"}}"#);
+        body.push('\n');
+        body.push_str(r#"{"type":"response_item","payload":{"type":"agent_message"}}"#);
         body.push('\n');
         body.push_str(
             r#"{"type":"response_item","payload":{"type":"function_call_output","output":"x"}}"#,

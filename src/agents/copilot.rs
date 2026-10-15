@@ -297,15 +297,22 @@ impl AgentPlugin for CopilotPlugin {
 
     /// The models that actually answered; `session.start` only records the
     /// selection, which may be `auto`. Older logs name the model on tool
-    /// executions and at shutdown but not on assistant messages.
+    /// executions and at shutdown but not on assistant messages. Shutdown's
+    /// `currentModel` is only the selection, so it counts when the same
+    /// event's `modelMetrics` shows requests to it.
     fn resolve_model(&self, path: &Path) -> Option<String> {
         super::common::jsonl_models(&Self::events_path(path)?, b"odel\"", |val| {
-            let key = match val.get("type")?.as_str()? {
-                "assistant.message" | "tool.execution_complete" => "/data/model",
-                "session.shutdown" => "/data/currentModel",
+            let data = val.get("data")?;
+            let model = match val.get("type")?.as_str()? {
+                "assistant.message" | "tool.execution_complete" => data.get("model")?.as_str()?,
+                "session.shutdown" => {
+                    let current = data.get("currentModel")?.as_str()?;
+                    data.get("modelMetrics")?.get(current)?;
+                    current
+                }
                 _ => return None,
             };
-            val.pointer(key)?.as_str().filter(|model| *model != "auto")
+            (model != "auto").then_some(model)
         })
     }
 
@@ -729,5 +736,34 @@ paras: >\n  one\n  two\n\n  three\n";
         assert_eq!(PLUGIN.resolve_model(&path), None);
         let path = session(tmp.path(), "m3", WORKSPACE, None);
         assert_eq!(PLUGIN.resolve_model(&path), None);
+        // Closed before any reply: shutdown only repeats the selection.
+        let no_reply = concat!(
+            r#"{"type":"session.start","data":{"selectedModel":"gpt-6-luna"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"currentModel":"gpt-6-luna"}}"#,
+        );
+        let path = session(tmp.path(), "m4", WORKSPACE, Some(no_reply));
+        assert_eq!(PLUGIN.resolve_model(&path), None);
+        // Older log: the reply names no model, shutdown does.
+        let legacy = concat!(
+            r#"{"type":"assistant.message","data":{"content":"x"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"currentModel":"claude-opus-4.6","modelMetrics":{"claude-opus-4.6":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m5", WORKSPACE, Some(legacy));
+        assert_eq!(
+            PLUGIN.resolve_model(&path).as_deref(),
+            Some("claude-opus-4.6")
+        );
+        // Switched to another model after the last reply.
+        let switched = concat!(
+            r#"{"type":"assistant.message","data":{"model":"gpt-6-luna","content":"x"}}"#,
+            "\n",
+            r#"{"type":"session.model_change","data":{"newModel":"claude-opus-4.6"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"currentModel":"claude-opus-4.6","modelMetrics":{"gpt-6-luna":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m6", WORKSPACE, Some(switched));
+        assert_eq!(PLUGIN.resolve_model(&path).as_deref(), Some("gpt-6-luna"));
     }
 }
