@@ -112,6 +112,9 @@ fn collect(
     let per_pattern: Vec<Vec<PathBuf>> = patterns
         .par_iter()
         .map(|(_, pattern, _)| {
+            if crate::cancel::checkpoint() {
+                return Vec::new();
+            }
             glob::glob(pattern)
                 .map(|entries| entries.flatten().collect::<Vec<_>>())
                 .unwrap_or_default()
@@ -138,6 +141,9 @@ fn collect(
             let owned = |path: &PathBuf| config::find_plugin_for_path(path).id() == plugin.id();
             let mut files = Vec::new();
             for path in paths {
+                if crate::cancel::requested() {
+                    break;
+                }
                 // A match of an extra pattern without its own marker that does
                 // not map back to this plugin could not be parsed later, so it
                 // is skipped (and never opened) instead of listed as unknown.
@@ -188,6 +194,9 @@ fn collect(
     let mut entries: Vec<(PathBuf, SystemTime)> = all_paths
         .into_par_iter()
         .filter_map(|path| {
+            if crate::cancel::checkpoint() {
+                return None;
+            }
             let plugin = config::find_plugin_for_path(&path);
             // No active owner (e.g. a file attributed to a disabled agent):
             // it could not be parsed, and disabled agents stay hidden.

@@ -282,6 +282,9 @@ impl AgentPlugin for GrokPlugin {
                 .map(|n| n.to_string_lossy().to_string())
         };
         for entry in entries.flatten() {
+            if crate::cancel::checkpoint() {
+                break;
+            }
             let dir = entry.path();
             if !dir.is_dir() {
                 continue;

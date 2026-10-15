@@ -270,6 +270,9 @@ fn expand_sources(
         if source.kind == MemoryKind::Skill && !with_skills {
             continue;
         }
+        if crate::cancel::checkpoint() {
+            break;
+        }
         let mut paths = glob_files(&source.pattern());
         paths.sort();
         entries.extend(
@@ -454,6 +457,9 @@ fn collect_known_project_cwds() -> Vec<String> {
     let cwds: HashSet<String> = files
         .par_iter()
         .filter_map(|(path, mtime)| {
+            if crate::cancel::checkpoint() {
+                return None;
+            }
             let plugin = agents::find_plugin_for_path(path);
             let fields = resolver::resolve_fields(
                 path,
@@ -560,6 +566,9 @@ pub fn build_memory_records(
     let project_entries: Vec<Vec<MemoryEntry>> = project_dirs
         .par_iter()
         .map(|dir| {
+            if crate::cancel::checkpoint() {
+                return Vec::new();
+            }
             // Only the project directory itself is resolved: a symlinked
             // directory inside the project (e.g. `.claude/rules` shared with
             // `~/.claude/rules`) keeps its files attributed to the project.
@@ -606,6 +615,9 @@ pub fn build_memory_records(
     let mut records: Vec<BTreeMap<MemoryField, String>> = entries
         .into_iter()
         .filter_map(|entry| {
+            if crate::cancel::checkpoint() {
+                return None;
+            }
             // Agent filter
             // Shared files (project AGENTS.md) are read by several agents,
             // so they match any agent filter.

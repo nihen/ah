@@ -152,6 +152,9 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
     let sessions: Vec<(Session, SystemTime)> = files
         .par_iter()
         .filter_map(|(path, mtime)| {
+            if crate::cancel::checkpoint() {
+                return None;
+            }
             // Time range filter
             if let Some(since) = &params.since {
                 if mtime < since {

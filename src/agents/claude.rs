@@ -494,6 +494,9 @@ impl AgentPlugin for ClaudePlugin {
         memory_files
             .into_iter()
             .filter_map(|path| {
+                if crate::cancel::checkpoint() {
+                    return None;
+                }
                 let project_dir = path.parent()?.parent()?;
                 let encoded_name = project_dir.file_name()?.to_string_lossy().to_string();
                 let session_cwd = project_cwds.get(project_dir).cloned().flatten();

@@ -99,6 +99,9 @@ pub fn build_project_records(
     let resolved: Vec<ResolvedEntry> = files
         .par_iter()
         .filter_map(|(path, mtime)| {
+            if crate::cancel::checkpoint() {
+                return None;
+            }
             if let Some(ref since) = since {
                 if mtime < since {
                     return None;

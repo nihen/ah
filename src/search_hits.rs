@@ -63,6 +63,24 @@ pub fn run(
     if args.pattern.is_some() && filter.query.is_some() {
         return Err("Use either PATTERN or -q REGEX, not both".into());
     }
+    let mut args = args;
+    args.kind = kinds;
+    let (hits, _truncated) = collect_hits(&args, &mut filter)?;
+    if ia.interactive {
+        return crate::fuzzy::run_search_hits(&hits, ia, &filter);
+    }
+    print_hits(&hits, &args);
+    Ok(())
+}
+
+/// Enumerate occurrences for `args` (pattern, kinds, limits) across the
+/// sessions `filter` selects, local and remote, sorted newest first. The
+/// pattern comes from `args.pattern` or `filter.query`; `filter.query` is
+/// set to it on return. The flag is `true` when `max_matches` cut the list.
+pub(crate) fn collect_hits(
+    args: &MatchSearchArgs,
+    filter: &mut FilterArgs,
+) -> Result<(Vec<SearchHit>, bool), String> {
     let query = args
         .pattern
         .as_ref()
@@ -75,6 +93,13 @@ pub fn run(
     // Validate remotes before doing local work. A failed/old remote is an error,
     // never a silently incomplete successful search.
     crate::remote::resolve_remotes(&filter.remote)?;
+    let kinds = &args.kind;
+    // One extra occurrence tells whether the cap truncated the list.
+    let cap = if args.max_matches == 0 {
+        usize::MAX
+    } else {
+        args.max_matches + 1
+    };
     let params = PipelineParams {
         resolve_fields: vec![
             Field::Path,
@@ -105,12 +130,8 @@ pub fn run(
     });
     let mut hits = Vec::new();
     for session in sessions {
-        let remaining = if args.max_matches == 0 {
-            usize::MAX
-        } else {
-            args.max_matches.saturating_sub(hits.len())
-        };
-        if remaining == 0 {
+        let remaining = cap.saturating_sub(hits.len());
+        if remaining == 0 || crate::cancel::requested() {
             break;
         }
         let plugin = agents::find_plugin_for_path(&session.path);
@@ -118,7 +139,7 @@ pub fn run(
             &session.path,
             plugin,
             &pattern,
-            &kinds,
+            kinds,
             remaining,
             &mut |index, kind, loc, text| {
                 let (start, end) = (loc.start, loc.end);
@@ -143,9 +164,7 @@ pub fn run(
             },
         );
     }
-    let mut args = args;
-    args.kind = kinds;
-    hits.extend(crate::remote::fetch_search_hits(&args, &filter)?);
+    hits.extend(crate::remote::fetch_search_hits(args, filter)?);
     // Stable sorting preserves source order inside each session. Paths also
     // distinguish sessions with equal ids on different hosts.
     hits.sort_by(|a, b| {
@@ -155,14 +174,11 @@ pub fn run(
             .then_with(|| a.text_index.cmp(&b.text_index))
             .then_with(|| a.match_start.cmp(&b.match_start))
     });
+    let truncated = args.max_matches != 0 && hits.len() > args.max_matches;
     if args.max_matches != 0 {
         hits.truncate(args.max_matches);
     }
-    if ia.interactive {
-        return crate::fuzzy::run_search_hits(&hits, ia, &filter);
-    }
-    print_hits(&hits, &args);
-    Ok(())
+    Ok((hits, truncated))
 }
 
 type OccurrenceVisitor<'a> = dyn FnMut(usize, SearchKind, &Location, &str) + 'a;
@@ -180,6 +196,9 @@ pub(crate) fn visit_typed_occurrences(
     plugin.iter_search_records(
         path,
         &mut RecordVisitor::new(&mut |record, fragment, kind, text, fingerprint| {
+            if crate::cancel::checkpoint() {
+                return false;
+            }
             index += 1;
             if !kinds.is_empty() && !kinds.contains(&kind) {
                 return true;

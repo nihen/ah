@@ -138,6 +138,12 @@ impl AgyPlugin {
 }
 
 impl AgentPlugin for AgyPlugin {
+    fn clear_caches(&self) {
+        if let Ok(mut c) = CWD_INDEX_CACHE.lock() {
+            c.clear();
+        }
+    }
+
     fn id(&self) -> &'static str {
         "agy"
     }
