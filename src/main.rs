@@ -46,6 +46,18 @@ fn main() {
 
     let cli = Cli::parse();
 
+    if let Commands::Mcp(_) = &cli.command {
+        // stdout is the protocol channel: no pager, no color. The global
+        // filters are the tools' default scope; -A is rejected inside.
+        color::init_color(false, true);
+        color::init_debug(cli.filter.debug);
+        if let Err(e) = mcp::serve(cli.filter, &cli.ia) {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
     let mut filter = cli.filter;
 
     // -A: expand to -a + all configured remotes (union with any explicit --remote)
@@ -249,6 +261,7 @@ fn main() {
         Commands::ListAgents(args) => {
             list_agents::run(args.output_format());
         }
+        Commands::Mcp(_) => unreachable!("handled before dispatch"),
     }
 }
 

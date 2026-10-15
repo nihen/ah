@@ -21,6 +21,7 @@ Commands:
 
 Help / setup:
   list-agents         List supported agents
+  mcp                 Serve sessions to MCP clients over stdio
   completion          Generate shell completion script
   man                 Generate man page
 
