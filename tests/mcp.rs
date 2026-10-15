@@ -309,6 +309,34 @@ fn modern_discover_and_version_errors() {
 }
 
 #[test]
+fn invalid_utf8_line_is_a_parse_error_not_a_shutdown() {
+    let home = Home::new();
+    let mut child = home.command(&[]).spawn().unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"x\":\"\xff\xfe\"}\n")
+            .unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+        )
+        .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let out: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert_eq!(out[0]["error"]["code"], json!(-32700));
+    assert_eq!(by_id(&out, 2)["result"], json!({}));
+}
+
+#[test]
 fn protocol_errors() {
     let home = Home::new();
     let mut child = home.command(&[]).spawn().unwrap();

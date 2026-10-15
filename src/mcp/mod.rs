@@ -107,18 +107,29 @@ fn run(filter: FilterArgs) {
     };
 
     let stdin = std::io::stdin();
-    let mut line = String::new();
+    let mut buf = Vec::new();
     loop {
-        line.clear();
-        match stdin.lock().read_line(&mut line) {
+        buf.clear();
+        // Read bytes, not a `String`: a line that is not valid UTF-8 is a
+        // parse error for that message, not a reason to shut down.
+        match stdin.lock().read_until(b'\n', &mut buf) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let line = match std::str::from_utf8(&buf) {
+            Ok(s) => s.trim(),
+            Err(e) => {
+                shared.write(&rpc::error(
+                    &Value::Null,
+                    &RpcError::new(rpc::PARSE_ERROR, format!("Parse error: {}", e)),
+                ));
+                continue;
+            }
+        };
+        if line.is_empty() {
             continue;
         }
-        handle_line(&shared, &base, trimmed);
+        handle_line(&shared, &base, line);
     }
 
     // EOF: stop accepting, let queued calls finish, then exit. `closed` is

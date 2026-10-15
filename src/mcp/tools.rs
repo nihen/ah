@@ -484,24 +484,44 @@ fn fit_records_around_selected(records: &mut Vec<show::AtRecord>, max: usize) ->
     let len = |r: &show::AtRecord| r.text.chars().count();
     let mut total: usize = records.iter().map(len).sum();
     let mut dropped = false;
-    while total > max && records.len() > 1 {
-        let Some(sel) = records.iter().position(|r| r.selected) else {
-            let last = records.pop().unwrap();
-            total -= len(&last);
-            dropped = true;
-            continue;
-        };
-        // Farthest from the selection by source record number (a record
-        // may span several fragments), then by fragment distance, then
-        // the later fragment.
-        let sel_record = records[sel].record;
-        let victim = (0..records.len())
-            .filter(|&i| i != sel)
-            .max_by_key(|&i| (records[i].record.abs_diff(sel_record), i.abs_diff(sel), i))
-            .unwrap();
-        total -= len(&records[victim]);
-        records.remove(victim);
-        dropped = true;
+    match records.iter().position(|r| r.selected) {
+        None => {
+            while total > max && records.len() > 1 {
+                let last = records.pop().unwrap();
+                total -= len(&last);
+                dropped = true;
+            }
+        }
+        Some(sel) => {
+            // Records come in source order, so the fragment farthest from
+            // the selection (by record number, then fragment distance, then
+            // the later one) is always one of the two ends of the retained
+            // range: shrink the range from its ends and cut once.
+            let sel_record = records[sel].record;
+            let key = |i: usize| (records[i].record.abs_diff(sel_record), i.abs_diff(sel), i);
+            let (mut lo, mut hi) = (0, records.len() - 1);
+            while total > max && lo < hi {
+                if crate::cancel::requested() {
+                    break;
+                }
+                let victim = if hi == sel {
+                    lo
+                } else if lo == sel || key(hi) >= key(lo) {
+                    hi
+                } else {
+                    lo
+                };
+                total -= len(&records[victim]);
+                dropped = true;
+                if victim == hi {
+                    hi -= 1;
+                } else {
+                    lo += 1;
+                }
+            }
+            records.truncate(hi + 1);
+            records.drain(..lo);
+        }
     }
     // The selected record alone may still exceed the limit (a huge tool
     // output): keep a window of `max` characters around the match.
@@ -878,6 +898,16 @@ mod tests {
         assert!(fit_records_around_selected(&mut records, 6));
         let left: Vec<(usize, usize)> = records.iter().map(|r| (r.record, r.fragment)).collect();
         assert_eq!(left, [(2, 2), (3, 1)]);
+        // Many fragments on both sides: the retained range stays centred.
+        let mut records: Vec<show::AtRecord> =
+            (1..=4000).map(|i| rec(i, 1, i == 2000, "abcd")).collect();
+        assert!(fit_records_around_selected(&mut records, 4 * 11));
+        let left: Vec<usize> = records.iter().map(|r| r.record).collect();
+        assert_eq!(left, (1995..=2005).collect::<Vec<_>>());
+        // Nothing is dropped when it fits.
+        let mut records = vec![rec(1, 1, false, "a"), rec(2, 1, true, "b")];
+        assert!(!fit_records_around_selected(&mut records, 10));
+        assert_eq!(records.len(), 2);
     }
 
     #[test]
