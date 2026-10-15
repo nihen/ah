@@ -256,6 +256,12 @@ fn modern_discover_and_version_errors() {
     // not a legacy request.
     assert_eq!(by_id(&out, 7)["error"]["code"], json!(-32602));
     assert_eq!(by_id(&out, 8)["error"]["code"], json!(-32602));
+    // The discovery probe must carry the envelope too.
+    let bare = home.batch(
+        &[],
+        &[json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})],
+    );
+    assert_eq!(by_id(&bare, 1)["error"]["code"], json!(-32602));
     // Legacy _meta keys (progress tokens, trace context) are not an envelope.
     let legacy = home.batch(
         &[],

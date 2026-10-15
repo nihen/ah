@@ -213,6 +213,12 @@ fn handle_line(shared: &Shared, base: &FilterArgs, line: &str) {
 
     let result = match req.method.as_str() {
         "initialize" => Ok(initialize_result(base, req.params_map())),
+        // The discovery probe is a modern request and must carry the
+        // envelope; without it a client would wrongly conclude modern
+        // negotiation succeeded instead of falling back to initialize.
+        "server/discover" if !modern => Err(RpcError::invalid_params(
+            "server/discover requires _meta with io.modelcontextprotocol/protocolVersion",
+        )),
         "server/discover" => Ok(discover_result(base)),
         "ping" => Ok(finish(json!({}), modern, false)),
         "tools/list" => Ok(finish(
