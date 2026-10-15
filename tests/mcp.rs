@@ -714,10 +714,14 @@ fn show_formats_and_truncation() {
     assert_eq!(s3["markdown"].as_str().unwrap().chars().count(), 12);
     assert_eq!(s3["markdown"], json!("## User\n\n日本語"));
     assert!(
-        r3["result"]["content"][0]["text"]
+        r3["result"]["content"][1]["text"]
             .as_str()
             .unwrap()
             .contains("[truncated")
+    );
+    assert!(
+        r1["result"]["content"].as_array().unwrap().len() == 1,
+        "no note block unless truncated"
     );
 
     let r4 = structured(&out, 4);
@@ -1143,10 +1147,16 @@ fn show_at_cuts_a_huge_selected_record_to_a_window() {
     let text = r2["records"][0]["text"].as_str().unwrap();
     assert_eq!(text.chars().count(), 200);
     assert!(text.contains("needle"));
+    let content = by_id(&out, 2)["result"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
     assert!(
-        by_id(&out, 2)["result"]["content"][0]["text"]
+        content[1]["text"]
             .as_str()
             .unwrap()
             .contains("smaller context")
     );
+    // The first block stays valid JSON Lines even when truncated.
+    for line in content[0]["text"].as_str().unwrap().lines() {
+        serde_json::from_str::<Value>(line).unwrap();
+    }
 }

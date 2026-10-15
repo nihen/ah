@@ -382,18 +382,24 @@ fn worker_loop(shared: &Shared, base: &FilterArgs) {
             continue;
         }
         let msg = match outcome {
-            Ok(Ok(Ok(output))) => rpc::response(
-                &job.id,
-                finish(
-                    json!({
-                        "content": [{ "type": "text", "text": output.text }],
-                        "structuredContent": output.structured,
-                        "isError": false,
-                    }),
-                    job.modern,
-                    false,
-                ),
-            ),
+            Ok(Ok(Ok(output))) => {
+                let mut content = vec![json!({ "type": "text", "text": output.text })];
+                if let Some(note) = output.note {
+                    content.push(json!({ "type": "text", "text": note }));
+                }
+                rpc::response(
+                    &job.id,
+                    finish(
+                        json!({
+                            "content": content,
+                            "structuredContent": output.structured,
+                            "isError": false,
+                        }),
+                        job.modern,
+                        false,
+                    ),
+                )
+            }
             Ok(Ok(Err(message))) => rpc::response(
                 &job.id,
                 finish(

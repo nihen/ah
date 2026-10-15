@@ -24,6 +24,9 @@ pub const DEFAULT_MAX_CHARS: u64 = 100_000;
 pub struct ToolOutput {
     pub text: String,
     pub structured: Value,
+    /// A plain-text remark sent as a second content block (so the first
+    /// block stays valid JSON Lines), e.g. that the result was truncated.
+    pub note: Option<String>,
 }
 
 impl ToolOutput {
@@ -32,18 +35,28 @@ impl ToolOutput {
     /// per item. Smaller than pretty JSON, and each line parses on its own.
     fn jsonl(structured: Value, items: &str) -> Self {
         let text = jsonl_text(&structured, items);
-        Self { text, structured }
+        Self {
+            text,
+            structured,
+            note: None,
+        }
     }
 }
 
-/// Render `structured` as JSON Lines (see `ToolOutput::jsonl`).
+/// Render `structured` as JSON Lines (see `ToolOutput::jsonl`). A value
+/// under `items` that is not an array stays on the first line.
 fn jsonl_text(structured: &Value, items: &str) -> String {
     let mut head = structured.clone();
-    let list = head
-        .as_object_mut()
-        .and_then(|m| m.remove(items))
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
+    let list = match head.as_object_mut().and_then(|m| m.remove(items)) {
+        Some(Value::Array(list)) => list,
+        Some(other) => {
+            if let Some(m) = head.as_object_mut() {
+                m.insert(items.to_string(), other);
+            }
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
     let mut out = serde_json::to_string(&head).unwrap_or_default();
     for item in &list {
         out.push('\n');
@@ -524,8 +537,11 @@ fn window_around_match(r: &mut show::AtRecord, max: usize) {
     r.match_end = r.match_end.map(clamp);
 }
 
-fn truncation_note(what: &str, advice: &str) -> String {
-    format!("\n\n[truncated: {} exceeded max_chars; {}]", what, advice)
+fn truncation_note(what: &str, advice: &str) -> Option<String> {
+    Some(format!(
+        "[truncated: {} exceeded max_chars; {}]",
+        what, advice
+    ))
 }
 
 const HEAD_ADVICE: &str = "use head or a larger max_chars";
@@ -586,11 +602,13 @@ fn tool_show(p: &Params<'_>) -> Result<ToolOutput, String> {
             "records": records,
             "truncated": truncated,
         });
-        let mut text = jsonl_text(&structured, "records");
-        if truncated {
-            text.push_str(&truncation_note("records", AT_ADVICE));
-        }
-        return Ok(ToolOutput { text, structured });
+        return Ok(ToolOutput {
+            text: jsonl_text(&structured, "records"),
+            structured,
+            note: truncated
+                .then(|| truncation_note("records", AT_ADVICE))
+                .flatten(),
+        });
     }
 
     if format == "json" {
@@ -605,26 +623,27 @@ fn tool_show(p: &Params<'_>) -> Result<ToolOutput, String> {
             "messages": messages,
             "truncated": truncated,
         });
-        let mut text = jsonl_text(&structured, "messages");
-        if truncated {
-            text.push_str(&truncation_note("messages", HEAD_ADVICE));
-        }
-        return Ok(ToolOutput { text, structured });
+        return Ok(ToolOutput {
+            text: jsonl_text(&structured, "messages"),
+            structured,
+            note: truncated
+                .then(|| truncation_note("messages", HEAD_ADVICE))
+                .flatten(),
+        });
     }
 
     let markdown = show::render_md(&path, head);
     let (markdown, truncated) = truncate_chars(&markdown, max_chars);
-    let mut text = markdown.clone();
-    if truncated {
-        text.push_str(&truncation_note("transcript", HEAD_ADVICE));
-    }
     Ok(ToolOutput {
-        text,
+        text: markdown.clone(),
         structured: json!({
             "session": session_json,
             "markdown": markdown,
             "truncated": truncated,
         }),
+        note: truncated
+            .then(|| truncation_note("transcript", HEAD_ADVICE))
+            .flatten(),
     })
 }
 
@@ -837,6 +856,11 @@ mod tests {
             json!({"id": "b"})
         );
         assert_eq!(jsonl_text(&json!({"agents": []}), "agents"), "{}");
+        // A non-array under the list key is kept on the first line.
+        assert_eq!(
+            jsonl_text(&json!({"agents": 3}), "agents"),
+            "{\"agents\":3}"
+        );
     }
 
     #[test]
