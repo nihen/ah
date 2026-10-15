@@ -65,7 +65,9 @@ pub fn run(
     }
     let mut args = args;
     args.kind = kinds;
-    let (hits, _truncated) = collect_hits(&args, &mut filter)?;
+    // The CLI prints what it finds; it never needs the lookahead that tells
+    // whether the cap cut the list.
+    let (hits, _truncated) = collect_hits(&args, &mut filter, false)?;
     if ia.interactive {
         return crate::fuzzy::run_search_hits(&hits, ia, &filter);
     }
@@ -76,10 +78,14 @@ pub fn run(
 /// Enumerate occurrences for `args` (pattern, kinds, limits) across the
 /// sessions `filter` selects, local and remote, sorted newest first. The
 /// pattern comes from `args.pattern` or `filter.query`; `filter.query` is
-/// set to it on return. The flag is `true` when `max_matches` cut the list.
+/// set to it on return. With `lookahead`, one occurrence beyond
+/// `max_matches` is scanned for locally so the flag can report whether the
+/// cap cut the list (remote hosts never look ahead); without it the scan
+/// stops at the cap and the flag is always `false`.
 pub(crate) fn collect_hits(
     args: &MatchSearchArgs,
     filter: &mut FilterArgs,
+    lookahead: bool,
 ) -> Result<(Vec<SearchHit>, bool), String> {
     let query = args
         .pattern
@@ -94,12 +100,7 @@ pub(crate) fn collect_hits(
     // never a silently incomplete successful search.
     crate::remote::resolve_remotes(&filter.remote)?;
     let kinds = &args.kind;
-    // One extra occurrence tells whether the cap truncated the list.
-    let cap = if args.max_matches == 0 {
-        usize::MAX
-    } else {
-        args.max_matches.saturating_add(1)
-    };
+    let cap = scan_cap(args.max_matches, lookahead);
     let params = PipelineParams {
         resolve_fields: vec![
             Field::Path,
@@ -174,11 +175,23 @@ pub(crate) fn collect_hits(
             .then_with(|| a.text_index.cmp(&b.text_index))
             .then_with(|| a.match_start.cmp(&b.match_start))
     });
-    let truncated = args.max_matches != 0 && hits.len() > args.max_matches;
+    // Only a local lookahead can tell; remote hosts return at most the cap.
+    let truncated = lookahead && args.max_matches != 0 && hits.len() > args.max_matches;
     if args.max_matches != 0 {
         hits.truncate(args.max_matches);
     }
     Ok((hits, truncated))
+}
+
+/// How many occurrences to collect before stopping: the cap itself, or one
+/// more when the caller wants to know whether the cap truncated the list.
+/// `0` means unlimited.
+fn scan_cap(max_matches: usize, lookahead: bool) -> usize {
+    match (max_matches, lookahead) {
+        (0, _) => usize::MAX,
+        (n, true) => n.saturating_add(1),
+        (n, false) => n,
+    }
 }
 
 type OccurrenceVisitor<'a> = dyn FnMut(usize, SearchKind, &Location, &str) + 'a;
@@ -422,6 +435,15 @@ pub(crate) fn display_text(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_cap_stops_at_the_limit_unless_lookahead() {
+        assert_eq!(scan_cap(0, false), usize::MAX);
+        assert_eq!(scan_cap(0, true), usize::MAX);
+        assert_eq!(scan_cap(1, false), 1, "the CLI stops at its limit");
+        assert_eq!(scan_cap(1, true), 2);
+        assert_eq!(scan_cap(usize::MAX, true), usize::MAX);
+    }
 
     #[test]
     fn highlight_tracks_the_original_occurrence_and_clipped_unicode_match() {

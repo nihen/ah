@@ -434,7 +434,7 @@ fn tool_search(p: &Params<'_>, base: &FilterArgs) -> Result<ToolOutput, String> 
         snippet_length,
     };
     apply_collector_flags(&filter);
-    let (hits, truncated) = search_hits::collect_hits(&search_args, &mut filter)?;
+    let (hits, truncated) = search_hits::collect_hits(&search_args, &mut filter, true)?;
     Ok(ToolOutput::jsonl(
         json!({
             "scope": args::scope_json(&filter),
