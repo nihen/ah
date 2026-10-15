@@ -143,14 +143,15 @@ fn handle_line(shared: &Shared, base: &FilterArgs, line: &str) {
             return;
         }
     };
-    if !value.is_object() {
-        shared.write(&rpc::error(
-            &Value::Null,
-            &RpcError::new(
-                rpc::INVALID_REQUEST,
-                "Invalid Request: expected a JSON object",
-            ),
-        ));
+    // Validate the JSON-RPC shape on the raw value: serde would fold an
+    // explicit `null` id or params into "absent".
+    if let Err(e) = rpc::validate_shape(&value) {
+        // A malformed id cannot be echoed; such requests get a null id.
+        let id = match value.get("id") {
+            Some(id) if rpc::is_valid_id(id) => id.clone(),
+            _ => Value::Null,
+        };
+        shared.write(&rpc::error(&id, &RpcError::new(rpc::INVALID_REQUEST, e)));
         return;
     }
     let req: Request = match serde_json::from_value(value) {
@@ -163,15 +164,6 @@ fn handle_line(shared: &Shared, base: &FilterArgs, line: &str) {
             return;
         }
     };
-    if let Err(e) = req.validate() {
-        // A malformed id cannot be echoed; such requests get a null id.
-        let id = match &req.id {
-            Some(id) if id.is_string() || id.is_number() => id.clone(),
-            _ => Value::Null,
-        };
-        shared.write(&rpc::error(&id, &RpcError::new(rpc::INVALID_REQUEST, e)));
-        return;
-    }
     if crate::color::is_debug() {
         eprintln!(
             "[debug] mcp: {} id={}",

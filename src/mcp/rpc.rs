@@ -13,32 +13,45 @@ pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 #[derive(Debug, Deserialize)]
 pub struct Request {
     #[serde(default)]
-    pub jsonrpc: Option<String>,
-    #[serde(default)]
     pub id: Option<Value>,
     pub method: String,
     #[serde(default)]
     pub params: Value,
 }
 
-impl Request {
-    /// JSON-RPC 2.0 shape: `jsonrpc: "2.0"`, an id that is a string or a
-    /// number (MCP forbids null), params an object when present.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.jsonrpc.as_deref() != Some("2.0") {
-            return Err("Invalid Request: jsonrpc must be \"2.0\"".into());
+/// A request id MCP accepts: a string or an integer (never null or a float).
+pub fn is_valid_id(id: &Value) -> bool {
+    id.is_string() || id.is_i64() || id.is_u64()
+}
+
+/// JSON-RPC 2.0 shape of a raw message: a `jsonrpc: "2.0"` object whose
+/// `id`, when the key is present, is a valid id, and whose `params`, when
+/// present, is an object. Checked before deserializing so an explicit
+/// `null` is rejected instead of being read as an absent field.
+pub fn validate_shape(value: &Value) -> Result<(), String> {
+    let Some(obj) = value.as_object() else {
+        return Err("Invalid Request: expected a JSON object".into());
+    };
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err("Invalid Request: jsonrpc must be \"2.0\"".into());
+    }
+    if let Some(id) = obj.get("id") {
+        if !is_valid_id(id) {
+            return Err("Invalid Request: id must be a string or an integer".into());
         }
-        if let Some(id) = &self.id {
-            if !(id.is_string() || id.is_number()) {
-                return Err("Invalid Request: id must be a string or a number".into());
-            }
-        }
-        if !(self.params.is_null() || self.params.is_object()) {
+    }
+    if obj.get("method").and_then(Value::as_str).is_none() {
+        return Err("Invalid Request: method must be a string".into());
+    }
+    if let Some(params) = obj.get("params") {
+        if !params.is_object() {
             return Err("Invalid Request: params must be an object".into());
         }
-        Ok(())
     }
+    Ok(())
+}
 
+impl Request {
     /// Whether a modern request carries the required client capabilities.
     pub fn has_meta_client_capabilities(&self) -> bool {
         self.params

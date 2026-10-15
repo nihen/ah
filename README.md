@@ -754,7 +754,7 @@ Sessions default to the server's working directory, which the client decides (Cl
 
 - Tool calls run one at a time; a long search delays the next call. A waiting or running call can be cancelled with `notifications/cancelled` and gets no response.
 - `resume` is not offered. The `resume_cmd` field of `log` gives the shell command.
-- `log` truncates to `max_results` and `show`/`memory` to `max_chars` (whole messages or file bodies are dropped from the end; Markdown is cut on a character boundary) and report `truncated: true`.
+- `log` truncates to `max_results` and `show`/`memory` to `max_chars` and report `truncated: true`. Markdown is cut on a character boundary; `json` messages and `memory` bodies are dropped from the end; with `at`, context records farthest from the hit go first and the hit itself is cut to a window around the match.
 - Stdout carries only protocol messages; `--debug` logs to stderr.
 
 ## Configuration (~/.ahrc)

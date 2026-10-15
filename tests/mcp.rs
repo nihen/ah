@@ -326,6 +326,30 @@ fn protocol_errors() {
             json!({"jsonrpc": "2.0", "id": 13, "method": "ping", "params": [1]})
         )
         .unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": null, "method": "ping"})
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 15, "method": "ping", "params": null})
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 1.5, "method": "ping"})
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 17, "method": 5})
+        )
+        .unwrap();
     }
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
@@ -341,8 +365,18 @@ fn protocol_errors() {
         .collect();
     assert_eq!(
         codes,
-        [-32700, -32600, -32600],
-        "parse error, array message, array id"
+        [-32700, -32600, -32600, -32600, -32600],
+        "parse error, array message, array id, null id, float id"
+    );
+    assert_eq!(
+        by_id(&out, 15)["error"]["code"],
+        json!(-32600),
+        "params: null"
+    );
+    assert_eq!(
+        by_id(&out, 17)["error"]["code"],
+        json!(-32600),
+        "method not a string"
     );
     assert_eq!(by_id(&out, 10)["error"]["code"], json!(-32600));
     assert_eq!(by_id(&out, 11)["error"]["code"], json!(-32600));
@@ -356,7 +390,7 @@ fn protocol_errors() {
             .contains("Unknown tool")
     );
     assert_eq!(by_id(&out, 9)["error"]["code"], json!(-32602));
-    assert_eq!(out.len(), 10, "notifications get no response: {out:?}");
+    assert_eq!(out.len(), 14, "notifications get no response: {out:?}");
 }
 
 #[test]
@@ -1048,4 +1082,71 @@ fn eof_drains_queued_calls_before_exit() {
     for id in 1..=3 {
         structured(&out, id);
     }
+}
+
+#[test]
+fn show_at_cuts_a_huge_selected_record_to_a_window() {
+    let home = Home::new();
+    let big_id = "abc12345-0000-0000-0000-000000000003";
+    let big = format!("{}needle{}", "x".repeat(150_000), "y".repeat(150_000));
+    fs::write(
+        home.path().join(format!(".claude/projects/-tmp-proj/{big_id}.jsonl")),
+        format!(
+            "{{\"type\":\"system\",\"cwd\":\"/Users/test/big\"}}\n\
+             {{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n\
+             {{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{big}\"}}]}}}}\n"
+        ),
+    )
+    .unwrap();
+    let out = home.batch(
+        &[],
+        &[
+            init(),
+            call(
+                1,
+                "search",
+                json!({"dir": "/Users/test/big", "pattern": "needle"}),
+            ),
+        ],
+    );
+    let position = structured(&out, 1)["hits"][0]["position"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = home.batch(
+        &[],
+        &[
+            init(),
+            call(
+                1,
+                "show",
+                json!({"session": big_id, "at": position, "context": 0}),
+            ),
+            call(
+                2,
+                "show",
+                json!({"session": big_id, "at": position, "context": 0, "max_chars": 200}),
+            ),
+        ],
+    );
+    // The default limit applies even to a single huge record.
+    let r1 = structured(&out, 1);
+    assert_eq!(r1["truncated"], json!(true));
+    let text = r1["records"][0]["text"].as_str().unwrap();
+    assert_eq!(text.chars().count(), 100_000);
+    let (s, e) = (
+        r1["records"][0]["match_start"].as_u64().unwrap() as usize,
+        r1["records"][0]["match_end"].as_u64().unwrap() as usize,
+    );
+    assert_eq!(&text[s..e], "needle");
+    let r2 = structured(&out, 2);
+    let text = r2["records"][0]["text"].as_str().unwrap();
+    assert_eq!(text.chars().count(), 200);
+    assert!(text.contains("needle"));
+    assert!(
+        by_id(&out, 2)["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("smaller context")
+    );
 }

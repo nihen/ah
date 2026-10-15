@@ -275,11 +275,12 @@ fn expand_sources(
         }
         let mut paths = glob_files(&source.pattern());
         paths.sort();
-        entries.extend(
-            paths
-                .into_iter()
-                .filter_map(|p| read_entry(p, agent, project, source.kind)),
-        );
+        entries.extend(paths.into_iter().filter_map(|p| {
+            if crate::cancel::checkpoint() {
+                return None;
+            }
+            read_entry(p, agent, project, source.kind)
+        }));
     }
     entries
 }
@@ -341,6 +342,9 @@ fn glob_files(pattern: &str) -> Vec<PathBuf> {
             continue;
         };
         for entry in entries.flatten() {
+            if crate::cancel::requested() {
+                return files;
+            }
             let path = entry.path();
             if path.is_dir() {
                 if chain.len() <= RECURSIVE_GLOB_MAX_DEPTH {

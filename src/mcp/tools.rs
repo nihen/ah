@@ -462,15 +462,50 @@ fn fit_records_around_selected(records: &mut Vec<show::AtRecord>, max: usize) ->
         records.remove(victim);
         dropped = true;
     }
+    // The selected record alone may still exceed the limit (a huge tool
+    // output): keep a window of `max` characters around the match.
+    if total > max {
+        if let Some(r) = records.iter_mut().find(|r| r.selected) {
+            window_around_match(r, max);
+            dropped = true;
+        }
+    }
     dropped
 }
 
-fn truncation_note(what: &str) -> String {
-    format!(
-        "\n\n[truncated: {} exceeded max_chars; use head or a larger max_chars]",
-        what
-    )
+/// Cut `r.text` to `max` characters around its match (byte offsets), on
+/// character boundaries, and shift the match offsets accordingly.
+fn window_around_match(r: &mut show::AtRecord, max: usize) {
+    let chars: Vec<usize> = r.text.char_indices().map(|(b, _)| b).collect();
+    if chars.len() <= max {
+        return;
+    }
+    let match_start = r.match_start.unwrap_or(0).min(r.text.len());
+    let match_end = r.match_end.unwrap_or(match_start).min(r.text.len());
+    let start_char = chars.partition_point(|&b| b < match_start);
+    let end_char = chars.partition_point(|&b| b < match_end);
+    let match_chars = end_char.saturating_sub(start_char);
+    // Center the match; when the match itself is longer than the window,
+    // start at the match.
+    let lead = max.saturating_sub(match_chars) / 2;
+    let begin = start_char
+        .saturating_sub(lead)
+        .min(chars.len().saturating_sub(max));
+    let end = begin + max;
+    let byte_begin = chars[begin];
+    let byte_end = chars.get(end).copied().unwrap_or(r.text.len());
+    r.text = r.text[byte_begin..byte_end].to_string();
+    let clamp = |off: usize| off.saturating_sub(byte_begin).min(r.text.len());
+    r.match_start = r.match_start.map(clamp);
+    r.match_end = r.match_end.map(clamp);
 }
+
+fn truncation_note(what: &str, advice: &str) -> String {
+    format!("\n\n[truncated: {} exceeded max_chars; {}]", what, advice)
+}
+
+const HEAD_ADVICE: &str = "use head or a larger max_chars";
+const AT_ADVICE: &str = "use a smaller context or a larger max_chars";
 
 fn tool_show(p: &Params<'_>) -> Result<ToolOutput, String> {
     p.check_allowed(&["session", "format", "head", "at", "context", "max_chars"])?;
@@ -529,7 +564,7 @@ fn tool_show(p: &Params<'_>) -> Result<ToolOutput, String> {
         });
         let mut text = serde_json::to_string_pretty(&structured).unwrap_or_default();
         if truncated {
-            text.push_str(&truncation_note("records"));
+            text.push_str(&truncation_note("records", AT_ADVICE));
         }
         return Ok(ToolOutput { text, structured });
     }
@@ -548,7 +583,7 @@ fn tool_show(p: &Params<'_>) -> Result<ToolOutput, String> {
         });
         let mut text = serde_json::to_string_pretty(&structured).unwrap_or_default();
         if truncated {
-            text.push_str(&truncation_note("messages"));
+            text.push_str(&truncation_note("messages", HEAD_ADVICE));
         }
         return Ok(ToolOutput { text, structured });
     }
@@ -557,7 +592,7 @@ fn tool_show(p: &Params<'_>) -> Result<ToolOutput, String> {
     let (markdown, truncated) = truncate_chars(&markdown, max_chars);
     let mut text = markdown.clone();
     if truncated {
-        text.push_str(&truncation_note("transcript"));
+        text.push_str(&truncation_note("transcript", HEAD_ADVICE));
     }
     Ok(ToolOutput {
         text,
@@ -711,6 +746,36 @@ mod tests {
         );
         assert_eq!(truncate_chars("abc", 3), ("abc".to_string(), false));
         assert_eq!(truncate_chars("abc", 0), ("abc".to_string(), false));
+    }
+
+    #[test]
+    fn window_keeps_the_match_and_shifts_offsets() {
+        let text = format!("{}日本語needle{}", "a".repeat(100), "b".repeat(100));
+        let start = text.find("needle").unwrap();
+        let mut r = show::AtRecord {
+            record: 1,
+            fragment: 1,
+            kind: SearchKind::Assistant,
+            text,
+            selected: true,
+            match_start: Some(start),
+            match_end: Some(start + 6),
+        };
+        window_around_match(&mut r, 20);
+        assert_eq!(r.text.chars().count(), 20);
+        let (s, e) = (r.match_start.unwrap(), r.match_end.unwrap());
+        assert_eq!(&r.text[s..e], "needle");
+        // A match longer than the window starts the window.
+        let mut r2 = show::AtRecord {
+            text: "xx".repeat(50),
+            match_start: Some(10),
+            match_end: Some(90),
+            ..r
+        };
+        window_around_match(&mut r2, 8);
+        assert_eq!(r2.text.len(), 8);
+        assert_eq!(r2.match_start, Some(0));
+        assert_eq!(r2.match_end, Some(8));
     }
 
     #[test]

@@ -552,6 +552,9 @@ fn claude_project_cwd(project_dir: &Path, home: &Path) -> Option<String> {
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
         .filter_map(|p| {
+            if crate::cancel::requested() {
+                return None;
+            }
             let mtime = fs::metadata(&p).and_then(|m| m.modified()).ok()?;
             Some((mtime, p))
         })
