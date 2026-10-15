@@ -484,6 +484,9 @@ impl AgentPlugin for ClaudePlugin {
         let project_cwds: HashMap<PathBuf, Option<String>> = project_dirs
             .into_par_iter()
             .map(|dir| {
+                if crate::cancel::checkpoint() {
+                    return (dir, None);
+                }
                 let cwd = claude_project_cwd(&dir, home);
                 (dir, cwd)
             })
@@ -494,6 +497,9 @@ impl AgentPlugin for ClaudePlugin {
         memory_files
             .into_iter()
             .filter_map(|path| {
+                if crate::cancel::checkpoint() {
+                    return None;
+                }
                 let project_dir = path.parent()?.parent()?;
                 let encoded_name = project_dir.file_name()?.to_string_lossy().to_string();
                 let session_cwd = project_cwds.get(project_dir).cloned().flatten();
@@ -546,6 +552,9 @@ fn claude_project_cwd(project_dir: &Path, home: &Path) -> Option<String> {
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
         .filter_map(|p| {
+            if crate::cancel::requested() {
+                return None;
+            }
             let mtime = fs::metadata(&p).and_then(|m| m.modified()).ok()?;
             Some((mtime, p))
         })

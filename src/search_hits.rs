@@ -63,6 +63,30 @@ pub fn run(
     if args.pattern.is_some() && filter.query.is_some() {
         return Err("Use either PATTERN or -q REGEX, not both".into());
     }
+    let mut args = args;
+    args.kind = kinds;
+    // The CLI prints what it finds; it never needs the lookahead that tells
+    // whether the cap cut the list.
+    let (hits, _truncated) = collect_hits(&args, &mut filter, false)?;
+    if ia.interactive {
+        return crate::fuzzy::run_search_hits(&hits, ia, &filter);
+    }
+    print_hits(&hits, &args);
+    Ok(())
+}
+
+/// Enumerate occurrences for `args` (pattern, kinds, limits) across the
+/// sessions `filter` selects, local and remote, sorted newest first. The
+/// pattern comes from `args.pattern` or `filter.query`; `filter.query` is
+/// set to it on return. With `lookahead`, one occurrence beyond
+/// `max_matches` is scanned for locally so the flag can report whether the
+/// cap cut the list (remote hosts never look ahead); without it the scan
+/// stops at the cap and the flag is always `false`.
+pub(crate) fn collect_hits(
+    args: &MatchSearchArgs,
+    filter: &mut FilterArgs,
+    lookahead: bool,
+) -> Result<(Vec<SearchHit>, bool), String> {
     let query = args
         .pattern
         .as_ref()
@@ -75,6 +99,8 @@ pub fn run(
     // Validate remotes before doing local work. A failed/old remote is an error,
     // never a silently incomplete successful search.
     crate::remote::resolve_remotes(&filter.remote)?;
+    let kinds = &args.kind;
+    let cap = scan_cap(args.max_matches, lookahead);
     let params = PipelineParams {
         resolve_fields: vec![
             Field::Path,
@@ -105,12 +131,8 @@ pub fn run(
     });
     let mut hits = Vec::new();
     for session in sessions {
-        let remaining = if args.max_matches == 0 {
-            usize::MAX
-        } else {
-            args.max_matches.saturating_sub(hits.len())
-        };
-        if remaining == 0 {
+        let remaining = cap.saturating_sub(hits.len());
+        if remaining == 0 || crate::cancel::requested() {
             break;
         }
         let plugin = agents::find_plugin_for_path(&session.path);
@@ -118,7 +140,7 @@ pub fn run(
             &session.path,
             plugin,
             &pattern,
-            &kinds,
+            kinds,
             remaining,
             &mut |index, kind, loc, text| {
                 let (start, end) = (loc.start, loc.end);
@@ -143,9 +165,12 @@ pub fn run(
             },
         );
     }
-    let mut args = args;
-    args.kind = kinds;
-    hits.extend(crate::remote::fetch_search_hits(&args, &filter)?);
+    // A cancelled call is discarded by the caller: skip the remote fetch,
+    // the sort and the serialization of what was collected so far.
+    if crate::cancel::requested() {
+        return Ok((Vec::new(), false));
+    }
+    hits.extend(crate::remote::fetch_search_hits(args, filter)?);
     // Stable sorting preserves source order inside each session. Paths also
     // distinguish sessions with equal ids on different hosts.
     hits.sort_by(|a, b| {
@@ -155,14 +180,23 @@ pub fn run(
             .then_with(|| a.text_index.cmp(&b.text_index))
             .then_with(|| a.match_start.cmp(&b.match_start))
     });
+    // Only a local lookahead can tell; remote hosts return at most the cap.
+    let truncated = lookahead && args.max_matches != 0 && hits.len() > args.max_matches;
     if args.max_matches != 0 {
         hits.truncate(args.max_matches);
     }
-    if ia.interactive {
-        return crate::fuzzy::run_search_hits(&hits, ia, &filter);
+    Ok((hits, truncated))
+}
+
+/// How many occurrences to collect before stopping: the cap itself, or one
+/// more when the caller wants to know whether the cap truncated the list.
+/// `0` means unlimited.
+fn scan_cap(max_matches: usize, lookahead: bool) -> usize {
+    match (max_matches, lookahead) {
+        (0, _) => usize::MAX,
+        (n, true) => n.saturating_add(1),
+        (n, false) => n,
     }
-    print_hits(&hits, &args);
-    Ok(())
 }
 
 type OccurrenceVisitor<'a> = dyn FnMut(usize, SearchKind, &Location, &str) + 'a;
@@ -180,13 +214,18 @@ pub(crate) fn visit_typed_occurrences(
     plugin.iter_search_records(
         path,
         &mut RecordVisitor::new(&mut |record, fragment, kind, text, fingerprint| {
+            if crate::cancel::checkpoint() {
+                return false;
+            }
             index += 1;
             if !kinds.is_empty() && !kinds.contains(&kind) {
                 return true;
             }
             let mut location: Option<Location> = None;
             for m in pattern.find_iter(text) {
-                if count >= limit {
+                // A huge fragment can hold many occurrences: stop allocating
+                // hits as soon as the limit is reached or the call is cancelled.
+                if count >= limit || crate::cancel::requested() {
                     return false;
                 }
                 let loc = location.get_or_insert_with(|| {
@@ -403,6 +442,15 @@ pub(crate) fn display_text(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_cap_stops_at_the_limit_unless_lookahead() {
+        assert_eq!(scan_cap(0, false), usize::MAX);
+        assert_eq!(scan_cap(0, true), usize::MAX);
+        assert_eq!(scan_cap(1, false), 1, "the CLI stops at its limit");
+        assert_eq!(scan_cap(1, true), 2);
+        assert_eq!(scan_cap(usize::MAX, true), usize::MAX);
+    }
 
     #[test]
     fn highlight_tracks_the_original_occurrence_and_clipped_unicode_match() {

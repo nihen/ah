@@ -787,6 +787,10 @@ fn fetch_one_agent_stats(
         args.push("--agent".to_string());
         args.push(a.clone());
     }
+    if let Some(ref p) = filter.project {
+        args.push("--project".to_string());
+        args.push(p.clone());
+    }
     if filter.limit > 0 {
         args.push("-n".to_string());
         args.push(filter.limit.to_string());

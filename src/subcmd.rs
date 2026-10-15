@@ -356,6 +356,9 @@ fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
     };
 
     for (fpath, mtime) in &files {
+        if crate::cancel::checkpoint() {
+            return Err(format!("Cancelled while resolving session id: {}", id));
+        }
         let plugin = agents::find_plugin_for_path(fpath);
         let fields = resolver::resolve_fields(fpath, plugin, *mtime, home, &resolve_fields, &opts);
         let Some(v) = fields.get(&Field::Id) else {

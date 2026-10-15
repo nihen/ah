@@ -1,11 +1,15 @@
+mod agent_stats;
 mod agents;
+mod cancel;
 mod cli;
 mod collector;
 mod color;
 mod config;
 mod fuzzy;
+mod list_agents;
 mod location;
 mod man;
+mod mcp;
 mod memory;
 mod output;
 mod pager;
@@ -20,12 +24,11 @@ mod session;
 mod show;
 mod subcmd;
 
-use std::fs;
 use std::process;
 
 use clap::{CommandFactory, Parser};
 
-use agents::common::{canonical_home, format_mtime};
+use agents::common::canonical_home;
 use cli::{Args, Cli, Commands, Field, ListProjectsResolvedArgs};
 use color::{BOLD, DIM, RESET};
 
@@ -42,6 +45,18 @@ fn main() {
     config::init(&home);
 
     let cli = Cli::parse();
+
+    if let Commands::Mcp(_) = &cli.command {
+        // stdout is the protocol channel: no pager, no color. The global
+        // filters are the tools' default scope; -A is rejected inside.
+        color::init_color(false, true);
+        color::init_debug(cli.filter.debug);
+        if let Err(e) = mcp::serve(cli.filter, &cli.ia) {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+        return;
+    }
 
     let mut filter = cli.filter;
 
@@ -238,109 +253,15 @@ fn main() {
             }
         }
         Commands::Agent(agent_args) => {
-            if let Err(e) = run_status(&filter, agent_args.output_format()) {
+            if let Err(e) = agent_stats::run(&filter, agent_args.output_format()) {
                 eprintln!("{}", e);
                 process::exit(1);
             }
         }
         Commands::ListAgents(args) => {
-            let all = config::agents();
-            let fmt = args.output_format();
-
-            fn caps(agent: &config::AgentDef) -> Vec<&'static str> {
-                let p = agent.plugin;
-                let mut v = Vec::new();
-                if p.can_search() {
-                    v.push("search");
-                }
-                if p.can_show() {
-                    v.push("show");
-                }
-                if p.can_resume() {
-                    v.push("resume");
-                }
-                if p.can_detect_running() {
-                    v.push("running");
-                }
-                // Memory files are found through the built-in agent's own
-                // locations, so a custom alias of the same plugin lists none.
-                if agent.is_builtin && p.can_memory() {
-                    v.push("memory");
-                }
-                v
-            }
-
-            match fmt {
-                cli::OutputFormat::Json => {
-                    for agent in all {
-                        let obj = serde_json::json!({
-                            "id": agent.id,
-                            "description": agent.description,
-                            "capabilities": caps(agent),
-                            "patterns": agent.glob_patterns,
-                            "subagent_patterns": agent.subagent_patterns,
-                            "project_desc": agent.plugin.project_desc(),
-                        });
-                        println!("{}", obj);
-                    }
-                }
-                cli::OutputFormat::Tsv => {
-                    for agent in all {
-                        println!(
-                            "{}\t{}\t{}\t{}",
-                            agent.id,
-                            agent.description,
-                            caps(agent).join(","),
-                            agent.glob_patterns.join(","),
-                        );
-                    }
-                }
-                cli::OutputFormat::Ltsv => {
-                    for agent in all {
-                        println!(
-                            "id:{}\tdescription:{}\tcapabilities:{}\tpatterns:{}",
-                            agent.id,
-                            agent.description,
-                            caps(agent).join(","),
-                            agent.glob_patterns.join(","),
-                        );
-                    }
-                }
-                cli::OutputFormat::Log | cli::OutputFormat::Table => {
-                    let builtins: Vec<_> = all.iter().filter(|a| a.is_builtin).collect();
-                    let custom: Vec<_> = all.iter().filter(|a| !a.is_builtin).collect();
-
-                    println!("Built-in agents:");
-                    println!();
-                    for agent in &builtins {
-                        let status = if agent.disabled { " (disabled)" } else { "" };
-                        println!("{:<12} {}{}", agent.id, agent.description, status);
-                        println!(
-                            "             Patterns:     {}",
-                            agent.glob_patterns.join(", ")
-                        );
-                        println!("             Capabilities: {}", caps(agent).join(", "));
-                        println!("             Project:      {}", agent.plugin.project_desc());
-                        println!();
-                    }
-
-                    if !custom.is_empty() {
-                        println!("Custom agents (~/.ahrc):");
-                        println!();
-                        for agent in &custom {
-                            let status = if agent.disabled { " (disabled)" } else { "" };
-                            println!("{:<12} plugin: {}{}", agent.id, agent.plugin.id(), status);
-                            println!(
-                                "             Patterns:     {}",
-                                agent.glob_patterns.join(", ")
-                            );
-                            println!("             Capabilities: {}", caps(agent).join(", "));
-                            println!();
-                        }
-                    }
-                }
-            }
+            list_agents::run(args.output_format());
         }
+        Commands::Mcp(_) => unreachable!("handled before dispatch"),
     }
 }
 
@@ -461,224 +382,4 @@ fn run_list_projects(
 /// vs a real error (invalid input, parse failure, etc.).
 fn is_empty_result_error(msg: &str) -> bool {
     msg.starts_with("No ") && msg.ends_with(" found.")
-}
-
-fn run_status(filter: &cli::FilterArgs, output_format: cli::OutputFormat) -> Result<(), String> {
-    use std::collections::BTreeMap;
-    use std::time::SystemTime;
-
-    let home = canonical_home();
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| fs::canonicalize(&p).ok())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    let since = filter.since_time()?;
-    let until = filter.until_time()?;
-
-    let files = collector::collect_files(filter.limit);
-    if files.is_empty() && filter.remote.is_empty() {
-        return Err("No session files found.".to_string());
-    }
-
-    struct AgentStats {
-        total: usize,
-        latest: SystemTime,
-        cwd_count: usize,
-        cwd_latest: Option<SystemTime>,
-    }
-
-    let resolve_fields = [Field::Cwd];
-    let mut stats: BTreeMap<&str, AgentStats> = BTreeMap::new();
-
-    for (path, mtime) in &files {
-        // Apply time filters
-        if let Some(ref since) = since {
-            if mtime < since {
-                continue;
-            }
-        }
-        if let Some(ref until) = until {
-            if mtime > until {
-                continue;
-            }
-        }
-
-        let agent = config::find_agent_for_path(path);
-        let plugin = agent
-            .map(|a| a.plugin)
-            .unwrap_or_else(agents::unknown_plugin);
-        let id = agent.map(|a| a.id.as_str()).unwrap_or("unknown");
-
-        // Apply --agent filter
-        if let Some(ref agent_filter) = filter.agent {
-            if id != agent_filter {
-                continue;
-            }
-        }
-
-        let fields = resolver::resolve_fields(
-            path,
-            plugin,
-            *mtime,
-            &home,
-            &resolve_fields,
-            &Default::default(),
-        );
-        let session_cwd = fields.get(&Field::Cwd).map(|v| v.as_str()).unwrap_or("");
-        let in_cwd = session_cwd == cwd;
-
-        let entry = stats.entry(id).or_insert(AgentStats {
-            total: 0,
-            latest: SystemTime::UNIX_EPOCH,
-            cwd_count: 0,
-            cwd_latest: None,
-        });
-        entry.total += 1;
-        if *mtime > entry.latest {
-            entry.latest = *mtime;
-        }
-        if in_cwd {
-            entry.cwd_count += 1;
-            if entry.cwd_latest.is_none_or(|t| *mtime > t) {
-                entry.cwd_latest = Some(*mtime);
-            }
-        }
-    }
-
-    // Rows are (agent, remote_name, count, latest). `remote_name` is empty
-    // for local rows; structured output puts it in its own column / field so
-    // consumers don't have to parse "agent (remote)" labels.
-    let mut rows: Vec<(String, String, usize, String)> = if filter.all {
-        stats
-            .iter()
-            .map(|(agent, s)| {
-                (
-                    agent.to_string(),
-                    String::new(),
-                    s.total,
-                    format_mtime(s.latest),
-                )
-            })
-            .collect()
-    } else {
-        let cwd_rows: Vec<_> = stats
-            .iter()
-            .filter(|(_, s)| s.cwd_count > 0)
-            .map(|(agent, s)| {
-                (
-                    agent.to_string(),
-                    String::new(),
-                    s.cwd_count,
-                    format_mtime(s.cwd_latest.unwrap()),
-                )
-            })
-            .collect();
-        if cwd_rows.is_empty() && filter.remote.is_empty() {
-            return Err("No sessions in current directory.".to_string());
-        }
-        cwd_rows
-    };
-
-    if !filter.remote.is_empty() {
-        let remotes = remote::resolve_remotes(&filter.remote)?;
-        let remote_stats = remote::fetch_remote_agent_stats(&remotes, filter);
-        for (remote_name, rs) in remote_stats {
-            rows.push((rs.agent, remote_name, rs.sessions, rs.latest));
-        }
-    }
-
-    if rows.is_empty() {
-        return Err("No sessions found.".to_string());
-    }
-
-    let display_label = |agent: &str, remote: &str| -> String {
-        if remote.is_empty() {
-            agent.to_string()
-        } else {
-            format!("{} ({})", agent, remote)
-        }
-    };
-
-    match output_format {
-        cli::OutputFormat::Json => {
-            for (agent, remote_name, count, latest) in &rows {
-                let mut obj = serde_json::Map::new();
-                obj.insert(
-                    "agent".to_string(),
-                    serde_json::Value::String(agent.clone()),
-                );
-                if !remote_name.is_empty() {
-                    obj.insert(
-                        "remote".to_string(),
-                        serde_json::Value::String(remote_name.clone()),
-                    );
-                }
-                obj.insert(
-                    "sessions".to_string(),
-                    serde_json::Value::Number((*count).into()),
-                );
-                obj.insert(
-                    "latest".to_string(),
-                    serde_json::Value::String(latest.clone()),
-                );
-                println!("{}", serde_json::Value::Object(obj));
-            }
-        }
-        cli::OutputFormat::Ltsv => {
-            for (agent, remote_name, count, latest) in &rows {
-                if remote_name.is_empty() {
-                    println!("agent:{}\tsessions:{}\tlatest:{}", agent, count, latest);
-                } else {
-                    println!(
-                        "agent:{}\tremote:{}\tsessions:{}\tlatest:{}",
-                        agent, remote_name, count, latest
-                    );
-                }
-            }
-        }
-        cli::OutputFormat::Log | cli::OutputFormat::Table => {
-            let is_tty = color::use_color();
-            let (b, d, r) = if is_tty {
-                (BOLD, DIM, RESET)
-            } else {
-                ("", "", "")
-            };
-            let labels: Vec<String> = rows
-                .iter()
-                .map(|(a, rn, _, _)| display_label(a, rn))
-                .collect();
-            let agent_w = labels.iter().map(|l| l.len()).max().unwrap_or(5).max(5);
-            let count_w = rows
-                .iter()
-                .map(|(_, _, c, _)| c.to_string().len())
-                .max()
-                .unwrap_or(8)
-                .max(8);
-            println!(
-                "{d}{:<agent_w$}  {:>count_w$}  LATEST{r}",
-                "AGENT", "SESSIONS"
-            );
-            for (label, (_, _, count, latest)) in labels.iter().zip(rows.iter()) {
-                println!(
-                    "{b}{:<agent_w$}{r}  {:>count_w$}  {d}{}{r}",
-                    label, count, latest
-                );
-            }
-        }
-        cli::OutputFormat::Tsv => {
-            // Only emit the `remote` column when at least one row has it, so
-            // local-only invocations keep the legacy 3-column shape.
-            let has_remote = rows.iter().any(|(_, rn, _, _)| !rn.is_empty());
-            for (agent, remote_name, count, latest) in &rows {
-                if has_remote {
-                    println!("{}\t{}\t{}\t{}", agent, remote_name, count, latest);
-                } else {
-                    println!("{}\t{}\t{}", agent, count, latest);
-                }
-            }
-        }
-    }
-    Ok(())
 }

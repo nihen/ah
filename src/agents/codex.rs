@@ -356,6 +356,15 @@ pub static PLUGIN: CodexPlugin = CodexPlugin;
 pub struct CodexPlugin;
 
 impl AgentPlugin for CodexPlugin {
+    fn clear_caches(&self) {
+        if let Ok(mut c) = TITLE_INDEXES.lock() {
+            c.clear();
+        }
+        if let Ok(mut c) = SESSION_METAS.lock() {
+            c.clear();
+        }
+    }
+
     fn id(&self) -> &'static str {
         "codex"
     }

@@ -578,20 +578,29 @@ fn output_ltsv(sessions: &[Session], fields: &[Field]) {
 }
 
 /// JSON Lines output.
+/// One session as a JSON object with the requested fields. List-valued
+/// fields (`prompts`, `responses`, `messages`) are emitted as JSON arrays.
+pub fn session_to_json(
+    session: &Session,
+    fields: &[Field],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    for field in fields {
+        let val = session.fields.get(field).cloned().unwrap_or_default();
+        if matches!(*field, Field::Prompts | Field::Responses | Field::Messages) {
+            if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&val) {
+                map.insert(field.name().to_string(), arr);
+                continue;
+            }
+        }
+        map.insert(field.name().to_string(), serde_json::Value::String(val));
+    }
+    map
+}
+
 fn output_jsonl(sessions: &[Session], fields: &[Field]) {
     for session in sessions {
-        let mut map = serde_json::Map::new();
-        for field in fields {
-            let val = session.fields.get(field).cloned().unwrap_or_default();
-            if matches!(*field, Field::Prompts | Field::Responses | Field::Messages) {
-                if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&val) {
-                    map.insert(field.name().to_string(), arr);
-                    continue;
-                }
-            }
-            map.insert(field.name().to_string(), serde_json::Value::String(val));
-        }
-        if let Ok(json) = serde_json::to_string(&map) {
+        if let Ok(json) = serde_json::to_string(&session_to_json(session, fields)) {
             println!("{}", json);
         }
     }
@@ -707,34 +716,43 @@ fn output_projects_ltsv(
     }
 }
 
+/// One project record as a JSON object (`sessions` as an array,
+/// `session_count` as a number).
+pub fn project_to_json(
+    record: &std::collections::BTreeMap<ProjectField, String>,
+    fields: &[ProjectField],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    for field in fields {
+        let val = record.get(field).cloned().unwrap_or_default();
+        // sessions as JSON array
+        if *field == ProjectField::Sessions {
+            if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&val) {
+                map.insert(field.name().to_string(), arr);
+                continue;
+            }
+        }
+        // session_count as number
+        if *field == ProjectField::SessionCount {
+            if let Ok(n) = val.parse::<u64>() {
+                map.insert(
+                    field.name().to_string(),
+                    serde_json::Value::Number(n.into()),
+                );
+                continue;
+            }
+        }
+        map.insert(field.name().to_string(), serde_json::Value::String(val));
+    }
+    map
+}
+
 fn output_projects_jsonl(
     records: &[std::collections::BTreeMap<ProjectField, String>],
     fields: &[ProjectField],
 ) {
     for record in records {
-        let mut map = serde_json::Map::new();
-        for field in fields {
-            let val = record.get(field).cloned().unwrap_or_default();
-            // sessions as JSON array
-            if *field == ProjectField::Sessions {
-                if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&val) {
-                    map.insert(field.name().to_string(), arr);
-                    continue;
-                }
-            }
-            // session_count as number
-            if *field == ProjectField::SessionCount {
-                if let Ok(n) = val.parse::<u64>() {
-                    map.insert(
-                        field.name().to_string(),
-                        serde_json::Value::Number(n.into()),
-                    );
-                    continue;
-                }
-            }
-            map.insert(field.name().to_string(), serde_json::Value::String(val));
-        }
-        if let Ok(json) = serde_json::to_string(&map) {
+        if let Ok(json) = serde_json::to_string(&project_to_json(record, fields)) {
             println!("{}", json);
         }
     }
@@ -878,17 +896,25 @@ fn output_memory_ltsv(
     }
 }
 
+/// One memory record as a JSON object of string fields.
+pub fn memory_to_json(
+    record: &std::collections::BTreeMap<MemoryField, String>,
+    fields: &[MemoryField],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    for field in fields {
+        let val = record.get(field).cloned().unwrap_or_default();
+        map.insert(field.name().to_string(), serde_json::Value::String(val));
+    }
+    map
+}
+
 fn output_memory_jsonl(
     records: &[std::collections::BTreeMap<MemoryField, String>],
     fields: &[MemoryField],
 ) {
     for record in records {
-        let mut map = serde_json::Map::new();
-        for field in fields {
-            let val = record.get(field).cloned().unwrap_or_default();
-            map.insert(field.name().to_string(), serde_json::Value::String(val));
-        }
-        if let Ok(json) = serde_json::to_string(&map) {
+        if let Ok(json) = serde_json::to_string(&memory_to_json(record, fields)) {
             println!("{}", json);
         }
     }

@@ -68,6 +68,11 @@ pub trait AgentPlugin: Sync {
         false
     }
 
+    /// Drop process-wide caches of parsed metadata. A long-running process
+    /// (the MCP server) calls this before each request so sessions and
+    /// directories added since the last scan are seen.
+    fn clear_caches(&self) {}
+
     /// How project is resolved, for list-agents display
     fn project_desc(&self) -> &'static str {
         "parent directory name of session file"
@@ -407,6 +412,13 @@ static PLUGINS: [&'static dyn AgentPlugin; 8] = [
 
 pub fn all_plugins() -> &'static [&'static dyn AgentPlugin] {
     &PLUGINS
+}
+
+/// Drop every plugin's process-wide cache (see `AgentPlugin::clear_caches`).
+pub fn clear_all_caches() {
+    for plugin in all_plugins() {
+        plugin.clear_caches();
+    }
 }
 
 pub fn find_builtin_plugin(id: &str) -> Option<&'static dyn AgentPlugin> {

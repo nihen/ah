@@ -501,6 +501,12 @@ fn message_from_parts(info: &serde_json::Value, parts: &[serde_json::Value]) -> 
 }
 
 impl AgentPlugin for OpencodePlugin {
+    fn clear_caches(&self) {
+        if let Ok(mut c) = SESSION_CACHE.lock() {
+            c.clear();
+        }
+    }
+
     fn id(&self) -> &'static str {
         "opencode"
     }
@@ -556,6 +562,9 @@ impl AgentPlugin for OpencodePlugin {
             // Skip malformed rows instead of dropping every session.
             let mut ok = Vec::new();
             for row in rows {
+                if crate::cancel::checkpoint() {
+                    return Ok(Vec::new());
+                }
                 match row {
                     Ok(row) => ok.push(row),
                     Err(e) => warn_once(file, &e.to_string()),

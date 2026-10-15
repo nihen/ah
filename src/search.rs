@@ -34,6 +34,9 @@ pub fn search_prompts(
 ) -> Option<String> {
     let mut found = None;
     let mut visit = |message: Message| {
+        if crate::cancel::requested() {
+            return false;
+        }
         if message.role != MessageRole::User {
             return true;
         }
@@ -65,12 +68,17 @@ pub fn search_texts(
     // Empty values (e.g. the `content` of a tool-call-only turn) are
     // skipped: a pattern matching the empty string would otherwise stop
     // at them with an empty excerpt, which drops the session.
-    let mut visit = |text: &str| match pattern.find(text).filter(|_| !text.is_empty()) {
-        Some(m) => {
-            found = Some(extract_match_context(text, m.start(), m.end(), 30));
-            false
+    let mut visit = |text: &str| {
+        if crate::cancel::requested() {
+            return false;
         }
-        None => true,
+        match pattern.find(text).filter(|_| !text.is_empty()) {
+            Some(m) => {
+                found = Some(extract_match_context(text, m.start(), m.end(), 30));
+                false
+            }
+            None => true,
+        }
     };
     match data {
         Some(data) => plugin.iter_search_texts_from_bytes(path, data, &mut visit),
@@ -183,6 +191,10 @@ impl QueryPrefilter {
         let mut total = 0;
         let mut from = 0;
         while let Some(at) = self.next_hit(raw, from, &mut cursor) {
+            // A cancelled MCP call stops collecting candidate lines.
+            if crate::cancel::requested() {
+                return None;
+            }
             let start = memchr::memrchr(b'\n', &raw[..at]).map_or(0, |i| i + 1);
             let end = memchr::memchr(b'\n', &raw[at..]).map_or(raw.len(), |i| at + i);
             ranges.push(start..end);
@@ -215,6 +227,10 @@ impl QueryPrefilter {
     ) {
         let mut start = 0;
         while start < raw.len() {
+            // A cancelled MCP call stops scanning a large file mid-way.
+            if crate::cancel::requested() {
+                return;
+            }
             let end = memchr::memchr(b'\n', &raw[start..]).map_or(raw.len(), |i| start + i);
             let line = &raw[start..end];
             if keep(line) && self.may_match(line) && !visit(line) {

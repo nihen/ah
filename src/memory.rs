@@ -270,13 +270,17 @@ fn expand_sources(
         if source.kind == MemoryKind::Skill && !with_skills {
             continue;
         }
+        if crate::cancel::checkpoint() {
+            break;
+        }
         let mut paths = glob_files(&source.pattern());
         paths.sort();
-        entries.extend(
-            paths
-                .into_iter()
-                .filter_map(|p| read_entry(p, agent, project, source.kind)),
-        );
+        entries.extend(paths.into_iter().filter_map(|p| {
+            if crate::cancel::checkpoint() {
+                return None;
+            }
+            read_entry(p, agent, project, source.kind)
+        }));
     }
     entries
 }
@@ -324,6 +328,9 @@ fn glob_files(pattern: &str) -> Vec<PathBuf> {
     // directory reached along another path is still walked there.
     let mut stack: Vec<(PathBuf, Vec<PathBuf>)> = vec![(root, Vec::new())];
     while let Some((dir, mut chain)) = stack.pop() {
+        if crate::cancel::checkpoint() {
+            break;
+        }
         let Ok(canonical) = fs::canonicalize(&dir) else {
             continue;
         };
@@ -335,6 +342,9 @@ fn glob_files(pattern: &str) -> Vec<PathBuf> {
             continue;
         };
         for entry in entries.flatten() {
+            if crate::cancel::requested() {
+                return files;
+            }
             let path = entry.path();
             if path.is_dir() {
                 if chain.len() <= RECURSIVE_GLOB_MAX_DEPTH {
@@ -454,6 +464,9 @@ fn collect_known_project_cwds() -> Vec<String> {
     let cwds: HashSet<String> = files
         .par_iter()
         .filter_map(|(path, mtime)| {
+            if crate::cancel::checkpoint() {
+                return None;
+            }
             let plugin = agents::find_plugin_for_path(path);
             let fields = resolver::resolve_fields(
                 path,
@@ -560,6 +573,9 @@ pub fn build_memory_records(
     let project_entries: Vec<Vec<MemoryEntry>> = project_dirs
         .par_iter()
         .map(|dir| {
+            if crate::cancel::checkpoint() {
+                return Vec::new();
+            }
             // Only the project directory itself is resolved: a symlinked
             // directory inside the project (e.g. `.claude/rules` shared with
             // `~/.claude/rules`) keeps its files attributed to the project.
@@ -606,6 +622,9 @@ pub fn build_memory_records(
     let mut records: Vec<BTreeMap<MemoryField, String>> = entries
         .into_iter()
         .filter_map(|entry| {
+            if crate::cancel::checkpoint() {
+                return None;
+            }
             // Agent filter
             // Shared files (project AGENTS.md) are read by several agents,
             // so they match any agent filter.

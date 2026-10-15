@@ -297,6 +297,15 @@ fn cursor_user_body(raw: &str) -> Option<&str> {
 }
 
 impl AgentPlugin for CursorPlugin {
+    fn clear_caches(&self) {
+        if let Ok(mut c) = DECODE_CACHE.lock() {
+            c.clear();
+        }
+        if let Ok(mut c) = LISTING_CACHE.lock() {
+            c.clear();
+        }
+    }
+
     fn id(&self) -> &'static str {
         "cursor"
     }

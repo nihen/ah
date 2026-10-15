@@ -1,0 +1,952 @@
+//! MCP tool definitions and dispatch. Every tool reuses the CLI's data
+//! builders; nothing here prints.
+use std::collections::BTreeMap;
+
+use serde_json::{Map, Value, json};
+
+use super::args::{self, Params, common_schema, merge_filter};
+use super::rpc::RpcError;
+use crate::agents::common::canonical_home;
+use crate::agents::entries::SearchKind;
+use crate::cli::{
+    Field, FilterArgs, ListProjectsResolvedArgs, MatchSearchArgs, MemoryField, MemoryResolvedArgs,
+    OutputFormat, ProjectField, SortOrder,
+};
+use crate::{
+    agent_stats, agents, collector, list_agents, memory, pipeline, projects, resolver, search_hits,
+    show, subcmd,
+};
+
+pub const DEFAULT_MAX_RESULTS: u64 = 50;
+pub const DEFAULT_MAX_CHARS: u64 = 100_000;
+
+/// A successful tool execution: the text block and the structured value.
+pub struct ToolOutput {
+    pub text: String,
+    pub structured: Value,
+    /// A plain-text remark sent as a second content block (so the first
+    /// block stays valid JSON Lines), e.g. that the result was truncated.
+    pub note: Option<String>,
+}
+
+impl ToolOutput {
+    /// JSON Lines as the text block: the first line holds every field of
+    /// `structured` except the list under `items`, then one compact line
+    /// per item. Smaller than pretty JSON, and each line parses on its own.
+    fn jsonl(structured: Value, items: &str) -> Self {
+        let text = jsonl_text(&structured, items);
+        Self {
+            text,
+            structured,
+            note: None,
+        }
+    }
+}
+
+/// Render `structured` as JSON Lines (see `ToolOutput::jsonl`). A value
+/// under `items` that is not an array stays on the first line.
+fn jsonl_text(structured: &Value, items: &str) -> String {
+    let mut head = structured.clone();
+    let list = match head.as_object_mut().and_then(|m| m.remove(items)) {
+        Some(Value::Array(list)) => list,
+        Some(other) => {
+            if let Some(m) = head.as_object_mut() {
+                m.insert(items.to_string(), other);
+            }
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    let mut out = serde_json::to_string(&head).unwrap_or_default();
+    for item in &list {
+        out.push('\n');
+        out.push_str(&serde_json::to_string(item).unwrap_or_default());
+    }
+    out
+}
+
+pub const TOOL_NAMES: [&str; 7] = [
+    "log",
+    "search",
+    "show",
+    "project",
+    "memory",
+    "agent",
+    "list_agents",
+];
+
+pub fn exists(name: &str) -> bool {
+    TOOL_NAMES.contains(&name)
+}
+
+const LOG_COMMON: [&str; 10] = [
+    args::ALL,
+    args::DIR,
+    args::AGENT,
+    args::PROJECT,
+    args::SINCE,
+    args::UNTIL,
+    args::RUNNING,
+    args::NO_ARCHIVED,
+    args::SUBAGENTS,
+    args::LIMIT,
+];
+const PROJECT_COMMON: [&str; 9] = [
+    args::ALL,
+    args::DIR,
+    args::AGENT,
+    args::PROJECT,
+    args::SINCE,
+    args::UNTIL,
+    args::NO_ARCHIVED,
+    args::SUBAGENTS,
+    args::LIMIT,
+];
+const MEMORY_COMMON: [&str; 6] = [
+    args::ALL,
+    args::DIR,
+    args::AGENT,
+    args::PROJECT,
+    args::SINCE,
+    args::UNTIL,
+];
+const AGENT_COMMON: [&str; 9] = [
+    args::ALL,
+    args::DIR,
+    args::AGENT,
+    args::PROJECT,
+    args::SINCE,
+    args::UNTIL,
+    args::NO_ARCHIVED,
+    args::SUBAGENTS,
+    args::LIMIT,
+];
+
+fn schema(common: &[&str], extra: Vec<(&str, Value)>, required: &[&str]) -> Value {
+    let mut props = Map::new();
+    for name in common {
+        props.insert((*name).to_string(), common_schema(name));
+    }
+    for (name, def) in extra {
+        props.insert(name.to_string(), def);
+    }
+    let mut s = json!({
+        "type": "object",
+        "properties": Value::Object(props),
+        "additionalProperties": false,
+    });
+    if !required.is_empty() {
+        s["required"] = json!(required);
+    }
+    s
+}
+
+fn names<T>(all: Vec<T>, name: impl Fn(&T) -> &'static str) -> Vec<&'static str> {
+    all.iter().map(name).collect()
+}
+
+/// The `tools/list` entries, in a fixed order.
+pub fn definitions() -> Vec<Value> {
+    let field_names = names(Field::all(), Field::name);
+    let project_fields = names(ProjectField::all(), ProjectField::name);
+    let memory_fields = names(MemoryField::all(), MemoryField::name);
+    let order = json!({"type": "string", "enum": ["asc", "desc"], "description": "Sort direction (default desc)"});
+    vec![
+        json!({
+            "name": "log",
+            "title": "List sessions",
+            "description": "List coding-agent sessions (Claude Code, Codex, Gemini CLI, Copilot, Cursor, Grok, opencode, ...) newest first, optionally matching a regex over the conversation. Returns metadata per session; use show to read a transcript.",
+            "inputSchema": schema(&LOG_COMMON, vec![
+                ("query", json!({"type": "string", "description": "Case-insensitive regex over user/assistant messages and tool input/output"})),
+                ("prompt_only", json!({"type": "boolean", "description": "Match query against user prompts only"})),
+                ("raw_search", json!({"type": "boolean", "description": "Match query against the raw session file bytes, including metadata"})),
+                ("fields", json!({"type": "array", "items": {"type": "string", "enum": field_names}, "description": "Fields to return per session (default: agent, project, modified_at, title, id, plus matched when query is set)"})),
+                ("sort", json!({"type": "string", "enum": field_names, "description": "Sort field (default modified_at)"})),
+                ("order", order.clone()),
+                ("max_results", json!({"type": "integer", "minimum": 0, "description": "Return at most this many sessions (default 50, 0 = unlimited)"})),
+                ("transcript_limit", json!({"type": "integer", "minimum": 0, "description": "Max characters of the transcript field (default 500, 0 = unlimited)"})),
+                ("title_limit", json!({"type": "integer", "minimum": 0, "description": "Max characters of auto-generated titles (default 50, 0 = unlimited)"})),
+            ], &[]),
+        }),
+        json!({
+            "name": "search",
+            "title": "Search passages",
+            "description": "Find every occurrence of a regex in session conversations and tool input/output. Each hit has a snippet and a position; pass the position to show (at) to read the surrounding records.",
+            "inputSchema": schema(&LOG_COMMON, vec![
+                ("pattern", json!({"type": "string", "description": "Case-insensitive regex"})),
+                ("kind", json!({"type": "array", "items": {"type": "string", "enum": ["user", "assistant", "tool-input", "tool-output", "unknown"]}, "description": "Only these record kinds (default: all)"})),
+                ("prompt_only", json!({"type": "boolean", "description": "Only user prompts (same as kind: [\"user\"])"})),
+                ("max_matches", json!({"type": "integer", "minimum": 0, "description": "Stop after this many occurrences (default 100, 0 = unlimited)"})),
+                ("snippet_length", json!({"type": "integer", "minimum": 1, "description": "Max characters per snippet including ellipses (default 240)"})),
+            ], &["pattern"]),
+        }),
+        json!({
+            "name": "show",
+            "title": "Show transcript",
+            "description": "Read one session: the whole conversation as Markdown or JSON messages, or, with at, the source records around a search hit (tool input/output included).",
+            "inputSchema": schema(&[], vec![
+                ("session", json!({"type": "string", "description": "Session id (or unique prefix) or session file path, as returned by log/search"})),
+                ("format", json!({"type": "string", "enum": ["md", "json"], "description": "md (default): Markdown transcript; json: [{role, text}] messages"})),
+                ("head", json!({"type": "integer", "minimum": 0, "description": "Only the first N messages (0 = all)"})),
+                ("at", json!({"type": "string", "description": "A position from search; returns the records around it instead of the transcript"})),
+                ("context", json!({"type": "integer", "minimum": 0, "maximum": 1000, "description": "Records before and after the position (default 2)"})),
+                ("max_chars", json!({"type": "integer", "minimum": 0, "description": "Truncate the result to this many characters (default 100000, 0 = unlimited)"})),
+            ], &["session"]),
+        }),
+        json!({
+            "name": "project",
+            "title": "List projects",
+            "description": "List known projects (working directories with sessions) with session counts and agents. Covers every directory unless dir applies; all: true clears a dir inherited from the server's startup flags.",
+            "inputSchema": schema(&PROJECT_COMMON, vec![
+                ("fields", json!({"type": "array", "items": {"type": "string", "enum": project_fields.clone()}, "description": "Fields per project (default: project, session_count, last_modified_at, agents)"})),
+                ("sort", json!({"type": "string", "enum": project_fields, "description": "Sort field (default last_modified_at)"})),
+                ("order", order.clone()),
+            ], &[]),
+        }),
+        json!({
+            "name": "memory",
+            "title": "List memory files",
+            "description": "List agent memory and instruction files (CLAUDE.md, AGENTS.md, rules, auto memory, skills) for the current project, or every project with all. Request the body field to get file contents.",
+            "inputSchema": schema(&MEMORY_COMMON, vec![
+                ("fields", json!({"type": "array", "items": {"type": "string", "enum": memory_fields.clone()}, "description": "Fields per file (default: agent, project, type, name, modified_at, description); add body for contents"})),
+                ("type", json!({"type": "string", "description": "Only this memory type (e.g. instruction, rule, memory, skill; skills are listed only when requested)"})),
+                ("query", json!({"type": "string", "description": "Case-insensitive regex over file contents; the matched field holds the hit"})),
+                ("sort", json!({"type": "string", "enum": memory_fields, "description": "Sort field (default modified_at)"})),
+                ("order", order.clone()),
+                ("max_chars", json!({"type": "integer", "minimum": 0, "description": "Drop body contents from the end once the total exceeds this (default 100000, 0 = unlimited)"})),
+            ], &[]),
+        }),
+        json!({
+            "name": "agent",
+            "title": "Sessions per agent",
+            "description": "Session count and latest activity per agent, overall and within the directory scope.",
+            "inputSchema": schema(&AGENT_COMMON, vec![], &[]),
+        }),
+        json!({
+            "name": "list_agents",
+            "title": "Supported agents",
+            "description": "The agents this server can read, with their session file patterns and capabilities.",
+            "inputSchema": json!({"type": "object", "additionalProperties": false}),
+        }),
+    ]
+}
+
+/// Run `name` with `arguments`. `Err` is a protocol error (unknown tool);
+/// tool execution errors are `Ok(Err(message))`.
+pub fn call(
+    name: &str,
+    arguments: &Map<String, Value>,
+    base: &FilterArgs,
+) -> Result<Result<ToolOutput, String>, RpcError> {
+    let p = Params::new(arguments);
+    Ok(match name {
+        "log" => tool_log(&p, base),
+        "search" => tool_search(&p, base),
+        "show" => tool_show(&p),
+        "project" => tool_project(&p, base),
+        "memory" => tool_memory(&p, base),
+        "agent" => tool_agent(&p, base),
+        "list_agents" => tool_list_agents(&p),
+        _ => return Err(RpcError::invalid_params(format!("Unknown tool: {}", name))),
+    })
+}
+
+/// Apply the per-call listing flags the collector reads from process state.
+fn apply_collector_flags(filter: &FilterArgs) {
+    collector::init_exclude_archived(filter.no_archived);
+    collector::init_include_subagents(filter.subagents);
+}
+
+fn empty_is_ok<T>(r: Result<Vec<T>, String>) -> Result<Vec<T>, String> {
+    match r {
+        Err(e) if crate::is_empty_result_error(&e) => Ok(Vec::new()),
+        other => other,
+    }
+}
+
+fn sort_order(p: &Params<'_>) -> Result<SortOrder, String> {
+    match p.string("order")?.as_deref() {
+        None | Some("desc") => Ok(SortOrder::Desc),
+        Some("asc") => Ok(SortOrder::Asc),
+        Some(other) => Err(format!("'order' must be asc or desc, got '{}'", other)),
+    }
+}
+
+fn parse_fields<T: std::str::FromStr<Err = String>>(
+    p: &Params<'_>,
+    key: &str,
+) -> Result<Option<Vec<T>>, String> {
+    let Some(list) = p.string_list(key)? else {
+        return Ok(None);
+    };
+    if list.is_empty() {
+        return Err(format!("'{}' must list at least one field", key));
+    }
+    list.iter()
+        .map(|s| s.parse::<T>())
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn with_common<'a>(common: &[&'a str], extra: &[&'a str]) -> Vec<&'a str> {
+    common.iter().chain(extra.iter()).copied().collect()
+}
+
+// ─── log ──────────────────────────────────────────────────────────────
+
+fn tool_log(p: &Params<'_>, base: &FilterArgs) -> Result<ToolOutput, String> {
+    p.check_allowed(&with_common(
+        &LOG_COMMON,
+        &[
+            "query",
+            "prompt_only",
+            "raw_search",
+            "fields",
+            "sort",
+            "order",
+            "max_results",
+            "transcript_limit",
+            "title_limit",
+        ],
+    ))?;
+    let mut filter = merge_filter(base, p, &LOG_COMMON)?;
+    filter.query = p.string("query")?.filter(|q| !q.is_empty());
+    filter.prompt_only = p.bool("prompt_only")?.unwrap_or(false);
+    filter.raw_search = p.bool("raw_search")?.unwrap_or(false);
+    if filter.prompt_only && filter.raw_search {
+        return Err("'prompt_only' and 'raw_search' are exclusive".into());
+    }
+    let query = filter.query.clone().unwrap_or_default();
+    let sort_field = match p.string("sort")? {
+        Some(s) => s.parse::<Field>()?,
+        None => Field::ModifiedAt,
+    };
+    let fields = match parse_fields::<Field>(p, "fields")? {
+        Some(f) => f,
+        None if query.is_empty() => vec![
+            Field::Agent,
+            Field::Project,
+            Field::ModifiedAt,
+            Field::Title,
+            Field::Id,
+        ],
+        None => vec![
+            Field::Agent,
+            Field::Project,
+            Field::ModifiedAt,
+            Field::Title,
+            Field::Matched,
+            Field::Id,
+        ],
+    };
+    let max_results = p.uint("max_results")?.unwrap_or(DEFAULT_MAX_RESULTS) as usize;
+    let transcript_limit = p.uint("transcript_limit")?.unwrap_or(500) as usize;
+    let title_limit = p.uint("title_limit")?.unwrap_or(50) as usize;
+
+    apply_collector_flags(&filter);
+    let search_mode = filter.search_mode();
+    let params = pipeline::PipelineParams {
+        resolve_fields: fields.clone(),
+        resolve_opts: resolver::ResolveOpts::new(&query, transcript_limit, title_limit)
+            .with_search_mode(search_mode.clone()),
+        filters: filter.to_filters(),
+        since: filter.since_time()?,
+        until: filter.until_time()?,
+        query,
+        search_mode,
+        sort_field,
+        sort_order: sort_order(p)?,
+        collect_limit: filter.limit,
+        running: filter.running,
+        require_resume_cmd: false,
+    };
+    let mut sessions = pipeline::run_pipeline(&params)?.sessions;
+    let total = sessions.len();
+    let truncated = max_results != 0 && total > max_results;
+    if truncated {
+        sessions.truncate(max_results);
+    }
+    let rows: Vec<Value> = sessions
+        .iter()
+        .map(|s| Value::Object(crate::output::session_to_json(s, &fields)))
+        .collect();
+    Ok(ToolOutput::jsonl(
+        json!({
+            "scope": args::scope_json(&filter),
+            "sessions": rows,
+            "total": total,
+            "truncated": truncated,
+        }),
+        "sessions",
+    ))
+}
+
+// ─── search ───────────────────────────────────────────────────────────
+
+fn tool_search(p: &Params<'_>, base: &FilterArgs) -> Result<ToolOutput, String> {
+    p.check_allowed(&with_common(
+        &LOG_COMMON,
+        &[
+            "pattern",
+            "kind",
+            "prompt_only",
+            "max_matches",
+            "snippet_length",
+        ],
+    ))?;
+    let mut filter = merge_filter(base, p, &LOG_COMMON)?;
+    let pattern = p.required_string("pattern")?;
+    let mut kinds: Vec<SearchKind> = match p.string_list("kind")? {
+        Some(list) => list
+            .iter()
+            .map(|k| {
+                serde_json::from_value::<SearchKind>(Value::String(k.clone())).map_err(|_| {
+                    format!(
+                        "unknown kind '{}'; expected user, assistant, tool-input, tool-output or unknown",
+                        k
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        None => Vec::new(),
+    };
+    if p.bool("prompt_only")?.unwrap_or(false) {
+        if kinds.iter().any(|k| *k != SearchKind::User) {
+            return Err(
+                "'prompt_only' selects user text; do not combine it with other kinds".into(),
+            );
+        }
+        kinds = vec![SearchKind::User];
+    }
+    let max_matches = p.uint("max_matches")?.unwrap_or(100) as usize;
+    let snippet_length = match p.uint("snippet_length")?.unwrap_or(240) {
+        0 => return Err("'snippet_length' must be at least 1".into()),
+        n => n.min(u32::MAX as u64) as u32,
+    };
+    let search_args = MatchSearchArgs {
+        kind: kinds,
+        pattern: Some(pattern),
+        json: true,
+        tsv: false,
+        verbose: false,
+        search_wire: false,
+        max_matches,
+        snippet_length,
+    };
+    apply_collector_flags(&filter);
+    let (hits, truncated) = search_hits::collect_hits(&search_args, &mut filter, true)?;
+    Ok(ToolOutput::jsonl(
+        json!({
+            "scope": args::scope_json(&filter),
+            "hits": hits,
+            "truncated": truncated,
+        }),
+        "hits",
+    ))
+}
+
+// ─── show ─────────────────────────────────────────────────────────────
+
+/// Cut `s` to at most `max` characters on a character boundary.
+pub fn truncate_chars(s: &str, max: usize) -> (String, bool) {
+    if max == 0 {
+        return (s.to_string(), false);
+    }
+    match s.char_indices().nth(max) {
+        Some((idx, _)) => (s[..idx].to_string(), true),
+        None => (s.to_string(), false),
+    }
+}
+
+/// Drop trailing items until the summed character count of `len(item)`
+/// fits in `max` (0 = unlimited). Returns whether anything was dropped.
+fn fit_chars<T>(items: &mut Vec<T>, max: usize, len: impl Fn(&T) -> usize) -> bool {
+    if max == 0 {
+        return false;
+    }
+    let mut total: usize = items.iter().map(&len).sum();
+    let mut dropped = false;
+    while total > max && !items.is_empty() {
+        let last = items.pop().unwrap();
+        total -= len(&last);
+        dropped = true;
+    }
+    dropped
+}
+
+/// Like `fit_chars`, but for the records around a search hit: context
+/// records farthest from the selected one go first, and the selected record
+/// is always kept (it is what the caller asked to read).
+fn fit_records_around_selected(records: &mut Vec<show::AtRecord>, max: usize) -> bool {
+    if max == 0 {
+        return false;
+    }
+    let len = |r: &show::AtRecord| r.text.chars().count();
+    let mut total: usize = records.iter().map(len).sum();
+    let mut dropped = false;
+    match records.iter().position(|r| r.selected) {
+        None => {
+            while total > max && records.len() > 1 {
+                let last = records.pop().unwrap();
+                total -= len(&last);
+                dropped = true;
+            }
+        }
+        Some(sel) => {
+            // Records come in source order, so the fragment farthest from
+            // the selection (by record number, then fragment distance, then
+            // the later one) is always one of the two ends of the retained
+            // range: shrink the range from its ends and cut once.
+            let sel_record = records[sel].record;
+            let key = |i: usize| (records[i].record.abs_diff(sel_record), i.abs_diff(sel), i);
+            let (mut lo, mut hi) = (0, records.len() - 1);
+            while total > max && lo < hi {
+                if crate::cancel::requested() {
+                    break;
+                }
+                let victim = if hi == sel {
+                    lo
+                } else if lo == sel || key(hi) >= key(lo) {
+                    hi
+                } else {
+                    lo
+                };
+                total -= len(&records[victim]);
+                dropped = true;
+                if victim == hi {
+                    hi -= 1;
+                } else {
+                    lo += 1;
+                }
+            }
+            records.truncate(hi + 1);
+            records.drain(..lo);
+        }
+    }
+    // The selected record alone may still exceed the limit (a huge tool
+    // output): keep a window of `max` characters around the match.
+    if total > max {
+        if let Some(r) = records.iter_mut().find(|r| r.selected) {
+            window_around_match(r, max);
+            dropped = true;
+        }
+    }
+    dropped
+}
+
+/// Cut `r.text` to `max` characters around its match (byte offsets), on
+/// character boundaries, and shift the match offsets accordingly.
+fn window_around_match(r: &mut show::AtRecord, max: usize) {
+    let chars: Vec<usize> = r.text.char_indices().map(|(b, _)| b).collect();
+    if chars.len() <= max {
+        return;
+    }
+    let match_start = r.match_start.unwrap_or(0).min(r.text.len());
+    let match_end = r.match_end.unwrap_or(match_start).min(r.text.len());
+    let start_char = chars.partition_point(|&b| b < match_start);
+    let end_char = chars.partition_point(|&b| b < match_end);
+    let match_chars = end_char.saturating_sub(start_char);
+    // Center the match; when the match itself is longer than the window,
+    // start at the match.
+    let lead = max.saturating_sub(match_chars) / 2;
+    let begin = start_char
+        .saturating_sub(lead)
+        .min(chars.len().saturating_sub(max));
+    let end = begin + max;
+    let byte_begin = chars[begin];
+    let byte_end = chars.get(end).copied().unwrap_or(r.text.len());
+    r.text = r.text[byte_begin..byte_end].to_string();
+    let clamp = |off: usize| off.saturating_sub(byte_begin).min(r.text.len());
+    r.match_start = r.match_start.map(clamp);
+    r.match_end = r.match_end.map(clamp);
+}
+
+fn truncation_note(what: &str, advice: &str) -> Option<String> {
+    Some(format!(
+        "[truncated: {} exceeded max_chars; {}]",
+        what, advice
+    ))
+}
+
+const HEAD_ADVICE: &str = "use head or a larger max_chars";
+const AT_ADVICE: &str = "use a smaller context or a larger max_chars";
+
+fn tool_show(p: &Params<'_>) -> Result<ToolOutput, String> {
+    p.check_allowed(&["session", "format", "head", "at", "context", "max_chars"])?;
+    let session = p.required_string("session")?;
+    let format = p.string("format")?.unwrap_or_else(|| "md".into());
+    if format != "md" && format != "json" {
+        return Err(format!("'format' must be md or json, got '{}'", format));
+    }
+    let head = p.uint("head")?.map(|n| n as usize).filter(|n| *n > 0);
+    let at = p.string("at")?.filter(|s| !s.is_empty());
+    let context = p.uint("context")?;
+    if context.is_some() && at.is_none() {
+        return Err("'context' requires 'at'".into());
+    }
+    if context.is_some_and(|c| c > 1000) {
+        return Err("'context' must be at most 1000".into());
+    }
+    if at.is_some() && head.is_some() {
+        return Err("'head' does not apply with 'at'".into());
+    }
+    let max_chars = p.uint("max_chars")?.unwrap_or(DEFAULT_MAX_CHARS) as usize;
+
+    let home = canonical_home();
+    // Explicit references reach archived and subagent sessions too.
+    collector::init_exclude_archived(false);
+    collector::init_include_subagents(true);
+    let path = subcmd::resolve_session_ref(&session, &home)?;
+    let plugin = agents::find_plugin_for_path(&path);
+    let mtime = plugin
+        .session_mtime(&path)
+        .ok_or_else(|| format!("Failed to read session metadata: {}", path.display()))?;
+    let meta_fields = [Field::Agent, Field::Id, Field::Title];
+    let meta = resolver::resolve_fields(
+        &path,
+        plugin,
+        mtime,
+        &home,
+        &meta_fields,
+        &resolver::ResolveOpts::default_with_title_limit(50),
+    );
+    let field = |f: Field| meta.get(&f).cloned().unwrap_or_default();
+    let session_json = json!({
+        "path": path.to_string_lossy(),
+        "agent": field(Field::Agent),
+        "id": field(Field::Id),
+        "title": field(Field::Title),
+    });
+
+    if let Some(at) = at {
+        let mut records = show::collect_at_records(&path, &at, context.unwrap_or(2) as usize)?;
+        let truncated = fit_records_around_selected(&mut records, max_chars);
+        let structured = json!({
+            "session": session_json,
+            "records": records,
+            "truncated": truncated,
+        });
+        return Ok(ToolOutput {
+            text: jsonl_text(&structured, "records"),
+            structured,
+            note: truncated
+                .then(|| truncation_note("records", AT_ADVICE))
+                .flatten(),
+        });
+    }
+
+    if format == "json" {
+        let mut messages = show::collect_messages(&path, head);
+        let truncated = fit_chars(&mut messages, max_chars, |(_, t)| t.chars().count());
+        let messages: Vec<Value> = messages
+            .into_iter()
+            .map(|(role, text)| json!({ "role": role, "text": text }))
+            .collect();
+        let structured = json!({
+            "session": session_json,
+            "messages": messages,
+            "truncated": truncated,
+        });
+        return Ok(ToolOutput {
+            text: jsonl_text(&structured, "messages"),
+            structured,
+            note: truncated
+                .then(|| truncation_note("messages", HEAD_ADVICE))
+                .flatten(),
+        });
+    }
+
+    let markdown = show::render_md(&path, head);
+    let (markdown, truncated) = truncate_chars(&markdown, max_chars);
+    Ok(ToolOutput {
+        text: markdown.clone(),
+        structured: json!({
+            "session": session_json,
+            "markdown": markdown,
+            "truncated": truncated,
+        }),
+        note: truncated
+            .then(|| truncation_note("transcript", HEAD_ADVICE))
+            .flatten(),
+    })
+}
+
+// ─── project ──────────────────────────────────────────────────────────
+
+fn tool_project(p: &Params<'_>, base: &FilterArgs) -> Result<ToolOutput, String> {
+    p.check_allowed(&with_common(&PROJECT_COMMON, &["fields", "sort", "order"]))?;
+    let filter = merge_filter(base, p, &PROJECT_COMMON)?;
+    let fields = parse_fields::<ProjectField>(p, "fields")?.unwrap_or_else(|| {
+        vec![
+            ProjectField::Project,
+            ProjectField::SessionCount,
+            ProjectField::LastModifiedAt,
+            ProjectField::Agents,
+        ]
+    });
+    let sort_field = match p.string("sort")? {
+        Some(s) => s.parse::<ProjectField>()?,
+        None => ProjectField::LastModifiedAt,
+    };
+    let resolved = ListProjectsResolvedArgs {
+        fields: fields.clone(),
+        output_format: OutputFormat::Json,
+        sort_order: sort_order(p)?,
+        sort_field,
+    };
+    apply_collector_flags(&filter);
+    let records = empty_is_ok(projects::build_project_records(&resolved, &filter))?;
+    let rows: Vec<Value> = records
+        .iter()
+        .map(|r| Value::Object(crate::output::project_to_json(r, &fields)))
+        .collect();
+    Ok(ToolOutput::jsonl(
+        json!({
+            "scope": args::dir_only_scope_json(&filter),
+            "projects": rows,
+        }),
+        "projects",
+    ))
+}
+
+// ─── memory ───────────────────────────────────────────────────────────
+
+fn tool_memory(p: &Params<'_>, base: &FilterArgs) -> Result<ToolOutput, String> {
+    p.check_allowed(&with_common(
+        &MEMORY_COMMON,
+        &["fields", "type", "query", "sort", "order", "max_chars"],
+    ))?;
+    let mut filter = merge_filter(base, p, &MEMORY_COMMON)?;
+    filter.query = p.string("query")?.filter(|q| !q.is_empty());
+    // An invalid regex is an error even when no memory file exists.
+    if let Some(q) = &filter.query {
+        pipeline::compile_text_regex(q)?;
+    }
+    let fields = parse_fields::<MemoryField>(p, "fields")?.unwrap_or_else(|| {
+        vec![
+            MemoryField::Agent,
+            MemoryField::Project,
+            MemoryField::Type,
+            MemoryField::Name,
+            MemoryField::ModifiedAt,
+            MemoryField::Description,
+        ]
+    });
+    let sort_field = match p.string("sort")? {
+        Some(s) => s.parse::<MemoryField>()?,
+        None => MemoryField::ModifiedAt,
+    };
+    let max_chars = p.uint("max_chars")?.unwrap_or(DEFAULT_MAX_CHARS) as usize;
+    let resolved = MemoryResolvedArgs {
+        fields: fields.clone(),
+        output_format: OutputFormat::Json,
+        sort_order: sort_order(p)?,
+        sort_field,
+        memory_type: p.string("type")?.filter(|t| !t.is_empty()),
+    };
+    let records: Vec<BTreeMap<MemoryField, String>> =
+        empty_is_ok(memory::build_memory_records(&resolved, &filter))?;
+    let mut rows: Vec<Map<String, Value>> = records
+        .iter()
+        .map(|r| crate::output::memory_to_json(r, &fields))
+        .collect();
+    // Bodies are the only large values: drop them from the end until the
+    // total fits, keeping every file listed.
+    let mut truncated = false;
+    if fields.contains(&MemoryField::Body) && max_chars != 0 {
+        let body_len = |row: &Map<String, Value>| {
+            row.get("body")
+                .and_then(Value::as_str)
+                .map(|s| s.chars().count())
+                .unwrap_or(0)
+        };
+        let mut total: usize = rows.iter().map(body_len).sum();
+        for row in rows.iter_mut().rev() {
+            if total <= max_chars {
+                break;
+            }
+            let len = body_len(row);
+            if len > 0 {
+                row.insert("body".into(), Value::Null);
+                total -= len;
+                truncated = true;
+            }
+        }
+    }
+    let rows: Vec<Value> = rows.into_iter().map(Value::Object).collect();
+    Ok(ToolOutput::jsonl(
+        json!({
+            "scope": args::scope_json(&filter),
+            "memory": rows,
+            "truncated": truncated,
+        }),
+        "memory",
+    ))
+}
+
+// ─── agent ────────────────────────────────────────────────────────────
+
+fn tool_agent(p: &Params<'_>, base: &FilterArgs) -> Result<ToolOutput, String> {
+    p.check_allowed(&AGENT_COMMON)?;
+    let filter = merge_filter(base, p, &AGENT_COMMON)?;
+    apply_collector_flags(&filter);
+    let scope = args::scope_json(&filter);
+    let scope_dir = scope.get("dir").and_then(Value::as_str).map(str::to_string);
+    let stats = empty_is_ok(agent_stats::build_agent_stats(
+        &filter,
+        scope_dir.as_deref(),
+    ))?;
+    Ok(ToolOutput::jsonl(
+        json!({
+            "scope": scope,
+            "agents": stats,
+        }),
+        "agents",
+    ))
+}
+
+// ─── list_agents ──────────────────────────────────────────────────────
+
+fn tool_list_agents(p: &Params<'_>) -> Result<ToolOutput, String> {
+    p.check_allowed(&[])?;
+    Ok(ToolOutput::jsonl(
+        json!({
+            "agents": list_agents::agent_defs_to_json(),
+        }),
+        "agents",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_chars_respects_boundaries() {
+        assert_eq!(
+            truncate_chars("日本語テキスト", 3),
+            ("日本語".to_string(), true)
+        );
+        assert_eq!(truncate_chars("abc", 3), ("abc".to_string(), false));
+        assert_eq!(truncate_chars("abc", 0), ("abc".to_string(), false));
+    }
+
+    #[test]
+    fn window_keeps_the_match_and_shifts_offsets() {
+        let text = format!("{}日本語needle{}", "a".repeat(100), "b".repeat(100));
+        let start = text.find("needle").unwrap();
+        let mut r = show::AtRecord {
+            record: 1,
+            fragment: 1,
+            kind: SearchKind::Assistant,
+            text,
+            selected: true,
+            match_start: Some(start),
+            match_end: Some(start + 6),
+        };
+        window_around_match(&mut r, 20);
+        assert_eq!(r.text.chars().count(), 20);
+        let (s, e) = (r.match_start.unwrap(), r.match_end.unwrap());
+        assert_eq!(&r.text[s..e], "needle");
+        // A match longer than the window starts the window.
+        let mut r2 = show::AtRecord {
+            text: "xx".repeat(50),
+            match_start: Some(10),
+            match_end: Some(90),
+            ..r
+        };
+        window_around_match(&mut r2, 8);
+        assert_eq!(r2.text.len(), 8);
+        assert_eq!(r2.match_start, Some(0));
+        assert_eq!(r2.match_end, Some(8));
+    }
+
+    #[test]
+    fn at_truncation_drops_by_source_record_distance() {
+        let rec = |record: usize, fragment: usize, selected: bool, text: &str| show::AtRecord {
+            record,
+            fragment,
+            kind: SearchKind::ToolInput,
+            text: text.to_string(),
+            selected,
+            match_start: selected.then_some(0),
+            match_end: selected.then_some(1),
+        };
+        // Five fragments of record 2, the hit in record 3, then record 5.
+        let mut records = vec![
+            rec(2, 1, false, "aa"),
+            rec(2, 2, false, "aa"),
+            rec(2, 3, false, "aa"),
+            rec(2, 4, false, "aa"),
+            rec(2, 5, false, "aa"),
+            rec(3, 1, true, "xx"),
+            rec(5, 1, false, "bb"),
+        ];
+        assert!(fit_records_around_selected(&mut records, 12));
+        let left: Vec<usize> = records.iter().map(|r| r.record).collect();
+        assert_eq!(
+            left,
+            [2, 2, 2, 2, 2, 3],
+            "record 5 is farther than record 2"
+        );
+        // Within the record before the hit, the fragment nearest the hit stays.
+        let mut records = vec![
+            rec(2, 1, false, "aaaa"),
+            rec(2, 2, false, "bb"),
+            rec(3, 1, true, "xx"),
+        ];
+        assert!(fit_records_around_selected(&mut records, 6));
+        let left: Vec<(usize, usize)> = records.iter().map(|r| (r.record, r.fragment)).collect();
+        assert_eq!(left, [(2, 2), (3, 1)]);
+        // Many fragments on both sides: the retained range stays centred.
+        let mut records: Vec<show::AtRecord> =
+            (1..=4000).map(|i| rec(i, 1, i == 2000, "abcd")).collect();
+        assert!(fit_records_around_selected(&mut records, 4 * 11));
+        let left: Vec<usize> = records.iter().map(|r| r.record).collect();
+        assert_eq!(left, (1995..=2005).collect::<Vec<_>>());
+        // Nothing is dropped when it fits.
+        let mut records = vec![rec(1, 1, false, "a"), rec(2, 1, true, "b")];
+        assert!(!fit_records_around_selected(&mut records, 10));
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn fit_chars_drops_from_the_end() {
+        let mut v = vec!["aaaa".to_string(), "bb".to_string(), "c".to_string()];
+        assert!(fit_chars(&mut v, 6, |s| s.len()));
+        assert_eq!(v, vec!["aaaa".to_string(), "bb".to_string()]);
+        assert!(!fit_chars(&mut v, 0, |s| s.len()));
+    }
+
+    #[test]
+    fn jsonl_text_puts_meta_first_then_one_item_per_line() {
+        let v = json!({"scope": {"all": true}, "sessions": [{"id": "a"}, {"id": "b"}], "total": 2});
+        let text = jsonl_text(&v, "sessions");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[0]).unwrap(),
+            json!({"scope": {"all": true}, "total": 2})
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[2]).unwrap(),
+            json!({"id": "b"})
+        );
+        assert_eq!(jsonl_text(&json!({"agents": []}), "agents"), "{}");
+        // A non-array under the list key is kept on the first line.
+        assert_eq!(
+            jsonl_text(&json!({"agents": 3}), "agents"),
+            "{\"agents\":3}"
+        );
+    }
+
+    #[test]
+    fn definitions_cover_every_tool() {
+        let defs = definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+        assert_eq!(names, TOOL_NAMES);
+        for d in &defs {
+            assert_eq!(d["inputSchema"]["additionalProperties"], Value::Bool(false));
+        }
+    }
+}

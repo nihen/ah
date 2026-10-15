@@ -31,9 +31,10 @@ pub fn build_project_records(
     }
     let field_filters = FieldFilter::from_options(&filter.agent, &None);
 
-    let needs_cwd = args.fields.contains(&ProjectField::Cwd) || filter.dir.is_some();
-    let needs_project_raw = args.fields.contains(&ProjectField::ProjectRaw);
-    let needs_sessions = args.fields.contains(&ProjectField::Sessions);
+    let wants = |f: ProjectField| args.fields.contains(&f) || args.sort_field == f;
+    let needs_cwd = wants(ProjectField::Cwd) || filter.dir.is_some();
+    let needs_project_raw = wants(ProjectField::ProjectRaw);
+    let needs_sessions = wants(ProjectField::Sessions);
     let needs_created_at = args.fields.contains(&ProjectField::FirstCreatedAt)
         || args.sort_field == ProjectField::FirstCreatedAt;
 
@@ -99,6 +100,9 @@ pub fn build_project_records(
     let resolved: Vec<ResolvedEntry> = files
         .par_iter()
         .filter_map(|(path, mtime)| {
+            if crate::cancel::checkpoint() {
+                return None;
+            }
             if let Some(ref since) = since {
                 if mtime < since {
                     return None;

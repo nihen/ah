@@ -32,6 +32,7 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("ah memory", "List agent memory and instruction files"),
     ("ah agent", "Show session summary per agent"),
     ("ah list-agents", "List supported agents and capabilities"),
+    ("ah mcp", "Serve sessions to MCP clients over stdio"),
 ];
 
 /// Generate all man pages to `w`. If `subcommand` is Some, generate only that one.
@@ -239,6 +240,7 @@ fn render_see_also(w: &mut dyn Write) -> Result<(), std::io::Error> {
         "ah-agent",
         "ah-memory",
         "ah-list-agents",
+        "ah-mcp",
     ];
     let refs: Vec<String> = subcmds.iter().map(|s| format!("{s}(1)")).collect();
     let joined = refs.join(", ");

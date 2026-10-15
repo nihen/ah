@@ -92,6 +92,11 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
     if !resolve_fields.contains(&Field::ModifiedAt) {
         resolve_fields.push(Field::ModifiedAt);
     }
+    // Sorting compares resolved values, so the sort field is resolved even
+    // when the caller does not output it.
+    if !resolve_fields.contains(&params.sort_field) {
+        resolve_fields.push(params.sort_field);
+    }
     if !resolve_fields.contains(&Field::Id) {
         resolve_fields.push(Field::Id);
     }
@@ -152,6 +157,9 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
     let sessions: Vec<(Session, SystemTime)> = files
         .par_iter()
         .filter_map(|(path, mtime)| {
+            if crate::cancel::checkpoint() {
+                return None;
+            }
             // Time range filter
             if let Some(since) = &params.since {
                 if mtime < since {

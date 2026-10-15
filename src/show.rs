@@ -303,63 +303,83 @@ fn run_pretty(path: &std::path::Path, head: Option<usize>, hl_re: Option<&regex:
     }
 }
 
-fn run_json(path: &std::path::Path, head: Option<usize>) {
+/// The first `head` conversation messages (all when `None` or 0), as
+/// `(role, text)` with the role spelled as in `show --json`.
+pub(crate) fn collect_messages(
+    path: &std::path::Path,
+    head: Option<usize>,
+) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    for_each_message(path, head, &mut |role, text| out.push((role, text)));
+    out
+}
+
+/// Visit the first `head` conversation messages (all when `None` or 0)
+/// as they are read, so callers can stream them.
+fn for_each_message(
+    path: &std::path::Path,
+    head: Option<usize>,
+    visit: &mut dyn FnMut(&'static str, String),
+) {
     let plugin = agents::find_plugin_for_path(path);
     let limit = head.unwrap_or(0);
 
     let mut count: usize = 0;
     plugin.iter_messages(path, &mut |message| {
+        if crate::cancel::checkpoint() {
+            return false;
+        }
         count += 1;
         if limit > 0 && count > limit {
             return false;
         }
-
         let role = match message.role {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
         };
-        let obj = serde_json::json!({
-            "role": role,
-            "text": message.text,
-        });
-        println!("{}", obj);
+        visit(role, message.text);
         true
     });
 }
 
-fn run_md(path: &std::path::Path, head: Option<usize>) {
-    let plugin = agents::find_plugin_for_path(path);
-    let limit = head.unwrap_or(0);
+fn run_json(path: &std::path::Path, head: Option<usize>) {
+    for_each_message(path, head, &mut |role, text| {
+        println!("{}", serde_json::json!({ "role": role, "text": text }));
+    });
+}
 
-    let mut count: usize = 0;
+/// One message as its Markdown section; `first` omits the separator.
+fn md_section(first: bool, role: &str, text: &str) -> String {
+    let heading = if role == "user" {
+        "## User"
+    } else {
+        "## Assistant"
+    };
+    format!(
+        "{}{}\n\n{}\n",
+        if first { "" } else { "\n---\n\n" },
+        heading,
+        strip_ansi(text)
+    )
+}
+
+/// The transcript as Markdown (`## User` / `## Assistant` sections separated
+/// by `---`), exactly what `show --md` prints.
+pub(crate) fn render_md(path: &std::path::Path, head: Option<usize>) -> String {
+    let mut out = String::new();
     let mut first = true;
-    plugin.iter_messages(path, &mut |message| {
-        count += 1;
-        if limit > 0 && count > limit {
-            return false;
-        }
-
-        if !first {
-            println!();
-            println!("---");
-            println!();
-        }
+    for_each_message(path, head, &mut |role, text| {
+        out.push_str(&md_section(first, role, &text));
         first = false;
+    });
+    out
+}
 
-        let text = strip_ansi(&message.text);
-        match message.role {
-            MessageRole::User => {
-                println!("## User");
-                println!();
-                println!("{}", text);
-            }
-            MessageRole::Assistant => {
-                println!("## Assistant");
-                println!();
-                println!("{}", text);
-            }
-        }
-        true
+fn run_md(path: &std::path::Path, head: Option<usize>) {
+    let mut first = true;
+    for_each_message(path, head, &mut |role, text| {
+        print!("{}", md_section(first, role, &text));
+        first = false;
     });
 }
 
@@ -484,13 +504,27 @@ fn run_follow(
     }
 }
 
-/// Navigate the same unfiltered source-record stream used by occurrence search.
-fn run_at(
+/// One source record fragment around a search position, as `show --at`
+/// reports it. Match offsets are set on the selected fragment only.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct AtRecord {
+    pub record: usize,
+    pub fragment: usize,
+    pub kind: crate::agents::entries::SearchKind,
+    pub text: String,
+    pub selected: bool,
+    pub match_start: Option<usize>,
+    pub match_end: Option<usize>,
+}
+
+/// The fragments within `context` records of the position `token` (from
+/// search output), in source order. The same unfiltered source-record stream
+/// as occurrence search; stale positions are an error.
+pub(crate) fn collect_at_records(
     path: &std::path::Path,
     token: &str,
     context: usize,
-    format: ShowFormat,
-) -> Result<(), String> {
+) -> Result<Vec<AtRecord>, String> {
     use crate::agents::entries::{RecordVisitor, SearchKind};
     let loc = crate::location::Location::parse(token)?;
     let plugin = agents::find_plugin_for_path(path);
@@ -502,6 +536,9 @@ fn run_at(
     plugin.iter_search_records(
         path,
         &mut RecordVisitor::new(&mut |record, fragment, kind, text, fingerprint| {
+            if crate::cancel::checkpoint() {
+                return false;
+            }
             if record > upper {
                 return false;
             }
@@ -523,16 +560,49 @@ fn run_at(
             "Search position is stale or does not belong to this session; run search again".into(),
         );
     }
-    for (record, fragment, kind, text) in texts {
-        let selected = record == loc.record && fragment == loc.fragment;
+    Ok(texts
+        .into_iter()
+        .map(|(record, fragment, kind, text)| {
+            let selected = record == loc.record && fragment == loc.fragment;
+            AtRecord {
+                record,
+                fragment,
+                kind,
+                text,
+                selected,
+                match_start: selected.then_some(loc.start),
+                match_end: selected.then_some(loc.end),
+            }
+        })
+        .collect())
+}
+
+/// Navigate the same unfiltered source-record stream used by occurrence search.
+fn run_at(
+    path: &std::path::Path,
+    token: &str,
+    context: usize,
+    format: ShowFormat,
+) -> Result<(), String> {
+    for rec in collect_at_records(path, token, context)? {
+        let AtRecord {
+            record,
+            fragment,
+            kind,
+            text,
+            selected,
+            match_start,
+            match_end,
+        } = rec;
         match format {
             ShowFormat::Json => println!(
                 "{}",
-                serde_json::json!({
+                serde_json::to_string(&serde_json::json!({
                     "record": record, "fragment": fragment, "kind": kind, "text": text,
                     "selected": selected,
-                    "match_start": selected.then_some(loc.start), "match_end": selected.then_some(loc.end),
-                })
+                    "match_start": match_start, "match_end": match_end,
+                }))
+                .unwrap_or_default()
             ),
             ShowFormat::Pretty | ShowFormat::Md => {
                 let marker = if selected { ">" } else { " " };
@@ -553,20 +623,19 @@ fn run_at(
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
-                let rendered =
-                    if selected && color::use_color() && matches!(format, ShowFormat::Pretty) {
+                let rendered = match (selected, match_start, match_end) {
+                    (true, Some(start), Some(end))
+                        if color::use_color() && matches!(format, ShowFormat::Pretty) =>
+                    {
                         format!(
                             "{}{}{}",
-                            safe(&text[..loc.start]),
-                            color::colorize(
-                                crate::color::BOLD_YELLOW,
-                                &safe(&text[loc.start..loc.end])
-                            ),
-                            safe(&text[loc.end..])
+                            safe(&text[..start]),
+                            color::colorize(crate::color::BOLD_YELLOW, &safe(&text[start..end])),
+                            safe(&text[end..])
                         )
-                    } else {
-                        safe(&text)
-                    };
+                    }
+                    _ => safe(&text),
+                };
                 println!("{}\n", rendered);
             }
             _ => return Err("--at requires pretty, JSON or Markdown output".into()),

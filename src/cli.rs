@@ -417,6 +417,10 @@ pub enum Commands {
     #[command(name = "list-agents", override_help = LIST_AGENTS_HELP_TEXT)]
     ListAgents(ListAgentsArgs),
 
+    /// Serve sessions to MCP clients over stdio
+    #[command(name = "mcp", override_help = MCP_HELP_TEXT)]
+    Mcp(McpArgs),
+
     /// Generate shell completion script
     #[command(name = "completion", override_help = COMPLETION_HELP_TEXT)]
     Completion(CompletionArgs),
@@ -462,6 +466,11 @@ pub struct MatchSearchArgs {
     pub snippet_length: u32,
 }
 
+/// `ah mcp` has no options of its own; the global filters set the tools'
+/// default scope.
+#[derive(Parser, Debug)]
+pub struct McpArgs {}
+
 #[derive(Parser, Debug)]
 pub struct ManArgs {
     /// Subcommand name (e.g. "log", "show"); omit for main page
@@ -480,7 +489,7 @@ pub struct CompletionArgs {
 }
 
 /// Common filter options shared across all subcommands.
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 pub struct FilterArgs {
     /// Filter by agent name (e.g. claude, codex, gemini)
     #[arg(long = "agent", global = true)]
@@ -1629,6 +1638,7 @@ Commands:
 
 Help / setup:
   list-agents         List supported agents
+  mcp                 Serve sessions to MCP clients over stdio
   completion          Generate shell completion script
   man                 Generate man page
 
@@ -2016,6 +2026,35 @@ Examples:
   ah list-agents --json
   ah list-agents --json | jq '.id'
   ah list-agents --tsv | column -t -s$'\t'"#;
+
+const MCP_HELP_TEXT: &str = r#"Serve sessions to MCP clients over stdio
+
+Usage:
+  ah mcp [GLOBAL OPTIONS]
+
+Runs a Model Context Protocol server that reads JSON-RPC from stdin and
+writes to stdout. Register it in an MCP client, e.g.:
+
+  claude mcp add ah -- ah mcp
+  [mcp_servers.ah] command = "ah" args = ["mcp"]     (~/.codex/config.toml)
+
+Tools: log, search, show, project, memory, agent, list_agents. Their
+arguments mirror the CLI flags (query, dir, all, agent, since, ...).
+
+Global filters (-a, -d, --agent, --project, --since, --until, --running,
+--no-archived, --subagents, -n) become the tools' default scope; a tool
+argument overrides them per call (dir clears all and vice versa).
+-q, -p, --raw-search, -i, --color, --remote and -A are rejected.
+
+Tool calls run one at a time and can be cancelled with
+notifications/cancelled. Sessions default to the server's working
+directory; every result includes the applied scope. Remote hosts are not
+supported: run ah mcp where the sessions live.
+
+Examples:
+  ah mcp                 # scope: the client's working directory
+  ah mcp -a              # scope: every project
+  ah mcp --agent claude  # only Claude sessions by default"#;
 
 const COMPLETION_HELP_TEXT: &str = r#"Generate shell completion script
 
