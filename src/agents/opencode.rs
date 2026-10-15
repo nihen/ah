@@ -471,7 +471,7 @@ fn session_models(db: &Path, id: &str) -> Result<Option<String>, String> {
                AND json_extract(data, '$.role') = 'assistant' \
                AND json_type(data, '$.modelID') = 'text' \
                AND coalesce(json_extract(data, '$.summary'), 0) != 1 \
-               AND EXISTS (SELECT 1 FROM part WHERE part.message_id = message.id \
+               AND id IN (SELECT part.message_id FROM part WHERE part.session_id = ?1 \
                  AND json_valid(part.data) \
                  AND (json_extract(part.data, '$.type') = 'tool' \
                    OR (json_extract(part.data, '$.type') IN ('text', 'reasoning') \

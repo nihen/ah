@@ -303,10 +303,10 @@ impl AgentPlugin for CopilotPlugin {
     fn resolve_model(&self, path: &Path) -> Option<String> {
         let data = super::common::mmap_file(&Self::events_path(path)?)?;
         let finder = memchr::memmem::Finder::new(b"odel");
-        // `modelMetrics` lists every model that received requests in
-        // first-use order, so it leads; models seen only on replies follow.
-        let mut metered = super::common::ModelList::default();
-        let mut answered = super::common::ModelList::default();
+        let mut models = super::common::ModelList::default();
+        // `modelMetrics` keys: models that received requests, in first-use
+        // order. They fill in models older replies do not name.
+        let mut metered = Vec::new();
         for line in data.split(|&b| b == b'\n') {
             if finder.find(line).is_none() {
                 continue;
@@ -320,25 +320,20 @@ impl AgentPlugin for CopilotPlugin {
             match val.get("type").and_then(|v| v.as_str()) {
                 Some("assistant.message" | "tool.execution_complete") => {
                     if let Some(model) = data.get("model").and_then(|v| v.as_str()) {
-                        answered.push(model);
+                        models.push(model);
                     }
                 }
                 Some("session.shutdown") if data.get("modelMetrics").is_some() => {
                     // `Value` sorts object keys; read them in written order.
                     if let Ok(event) = serde_json::from_slice::<ShutdownEvent>(line) {
-                        event
-                            .data
-                            .model_metrics
-                            .0
-                            .iter()
-                            .for_each(|m| metered.push(m));
+                        metered.extend(event.data.model_metrics.0);
                     }
                 }
                 _ => {}
             }
         }
-        metered.append(answered);
-        metered.joined()
+        models.merge_ordered(&metered);
+        models.joined()
     }
 
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
@@ -849,6 +844,19 @@ paras: >\n  one\n  two\n\n  three\n";
             r#"{"type":"session.shutdown","data":{"modelMetrics":{"claude-opus-4.6":{},"gpt-5.6-luna":{}}}}"#,
         );
         let path = session(tmp.path(), "m8", WORKSPACE, Some(legacy_tool));
+        assert_eq!(
+            PLUGIN.resolve_model(&path).as_deref(),
+            Some("claude-opus-4.6,gpt-5.6-luna")
+        );
+        // Replies name both models; shutdown metrics name only the last.
+        let mixed = concat!(
+            r#"{"type":"assistant.message","data":{"model":"claude-opus-4.6","content":"x"}}"#,
+            "\n",
+            r#"{"type":"assistant.message","data":{"model":"gpt-5.6-luna","content":"y"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"modelMetrics":{"gpt-5.6-luna":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m9", WORKSPACE, Some(mixed));
         assert_eq!(
             PLUGIN.resolve_model(&path).as_deref(),
             Some("claude-opus-4.6,gpt-5.6-luna")

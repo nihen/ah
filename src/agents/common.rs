@@ -106,9 +106,22 @@ impl ModelList {
         }
     }
 
-    /// Add `other`'s models after these, keeping the first occurrence.
-    pub fn append(&mut self, other: ModelList) {
-        other.0.iter().for_each(|model| self.push(model));
+    /// Merge `ordered`, a first-use ordering that may include models not
+    /// seen here: each new model goes before the first known model that
+    /// follows it in `ordered`, or last.
+    pub fn merge_ordered(&mut self, ordered: &[String]) {
+        let mut order = ModelList::default();
+        ordered.iter().for_each(|model| order.push(model));
+        for (i, model) in order.0.iter().enumerate() {
+            if self.0.contains(model) {
+                continue;
+            }
+            let at = order.0[i + 1..]
+                .iter()
+                .find_map(|next| self.0.iter().position(|m| m == next))
+                .unwrap_or(self.0.len());
+            self.0.insert(at, model.clone());
+        }
     }
 
     pub fn joined(self) -> Option<String> {
@@ -486,6 +499,30 @@ pub fn file_lock_key(_path: &Path) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+
+    fn models(list: &[&str]) -> ModelList {
+        let mut models = ModelList::default();
+        list.iter().for_each(|m| models.push(m));
+        models
+    }
+
+    #[test]
+    fn merge_ordered_places_new_models_by_their_successors() {
+        let order = |list: &[&str]| list.iter().map(|m| m.to_string()).collect::<Vec<_>>();
+        let merged = |seen: &[&str], ordered: &[&str]| {
+            let mut list = models(seen);
+            list.merge_ordered(&order(ordered));
+            list.joined()
+        };
+        assert_eq!(merged(&["B"], &["A", "B"]).as_deref(), Some("A,B"));
+        assert_eq!(merged(&["A", "B"], &["B"]).as_deref(), Some("A,B"));
+        assert_eq!(merged(&[], &["A", "B", "A", "B"]).as_deref(), Some("A,B"));
+        assert_eq!(
+            merged(&["C"], &["A", "auto", "", "B"]).as_deref(),
+            Some("C,A,B")
+        );
+        assert_eq!(merged(&[], &[]), None);
+    }
     use super::*;
 
     #[test]
