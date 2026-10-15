@@ -60,8 +60,12 @@ impl Home {
         self.dir.path()
     }
 
+    /// Canonical, as the server reports it (macOS puts tmp under /private).
     fn project(&self) -> String {
-        self.path().join("proj").display().to_string()
+        fs::canonicalize(self.path().join("proj"))
+            .unwrap()
+            .display()
+            .to_string()
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -445,8 +449,25 @@ fn log_scope_fields_and_limits() {
             call(9, "log", json!({"all": true, "fields": ["nope"]})),
             call(10, "log", json!({})),
             call(11, "log", json!({"all": true, "max_results": 0})),
+            call(
+                12,
+                "log",
+                json!({"all": true, "sort": "turns", "order": "asc", "max_results": 1, "fields": ["id"]}),
+            ),
+            call(
+                13,
+                "log",
+                json!({"all": true, "sort": "turns", "order": "desc", "max_results": 1, "fields": ["id"]}),
+            ),
         ],
     );
+    // The sort field is resolved even when it is not returned.
+    assert_eq!(
+        structured(&out, 12)["sessions"][0]["id"],
+        json!(JP_SESSION_ID)
+    );
+    assert_eq!(structured(&out, 13)["sessions"][0]["id"], json!(SESSION_ID));
+    assert!(structured(&out, 12)["sessions"][0].get("turns").is_none());
     let r1 = structured(&out, 1);
     assert_eq!(r1["scope"], json!({"dir": null, "all": true}));
     assert_eq!(r1["total"], json!(2));
@@ -756,8 +777,25 @@ fn project_tool() {
             call(3, "project", json!({"project": "nothing-here"})),
             call(4, "project", json!({"dir": "/nonexistent"})),
             call(5, "project", json!({"all": true})),
+            call(
+                6,
+                "project",
+                json!({"sort": "cwd", "order": "asc", "fields": ["project"]}),
+            ),
+            call(
+                7,
+                "project",
+                json!({"sort": "cwd", "order": "desc", "fields": ["project"]}),
+            ),
         ],
     );
+    // Sorting by a field that is not returned still orders by its value.
+    assert_eq!(structured(&out, 6)["projects"][0]["project"], json!("jp"));
+    assert_eq!(
+        structured(&out, 7)["projects"][0]["project"],
+        json!("myproject")
+    );
+    assert!(structured(&out, 6)["projects"][0].get("cwd").is_none());
     let r1 = structured(&out, 1);
     assert_eq!(r1["scope"], json!({"dir": null, "all": true}));
     let names: Vec<&str> = r1["projects"]
@@ -825,7 +863,12 @@ fn memory_tool() {
                 "memory",
                 json!({"dir": project, "agent": "claude", "fields": ["agent", "name"]}),
             ),
+            call(8, "memory", json!({"dir": "/nonexistent", "query": "("})),
         ],
+    );
+    assert!(
+        tool_error(&out, 8).contains("Invalid regex"),
+        "an invalid query is an error even when no file exists"
     );
     let r1 = structured(&out, 1);
     assert_eq!(r1["scope"]["dir"], json!(project));
@@ -899,6 +942,8 @@ fn agent_and_list_agents_tools() {
             call(2, "agent", json!({"dir": SESSION_CWD})),
             call(3, "agent", json!({"dir": "/nonexistent"})),
             call(4, "agent", json!({"all": true, "agent": "codex"})),
+            call(7, "agent", json!({"all": true, "project": "jp"})),
+            call(8, "agent", json!({"all": true, "project": "nothing"})),
             call(5, "list_agents", json!({})),
             call(6, "list_agents", json!({"all": true})),
         ],
@@ -924,6 +969,8 @@ fn agent_and_list_agents_tools() {
         "zero rows are kept"
     );
     assert_eq!(structured(&out, 4)["agents"], json!([]));
+    assert_eq!(structured(&out, 7)["agents"][0]["sessions"], json!(1));
+    assert_eq!(structured(&out, 8)["agents"], json!([]));
 
     let r5 = structured(&out, 5);
     assert!(r5.get("scope").is_none());

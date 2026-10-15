@@ -309,11 +309,22 @@ pub(crate) fn collect_messages(
     path: &std::path::Path,
     head: Option<usize>,
 ) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    for_each_message(path, head, &mut |role, text| out.push((role, text)));
+    out
+}
+
+/// Visit the first `head` conversation messages (all when `None` or 0)
+/// as they are read, so callers can stream them.
+fn for_each_message(
+    path: &std::path::Path,
+    head: Option<usize>,
+    visit: &mut dyn FnMut(&'static str, String),
+) {
     let plugin = agents::find_plugin_for_path(path);
     let limit = head.unwrap_or(0);
 
     let mut count: usize = 0;
-    let mut out = Vec::new();
     plugin.iter_messages(path, &mut |message| {
         if crate::cancel::checkpoint() {
             return false;
@@ -326,41 +337,50 @@ pub(crate) fn collect_messages(
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
         };
-        out.push((role, message.text));
+        visit(role, message.text);
         true
     });
-    out
 }
 
 fn run_json(path: &std::path::Path, head: Option<usize>) {
-    for (role, text) in collect_messages(path, head) {
+    for_each_message(path, head, &mut |role, text| {
         println!("{}", serde_json::json!({ "role": role, "text": text }));
-    }
+    });
+}
+
+/// One message as its Markdown section; `first` omits the separator.
+fn md_section(first: bool, role: &str, text: &str) -> String {
+    let heading = if role == "user" {
+        "## User"
+    } else {
+        "## Assistant"
+    };
+    format!(
+        "{}{}\n\n{}\n",
+        if first { "" } else { "\n---\n\n" },
+        heading,
+        strip_ansi(text)
+    )
 }
 
 /// The transcript as Markdown (`## User` / `## Assistant` sections separated
 /// by `---`), exactly what `show --md` prints.
 pub(crate) fn render_md(path: &std::path::Path, head: Option<usize>) -> String {
     let mut out = String::new();
-    for (i, (role, text)) in collect_messages(path, head).into_iter().enumerate() {
-        if i > 0 {
-            out.push_str("\n---\n\n");
-        }
-        let heading = if role == "user" {
-            "## User"
-        } else {
-            "## Assistant"
-        };
-        out.push_str(heading);
-        out.push_str("\n\n");
-        out.push_str(&strip_ansi(&text));
-        out.push('\n');
-    }
+    let mut first = true;
+    for_each_message(path, head, &mut |role, text| {
+        out.push_str(&md_section(first, role, &text));
+        first = false;
+    });
     out
 }
 
 fn run_md(path: &std::path::Path, head: Option<usize>) {
-    print!("{}", render_md(path, head));
+    let mut first = true;
+    for_each_message(path, head, &mut |role, text| {
+        print!("{}", md_section(first, role, &text));
+        first = false;
+    });
 }
 
 /// Follow a session file for new messages (like tail -f).

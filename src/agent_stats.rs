@@ -47,7 +47,13 @@ pub fn build_agent_stats(
         cwd_latest: Option<SystemTime>,
     }
 
-    let resolve_fields = [Field::Cwd];
+    let mut resolve_fields = Vec::new();
+    if scope_dir.is_some() {
+        resolve_fields.push(Field::Cwd);
+    }
+    if filter.project.is_some() {
+        resolve_fields.push(Field::Project);
+    }
     let mut stats: BTreeMap<&str, AgentStats> = BTreeMap::new();
 
     for (path, mtime) in &files {
@@ -79,19 +85,31 @@ pub fn build_agent_stats(
             }
         }
 
-        let in_cwd = if scope_dir.is_some() {
-            let fields = resolver::resolve_fields(
+        let fields = if resolve_fields.is_empty() {
+            BTreeMap::new()
+        } else {
+            resolver::resolve_fields(
                 path,
                 plugin,
                 *mtime,
                 &home,
                 &resolve_fields,
                 &Default::default(),
-            );
-            fields.get(&Field::Cwd).map(|v| v.as_str()).unwrap_or("") == cwd
-        } else {
-            false
+            )
         };
+        // Apply --project filter
+        if let Some(ref project_filter) = filter.project {
+            if fields
+                .get(&Field::Project)
+                .map(|v| v.as_str())
+                .unwrap_or("")
+                != project_filter
+            {
+                continue;
+            }
+        }
+        let in_cwd =
+            scope_dir.is_some() && fields.get(&Field::Cwd).map(|v| v.as_str()).unwrap_or("") == cwd;
 
         let entry = stats.entry(id).or_insert(AgentStats {
             total: 0,

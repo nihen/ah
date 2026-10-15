@@ -110,10 +110,11 @@ const MEMORY_COMMON: [&str; 6] = [
     args::SINCE,
     args::UNTIL,
 ];
-const AGENT_COMMON: [&str; 8] = [
+const AGENT_COMMON: [&str; 9] = [
     args::ALL,
     args::DIR,
     args::AGENT,
+    args::PROJECT,
     args::SINCE,
     args::UNTIL,
     args::NO_ARCHIVED,
@@ -490,10 +491,13 @@ fn fit_records_around_selected(records: &mut Vec<show::AtRecord>, max: usize) ->
             dropped = true;
             continue;
         };
-        // Farthest from the selection; on a tie the later record goes.
+        // Farthest from the selection by source record number (a record
+        // may span several fragments), then by fragment distance, then
+        // the later fragment.
+        let sel_record = records[sel].record;
         let victim = (0..records.len())
             .filter(|&i| i != sel)
-            .max_by_key(|&i| (i.abs_diff(sel), i))
+            .max_by_key(|&i| (records[i].record.abs_diff(sel_record), i.abs_diff(sel), i))
             .unwrap();
         total -= len(&records[victim]);
         records.remove(victim);
@@ -694,6 +698,10 @@ fn tool_memory(p: &Params<'_>, base: &FilterArgs) -> Result<ToolOutput, String> 
     ))?;
     let mut filter = merge_filter(base, p, &MEMORY_COMMON)?;
     filter.query = p.string("query")?.filter(|q| !q.is_empty());
+    // An invalid regex is an error even when no memory file exists.
+    if let Some(q) = &filter.query {
+        pipeline::compile_text_regex(q)?;
+    }
     let fields = parse_fields::<MemoryField>(p, "fields")?.unwrap_or_else(|| {
         vec![
             MemoryField::Agent,
@@ -831,6 +839,45 @@ mod tests {
         assert_eq!(r2.text.len(), 8);
         assert_eq!(r2.match_start, Some(0));
         assert_eq!(r2.match_end, Some(8));
+    }
+
+    #[test]
+    fn at_truncation_drops_by_source_record_distance() {
+        let rec = |record: usize, fragment: usize, selected: bool, text: &str| show::AtRecord {
+            record,
+            fragment,
+            kind: SearchKind::ToolInput,
+            text: text.to_string(),
+            selected,
+            match_start: selected.then_some(0),
+            match_end: selected.then_some(1),
+        };
+        // Five fragments of record 2, the hit in record 3, then record 5.
+        let mut records = vec![
+            rec(2, 1, false, "aa"),
+            rec(2, 2, false, "aa"),
+            rec(2, 3, false, "aa"),
+            rec(2, 4, false, "aa"),
+            rec(2, 5, false, "aa"),
+            rec(3, 1, true, "xx"),
+            rec(5, 1, false, "bb"),
+        ];
+        assert!(fit_records_around_selected(&mut records, 12));
+        let left: Vec<usize> = records.iter().map(|r| r.record).collect();
+        assert_eq!(
+            left,
+            [2, 2, 2, 2, 2, 3],
+            "record 5 is farther than record 2"
+        );
+        // Within the record before the hit, the fragment nearest the hit stays.
+        let mut records = vec![
+            rec(2, 1, false, "aaaa"),
+            rec(2, 2, false, "bb"),
+            rec(3, 1, true, "xx"),
+        ];
+        assert!(fit_records_around_selected(&mut records, 6));
+        let left: Vec<(usize, usize)> = records.iter().map(|r| (r.record, r.fragment)).collect();
+        assert_eq!(left, [(2, 2), (3, 1)]);
     }
 
     #[test]
