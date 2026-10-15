@@ -327,6 +327,9 @@ fn glob_files(pattern: &str) -> Vec<PathBuf> {
     // directory reached along another path is still walked there.
     let mut stack: Vec<(PathBuf, Vec<PathBuf>)> = vec![(root, Vec::new())];
     while let Some((dir, mut chain)) = stack.pop() {
+        if crate::cancel::checkpoint() {
+            break;
+        }
         let Ok(canonical) = fs::canonicalize(&dir) else {
             continue;
         };

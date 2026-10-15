@@ -262,6 +262,7 @@ Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.j
 - **Resume-friendly** — `ah resume` and `ah show` can target the latest matching session without pasting IDs
 - **Structured output** — `git log`-style multi-line format with auto-pager on TTY, plain TSV when piped, plus `--table`, `--json`, `--ltsv`
 - **Interactive** — `-i` adds fuzzy selection with transcript preview (via [fzf](https://github.com/junegunn/fzf) or compatible finder)
+- **MCP server** — `ah mcp` exposes the same search and transcript access as tools for Claude Code, Codex, Gemini CLI, Cursor and other MCP clients
 
 ## Installation
 
@@ -346,6 +347,7 @@ Commands:
 
 Help / setup:
   list-agents         List supported agents
+  mcp                 Serve sessions to MCP clients over stdio
   completion          Generate shell completion script
   man                 Generate man page
 
@@ -686,6 +688,79 @@ Default output (when no format flag is given):
 Global options are also available (see ah -h).
 ```
 
+### `ah mcp --help`
+
+```
+Serve sessions to MCP clients over stdio
+
+Usage:
+  ah mcp [GLOBAL OPTIONS]
+
+Runs a Model Context Protocol server that reads JSON-RPC from stdin and
+writes to stdout. Register it in an MCP client, e.g.:
+
+  claude mcp add ah -- ah mcp
+  [mcp_servers.ah] command = "ah" args = ["mcp"]     (~/.codex/config.toml)
+
+Tools: log, search, show, project, memory, agent, list_agents. Their
+arguments mirror the CLI flags (query, dir, all, agent, since, ...).
+
+Global filters (-a, -d, --agent, --project, --since, --until, --running,
+--no-archived, --subagents, -n) become the tools' default scope; a tool
+argument overrides them per call (dir clears all and vice versa).
+-q, -p, --raw-search, -i, --color, --remote and -A are rejected.
+
+Tool calls run one at a time and can be cancelled with
+notifications/cancelled. Sessions default to the server's working
+directory; every result includes the applied scope. Remote hosts are not
+supported: run ah mcp where the sessions live.
+
+Examples:
+  ah mcp                 # scope: the client's working directory
+  ah mcp -a              # scope: every project
+  ah mcp --agent claude  # only Claude sessions by default
+```
+
+## MCP server
+
+`ah mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io/) server over stdio, so a coding agent can search its own (and other agents') history as structured data instead of parsing CLI output. Register it once:
+
+| Client | Setup |
+|---|---|
+| Claude Code | `claude mcp add ah -- ah mcp` (or add it to `.mcp.json`) |
+| Codex | `~/.codex/config.toml`: `[mcp_servers.ah]` `command = "ah"` `args = ["mcp"]` |
+| Gemini CLI | `settings.json`: `"mcpServers": {"ah": {"command": "ah", "args": ["mcp"]}}` |
+| Cursor | `.cursor/mcp.json`: `{"mcpServers": {"ah": {"command": "ah", "args": ["mcp"]}}}` |
+
+The server speaks both the `initialize` handshake of protocol revisions 2025-06-18 and 2025-11-25 and the per-request metadata style of 2026-07-28 (`server/discover`).
+
+### Tools
+
+| Tool | What it returns | Arguments (besides the common filters) |
+|---|---|---|
+| `log` | Sessions newest first: `{scope, sessions, total, truncated}` | `query`, `prompt_only`, `raw_search`, `fields`, `sort`, `order`, `max_results` (default 50), `transcript_limit`, `title_limit` |
+| `search` | Occurrences with snippets and positions: `{scope, hits, truncated}` | `pattern` (required), `kind`, `prompt_only`, `max_matches` (default 100), `snippet_length` |
+| `show` | One transcript as Markdown (`format: md`, the default) or `{role, text}` messages (`json`), or with `at` the records around a search hit | `session` (required), `format`, `head`, `at`, `context` (default 2), `max_chars` (default 100000) |
+| `project` | Known projects: `{scope, projects}` | `fields`, `sort`, `order` |
+| `memory` | Memory and instruction files: `{scope, memory, truncated}`; add `body` to `fields` for contents | `fields`, `type`, `query`, `sort`, `order`, `max_chars` |
+| `agent` | Session counts per agent: `{scope, agents}` | — |
+| `list_agents` | Supported agents and capabilities: `{agents}` | — |
+
+Common filters, where the tool applies them: `all`, `dir`, `agent`, `project`, `since`, `until`, `running`, `no_archived`, `subagents`, `limit` (`limit` bounds the files scanned, like `-n`; `max_results` bounds the result). `all` and `dir` are exclusive: `dir` narrows to one working directory, `all: true` covers every project. `project` covers every directory unless `dir` applies (`all: true` only clears a `dir` inherited from the startup flags); `memory` takes `all`, `dir`, `agent`, `project`, `since` and `until`. Arguments a tool does not apply are rejected rather than ignored.
+
+Results come back as a text block and as `structuredContent` with the same JSON (`show` returns the Markdown itself as text). `log`, `search`, `project`, `memory` and `agent` include `scope: {dir, all}`, the directory scope that was actually applied, so an empty result can be told from a wrong scope. Input errors (an invalid regex, an unknown session, an argument the tool does not take) are returned as tool errors (`isError: true`) with the message; an unknown tool name is a JSON-RPC error. Empty results are successes with empty arrays.
+
+### Scope and defaults
+
+Sessions default to the server's working directory, which the client decides (Claude Code starts stdio servers in the project directory). The global filters given to `ah mcp` become the defaults of every tool: `ah mcp -a` makes every tool cover all projects unless a call passes `dir`, and `ah mcp --agent claude` restricts the defaults to Claude sessions. A tool argument always wins over the startup default, including `all: false` and `running: false`. `-q`, `-p`, `--raw-search`, `-i`, `--color`, `--remote` and `-A` are rejected at startup; remote hosts are not supported, so run `ah mcp` on the host that holds the sessions.
+
+### Limits
+
+- Tool calls run one at a time; a long search delays the next call. A waiting or running call can be cancelled with `notifications/cancelled` and gets no response.
+- `resume` is not offered. The `resume_cmd` field of `log` gives the shell command.
+- `log` truncates to `max_results` and `show`/`memory` to `max_chars` (whole messages or file bodies are dropped from the end; Markdown is cut on a character boundary) and report `truncated: true`.
+- Stdout carries only protocol messages; `--debug` logs to stderr.
+
 ## Configuration (~/.ahrc)
 
 `ah` works out of the box with no configuration. Optionally, create `~/.ahrc` (TOML) to customize agent settings and remote hosts.
@@ -855,6 +930,8 @@ Add this line to your project or global instructions so your coding agent knows 
 ```
 `ah` — cross-agent session history CLI. Run `ah -h` for usage; key commands: `ah log` (list sessions), `ah show` (view transcript), `ah log -a -q "keyword"` (search all).
 ```
+
+Or register `ah mcp` as an MCP server (see [MCP server](#mcp-server)) so the agent gets the same data as tools.
 
 ## License
 

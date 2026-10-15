@@ -98,7 +98,7 @@ pub(crate) fn collect_hits(
     let cap = if args.max_matches == 0 {
         usize::MAX
     } else {
-        args.max_matches + 1
+        args.max_matches.saturating_add(1)
     };
     let params = PipelineParams {
         resolve_fields: vec![

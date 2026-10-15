@@ -121,9 +121,14 @@ fn run(filter: FilterArgs) {
         handle_line(&shared, &base, trimmed);
     }
 
-    // EOF: stop accepting, let queued calls finish, then exit.
-    shared.closed.store(true, Ordering::SeqCst);
-    shared.wake.notify_all();
+    // EOF: stop accepting, let queued calls finish, then exit. `closed` is
+    // set under the queue lock so the worker cannot miss the wakeup between
+    // checking the flag and waiting.
+    {
+        let _queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        shared.closed.store(true, Ordering::SeqCst);
+        shared.wake.notify_all();
+    }
     let _ = worker.join();
 }
 
@@ -158,6 +163,15 @@ fn handle_line(shared: &Shared, base: &FilterArgs, line: &str) {
             return;
         }
     };
+    if let Err(e) = req.validate() {
+        // A malformed id cannot be echoed; such requests get a null id.
+        let id = match &req.id {
+            Some(id) if id.is_string() || id.is_number() => id.clone(),
+            _ => Value::Null,
+        };
+        shared.write(&rpc::error(&id, &RpcError::new(rpc::INVALID_REQUEST, e)));
+        return;
+    }
     if crate::color::is_debug() {
         eprintln!(
             "[debug] mcp: {} id={}",
@@ -183,12 +197,21 @@ fn handle_line(shared: &Shared, base: &FilterArgs, line: &str) {
             shared.write(&rpc::error(&id, &err));
             return;
         }
+        if !req.has_meta_client_capabilities() {
+            shared.write(&rpc::error(
+                &id,
+                &RpcError::invalid_params(
+                    "_meta is missing io.modelcontextprotocol/clientCapabilities",
+                ),
+            ));
+            return;
+        }
     }
 
     let result = match req.method.as_str() {
         "initialize" => Ok(initialize_result(base, req.params_map())),
         "server/discover" => Ok(discover_result(base)),
-        "ping" => Ok(json!({})),
+        "ping" => Ok(finish(json!({}), modern, false)),
         "tools/list" => Ok(finish(
             json!({ "tools": tools::definitions() }),
             modern,
@@ -227,12 +250,13 @@ fn handle_notification(shared: &Shared, req: &Request) {
     let Some(target) = req.params.get("requestId") else {
         return;
     };
-    {
-        let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pos) = queue.iter().position(|j| j.id == *target) {
-            queue.remove(pos);
-            return;
-        }
+    // Hold the queue lock while inspecting `running` too: the worker moves
+    // a job from the queue to `running` under the same lock, so a request
+    // is always in exactly one of the two places (lock order: queue, running).
+    let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pos) = queue.iter().position(|j| j.id == *target) {
+        queue.remove(pos);
+        return;
     }
     let running = shared.running.lock().unwrap_or_else(|e| e.into_inner());
     if running.as_ref() == Some(target) {
@@ -336,6 +360,11 @@ fn worker_loop(shared: &Shared, base: &FilterArgs) {
             let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if let Some(job) = queue.pop_front() {
+                    // Register the job as running before releasing the queue
+                    // lock, so a cancellation arriving now still finds it.
+                    let mut running = shared.running.lock().unwrap_or_else(|e| e.into_inner());
+                    *running = Some(job.id.clone());
+                    crate::cancel::reset();
                     break job;
                 }
                 if shared.closed.load(Ordering::SeqCst) {
@@ -344,11 +373,6 @@ fn worker_loop(shared: &Shared, base: &FilterArgs) {
                 queue = shared.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
             }
         };
-        {
-            let mut running = shared.running.lock().unwrap_or_else(|e| e.into_inner());
-            *running = Some(job.id.clone());
-            crate::cancel::reset();
-        }
         crate::agents::clear_all_caches();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             if std::env::var_os(TEST_PANIC_ENV).is_some() && job.arguments.contains_key("panic") {

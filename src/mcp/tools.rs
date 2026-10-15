@@ -60,7 +60,8 @@ const LOG_COMMON: [&str; 10] = [
     args::SUBAGENTS,
     args::LIMIT,
 ];
-const PROJECT_COMMON: [&str; 8] = [
+const PROJECT_COMMON: [&str; 9] = [
+    args::ALL,
     args::DIR,
     args::AGENT,
     args::PROJECT,
@@ -154,7 +155,7 @@ pub fn definitions() -> Vec<Value> {
             "inputSchema": schema(&[], vec![
                 ("session", json!({"type": "string", "description": "Session id (or unique prefix) or session file path, as returned by log/search"})),
                 ("format", json!({"type": "string", "enum": ["md", "json"], "description": "md (default): Markdown transcript; json: [{role, text}] messages"})),
-                ("head", json!({"type": "integer", "minimum": 0, "description": "Only the first N messages"})),
+                ("head", json!({"type": "integer", "minimum": 0, "description": "Only the first N messages (0 = all)"})),
                 ("at", json!({"type": "string", "description": "A position from search; returns the records around it instead of the transcript"})),
                 ("context", json!({"type": "integer", "minimum": 0, "maximum": 1000, "description": "Records before and after the position (default 2)"})),
                 ("max_chars", json!({"type": "integer", "minimum": 0, "description": "Truncate the result to this many characters (default 100000, 0 = unlimited)"})),
@@ -163,7 +164,7 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": "project",
             "title": "List projects",
-            "description": "List known projects (working directories with sessions) with session counts and agents. Covers every directory unless dir is given.",
+            "description": "List known projects (working directories with sessions) with session counts and agents. Covers every directory unless dir applies; all: true clears a dir inherited from the server's startup flags.",
             "inputSchema": schema(&PROJECT_COMMON, vec![
                 ("fields", json!({"type": "array", "items": {"type": "string", "enum": project_fields.clone()}, "description": "Fields per project (default: project, session_count, last_modified_at, agents)"})),
                 ("sort", json!({"type": "string", "enum": project_fields, "description": "Sort field (default last_modified_at)"})),
@@ -435,6 +436,35 @@ fn fit_chars<T>(items: &mut Vec<T>, max: usize, len: impl Fn(&T) -> usize) -> bo
     dropped
 }
 
+/// Like `fit_chars`, but for the records around a search hit: context
+/// records farthest from the selected one go first, and the selected record
+/// is always kept (it is what the caller asked to read).
+fn fit_records_around_selected(records: &mut Vec<show::AtRecord>, max: usize) -> bool {
+    if max == 0 {
+        return false;
+    }
+    let len = |r: &show::AtRecord| r.text.chars().count();
+    let mut total: usize = records.iter().map(len).sum();
+    let mut dropped = false;
+    while total > max && records.len() > 1 {
+        let Some(sel) = records.iter().position(|r| r.selected) else {
+            let last = records.pop().unwrap();
+            total -= len(&last);
+            dropped = true;
+            continue;
+        };
+        // Farthest from the selection; on a tie the later record goes.
+        let victim = (0..records.len())
+            .filter(|&i| i != sel)
+            .max_by_key(|&i| (i.abs_diff(sel), i))
+            .unwrap();
+        total -= len(&records[victim]);
+        records.remove(victim);
+        dropped = true;
+    }
+    dropped
+}
+
 fn truncation_note(what: &str) -> String {
     format!(
         "\n\n[truncated: {} exceeded max_chars; use head or a larger max_chars]",
@@ -491,7 +521,7 @@ fn tool_show(p: &Params<'_>) -> Result<ToolOutput, String> {
 
     if let Some(at) = at {
         let mut records = show::collect_at_records(&path, &at, context.unwrap_or(2) as usize)?;
-        let truncated = fit_chars(&mut records, max_chars, |r| r.text.chars().count());
+        let truncated = fit_records_around_selected(&mut records, max_chars);
         let structured = json!({
             "session": session_json,
             "records": records,

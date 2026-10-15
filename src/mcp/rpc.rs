@@ -13,6 +13,8 @@ pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 #[derive(Debug, Deserialize)]
 pub struct Request {
     #[serde(default)]
+    pub jsonrpc: Option<String>,
+    #[serde(default)]
     pub id: Option<Value>,
     pub method: String,
     #[serde(default)]
@@ -20,6 +22,31 @@ pub struct Request {
 }
 
 impl Request {
+    /// JSON-RPC 2.0 shape: `jsonrpc: "2.0"`, an id that is a string or a
+    /// number (MCP forbids null), params an object when present.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.jsonrpc.as_deref() != Some("2.0") {
+            return Err("Invalid Request: jsonrpc must be \"2.0\"".into());
+        }
+        if let Some(id) = &self.id {
+            if !(id.is_string() || id.is_number()) {
+                return Err("Invalid Request: id must be a string or a number".into());
+            }
+        }
+        if !(self.params.is_null() || self.params.is_object()) {
+            return Err("Invalid Request: params must be an object".into());
+        }
+        Ok(())
+    }
+
+    /// Whether a modern request carries the required client capabilities.
+    pub fn has_meta_client_capabilities(&self) -> bool {
+        self.params
+            .get("_meta")
+            .and_then(|m| m.get("io.modelcontextprotocol/clientCapabilities"))
+            .is_some_and(Value::is_object)
+    }
+
     pub fn params_map(&self) -> Option<&Map<String, Value>> {
         self.params.as_object()
     }

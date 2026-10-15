@@ -227,7 +227,8 @@ fn unknown_legacy_version_gets_newest_legacy_version() {
 #[test]
 fn modern_discover_and_version_errors() {
     let home = Home::new();
-    let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"});
+    let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}});
     let out = home.batch(
         &[],
         &[
@@ -237,7 +238,16 @@ fn modern_discover_and_version_errors() {
                 "params": {"_meta": meta, "name": "list_agents"}}),
             json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list",
                 "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "1900-01-01"}}}),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "ping", "params": {"_meta": meta}}),
+            json!({"jsonrpc": "2.0", "id": 6, "method": "tools/list",
+                "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}}),
         ],
+    );
+    assert_eq!(by_id(&out, 5)["result"]["resultType"], json!("complete"));
+    assert_eq!(
+        by_id(&out, 6)["error"]["code"],
+        json!(-32602),
+        "modern requests must carry clientCapabilities"
     );
     let discover = &by_id(&out, 1)["result"];
     assert_eq!(discover["resultType"], json!("complete"));
@@ -262,9 +272,11 @@ fn modern_discover_and_version_errors() {
         &[
             init(),
             json!({"jsonrpc": "2.0", "id": 5, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 6, "method": "ping"}),
         ],
     );
     assert!(by_id(&legacy, 5)["result"].get("resultType").is_none());
+    assert_eq!(by_id(&legacy, 6)["result"], json!({}));
 }
 
 #[test]
@@ -295,6 +307,25 @@ fn protocol_errors() {
             json!({"jsonrpc": "2.0", "method": "notifications/whatever"})
         )
         .unwrap();
+        writeln!(stdin, "{}", json!({"id": 10, "method": "ping"})).unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "1.0", "id": 11, "method": "ping"})
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": [1], "method": "ping"})
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 13, "method": "ping", "params": [1]})
+        )
+        .unwrap();
     }
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
@@ -308,7 +339,14 @@ fn protocol_errors() {
         .filter(|r| r["id"].is_null())
         .map(|r| r["error"]["code"].as_i64().unwrap())
         .collect();
-    assert_eq!(codes, [-32700, -32600]);
+    assert_eq!(
+        codes,
+        [-32700, -32600, -32600],
+        "parse error, array message, array id"
+    );
+    assert_eq!(by_id(&out, 10)["error"]["code"], json!(-32600));
+    assert_eq!(by_id(&out, 11)["error"]["code"], json!(-32600));
+    assert_eq!(by_id(&out, 13)["error"]["code"], json!(-32600));
     assert_eq!(by_id(&out, 7)["error"]["code"], json!(-32601));
     assert_eq!(by_id(&out, 8)["error"]["code"], json!(-32602));
     assert!(
@@ -318,7 +356,7 @@ fn protocol_errors() {
             .contains("Unknown tool")
     );
     assert_eq!(by_id(&out, 9)["error"]["code"], json!(-32602));
-    assert_eq!(out.len(), 6, "notifications get no response: {out:?}");
+    assert_eq!(out.len(), 10, "notifications get no response: {out:?}");
 }
 
 #[test]
@@ -495,8 +533,15 @@ fn search_then_show_at_position() {
                 "search",
                 json!({"all": true, "pattern": "auth", "kind": ["user"]}),
             ),
+            call(
+                8,
+                "search",
+                json!({"all": true, "pattern": "the", "max_matches": u64::MAX}),
+            ),
         ],
     );
+    assert_eq!(structured(&out, 8)["truncated"], json!(false));
+    assert!(!structured(&out, 8)["hits"].as_array().unwrap().is_empty());
     let r1 = structured(&out, 1);
     assert_eq!(r1["scope"]["all"], json!(true));
     assert_eq!(r1["truncated"], json!(false));
@@ -548,8 +593,18 @@ fn search_then_show_at_position() {
                 json!({"session": SESSION_ID, "at": "1.1:0-1:deadbeef"}),
             ),
             call(3, "show", json!({"session": SESSION_ID, "context": 1})),
+            call(
+                4,
+                "show",
+                json!({"session": SESSION_ID, "at": position, "context": 2, "max_chars": 1}),
+            ),
         ],
     );
+    // max_chars drops the context farthest from the hit, never the hit.
+    let r4 = structured(&out, 4);
+    assert_eq!(r4["truncated"], json!(true));
+    assert_eq!(r4["records"].as_array().unwrap().len(), 1);
+    assert_eq!(r4["records"][0]["selected"], json!(true));
     let r1 = structured(&out, 1);
     assert_eq!(r1["session"]["id"], json!(SESSION_ID));
     assert_eq!(r1["session"]["agent"], json!("claude"));
@@ -683,8 +738,22 @@ fn project_tool() {
     let r4 = structured(&out, 4);
     assert_eq!(r4["projects"], json!([]));
     assert_eq!(r4["scope"]["dir"], json!("/nonexistent"));
-    // `all` is not an argument of project.
-    assert!(tool_error(&out, 5).contains("all"));
+    assert_eq!(
+        structured(&out, 5)["scope"],
+        json!({"dir": null, "all": true})
+    );
+
+    // all: true clears a dir inherited from the startup flags.
+    let out = home.batch(
+        &["-d", "/nonexistent"],
+        &[
+            init(),
+            call(1, "project", json!({})),
+            call(2, "project", json!({"all": true})),
+        ],
+    );
+    assert_eq!(structured(&out, 1)["projects"], json!([]));
+    assert_eq!(structured(&out, 2)["projects"].as_array().unwrap().len(), 2);
 }
 
 #[test]

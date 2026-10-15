@@ -484,6 +484,9 @@ impl AgentPlugin for ClaudePlugin {
         let project_cwds: HashMap<PathBuf, Option<String>> = project_dirs
             .into_par_iter()
             .map(|dir| {
+                if crate::cancel::checkpoint() {
+                    return (dir, None);
+                }
                 let cwd = claude_project_cwd(&dir, home);
                 (dir, cwd)
             })
