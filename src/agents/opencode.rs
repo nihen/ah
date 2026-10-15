@@ -461,6 +461,8 @@ fn text_messages(db: &Path, id: &str) -> Result<Vec<Message>, String> {
 }
 
 /// Models of the session's assistant messages (`modelID`), in time order.
+/// Compaction summaries and responses interrupted before any text,
+/// reasoning or tool part are not answers.
 fn session_models(db: &Path, id: &str) -> Result<Option<String>, String> {
     with_connection(db, |conn| {
         let mut stmt = conn.prepare_cached(
@@ -468,6 +470,12 @@ fn session_models(db: &Path, id: &str) -> Result<Option<String>, String> {
              WHERE session_id = ?1 AND json_valid(data) \
                AND json_extract(data, '$.role') = 'assistant' \
                AND json_type(data, '$.modelID') = 'text' \
+               AND coalesce(json_extract(data, '$.summary'), 0) != 1 \
+               AND EXISTS (SELECT 1 FROM part WHERE part.message_id = message.id \
+                 AND json_valid(part.data) \
+                 AND (json_extract(part.data, '$.type') = 'tool' \
+                   OR (json_extract(part.data, '$.type') IN ('text', 'reasoning') \
+                     AND trim(coalesce(json_extract(part.data, '$.text'), '')) != ''))) \
              ORDER BY time_created, id",
         )?;
         let mut rows = stmt.query([id])?;
@@ -1157,8 +1165,16 @@ mod tests {
                 WHERE id = 'msg_2';
             UPDATE message SET data = '{"role":"assistant","modelID":"deepseek-v4-pro"}'
                 WHERE id = 'msg_3';
-            UPDATE message SET data = '{"role":"assistant","modelID":123}'
+            UPDATE message SET data = '{"role":"assistant","summary":true,"modelID":"compactor"}'
                 WHERE id = 'msg_4';
+            INSERT INTO message VALUES
+                ('msg_6', 'ses_aaa', 6, 6, '{"role":"assistant","modelID":"interrupted"}'),
+                ('msg_7', 'ses_aaa', 7, 7, '{"role":"assistant","modelID":123}'),
+                ('msg_8', 'ses_aaa', 8, 8, '{"role":"assistant","modelID":"empty-reasoning"}');
+            INSERT INTO part VALUES
+                ('prt_9', 'msg_6', 'ses_aaa', 6, 6, '{"type":"step-start"}'),
+                ('prt_10', 'msg_7', 'ses_aaa', 7, 7, '{"type":"text","text":"x"}'),
+                ('prt_11', 'msg_8', 'ses_aaa', 8, 8, '{"type":"reasoning","text":""}');
             "#,
         )
         .unwrap();

@@ -94,15 +94,21 @@ pub fn for_each_jsonl_value(path: &Path, visit: impl FnMut(&serde_json::Value) -
 }
 
 /// Distinct model names in first-use order, for `AgentPlugin::resolve_model`.
+/// `auto` is a selection, not a model, and is skipped.
 #[derive(Default)]
 pub struct ModelList(Vec<String>);
 
 impl ModelList {
     pub fn push(&mut self, model: &str) {
         let model = model.trim();
-        if !model.is_empty() && !self.0.iter().any(|m| m == model) {
+        if !model.is_empty() && model != "auto" && !self.0.iter().any(|m| m == model) {
             self.0.push(model.to_string());
         }
+    }
+
+    /// Add `other`'s models after these, keeping the first occurrence.
+    pub fn append(&mut self, other: ModelList) {
+        other.0.iter().for_each(|model| self.push(model));
     }
 
     pub fn joined(self) -> Option<String> {

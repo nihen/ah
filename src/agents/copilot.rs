@@ -297,23 +297,48 @@ impl AgentPlugin for CopilotPlugin {
 
     /// The models that actually answered; `session.start` only records the
     /// selection, which may be `auto`. Older logs name the model on tool
-    /// executions and at shutdown but not on assistant messages. Shutdown's
-    /// `currentModel` is only the selection, so it counts when the same
-    /// event's `modelMetrics` shows requests to it.
+    /// executions and at shutdown but not on assistant messages. At shutdown
+    /// the models that received requests are the keys of `modelMetrics`
+    /// (`currentModel` is only the selection, even with no reply).
     fn resolve_model(&self, path: &Path) -> Option<String> {
-        super::common::jsonl_models(&Self::events_path(path)?, b"odel\"", |val| {
-            let data = val.get("data")?;
-            let model = match val.get("type")?.as_str()? {
-                "assistant.message" | "tool.execution_complete" => data.get("model")?.as_str()?,
-                "session.shutdown" => {
-                    let current = data.get("currentModel")?.as_str()?;
-                    data.get("modelMetrics")?.get(current)?;
-                    current
-                }
-                _ => return None,
+        let data = super::common::mmap_file(&Self::events_path(path)?)?;
+        let finder = memchr::memmem::Finder::new(b"odel");
+        // `modelMetrics` lists every model that received requests in
+        // first-use order, so it leads; models seen only on replies follow.
+        let mut metered = super::common::ModelList::default();
+        let mut answered = super::common::ModelList::default();
+        for line in data.split(|&b| b == b'\n') {
+            if finder.find(line).is_none() {
+                continue;
+            }
+            let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) else {
+                continue;
             };
-            (model != "auto").then_some(model)
-        })
+            let Some(data) = val.get("data") else {
+                continue;
+            };
+            match val.get("type").and_then(|v| v.as_str()) {
+                Some("assistant.message" | "tool.execution_complete") => {
+                    if let Some(model) = data.get("model").and_then(|v| v.as_str()) {
+                        answered.push(model);
+                    }
+                }
+                Some("session.shutdown") if data.get("modelMetrics").is_some() => {
+                    // `Value` sorts object keys; read them in written order.
+                    if let Ok(event) = serde_json::from_slice::<ShutdownEvent>(line) {
+                        event
+                            .data
+                            .model_metrics
+                            .0
+                            .iter()
+                            .for_each(|m| metered.push(m));
+                    }
+                }
+                _ => {}
+            }
+        }
+        metered.append(answered);
+        metered.joined()
     }
 
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
@@ -506,6 +531,45 @@ fn visit_search_record(val: &serde_json::Value, visit: &mut TypedVisitor<'_>) ->
             .and_then(|d| d.get("result"))
             .is_none_or(|v| visit_tool_output(v, &mut |text| visit(K::ToolOutput, text))),
         _ => true,
+    }
+}
+
+/// A `session.shutdown` event, reading only the `modelMetrics` keys.
+#[derive(serde::Deserialize)]
+struct ShutdownEvent {
+    data: ShutdownData,
+}
+
+#[derive(serde::Deserialize)]
+struct ShutdownData {
+    #[serde(rename = "modelMetrics", default)]
+    model_metrics: KeysInOrder,
+}
+
+/// Keys of a JSON object in the order they are written.
+#[derive(Default)]
+struct KeysInOrder(Vec<String>);
+
+impl<'de> serde::Deserialize<'de> for KeysInOrder {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Keys;
+        impl<'de> serde::de::Visitor<'de> for Keys {
+            type Value = KeysInOrder;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<KeysInOrder, A::Error> {
+                let mut keys = Vec::new();
+                while let Some((key, serde::de::IgnoredAny)) = map.next_entry::<String, _>()? {
+                    keys.push(key);
+                }
+                Ok(KeysInOrder(keys))
+            }
+        }
+        deserializer.deserialize_map(Keys)
     }
 }
 
@@ -765,5 +829,29 @@ paras: >\n  one\n  two\n\n  three\n";
         );
         let path = session(tmp.path(), "m6", WORKSPACE, Some(switched));
         assert_eq!(PLUGIN.resolve_model(&path).as_deref(), Some("gpt-6-luna"));
+        // Older log with text-only replies from two models.
+        let legacy_two = concat!(
+            r#"{"type":"assistant.message","data":{"content":"x"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"currentModel":"claude-opus-4.6","modelMetrics":{"gpt-5.6-luna":{},"claude-opus-4.6":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m7", WORKSPACE, Some(legacy_two));
+        assert_eq!(
+            PLUGIN.resolve_model(&path).as_deref(),
+            Some("gpt-5.6-luna,claude-opus-4.6")
+        );
+        // A text-only reply from one model, then a tool run by another.
+        let legacy_tool = concat!(
+            r#"{"type":"assistant.message","data":{"content":"x"}}"#,
+            "\n",
+            r#"{"type":"tool.execution_complete","data":{"model":"gpt-5.6-luna"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"modelMetrics":{"claude-opus-4.6":{},"gpt-5.6-luna":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m8", WORKSPACE, Some(legacy_tool));
+        assert_eq!(
+            PLUGIN.resolve_model(&path).as_deref(),
+            Some("claude-opus-4.6,gpt-5.6-luna")
+        );
     }
 }
