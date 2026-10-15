@@ -460,6 +460,26 @@ fn text_messages(db: &Path, id: &str) -> Result<Vec<Message>, String> {
     })
 }
 
+/// Models of the session's assistant messages (`modelID`), in time order.
+fn session_models(db: &Path, id: &str) -> Result<Option<String>, String> {
+    with_connection(db, |conn| {
+        let mut stmt = conn.prepare_cached(
+            "SELECT json_extract(data, '$.modelID') FROM message \
+             WHERE session_id = ?1 AND json_valid(data) \
+               AND json_extract(data, '$.role') = 'assistant' \
+             ORDER BY time_created, id",
+        )?;
+        let mut rows = stmt.query([id])?;
+        let mut models = super::common::ModelList::default();
+        while let Some(row) = rows.next()? {
+            if let Some(model) = row.get::<_, Option<String>>(0)? {
+                models.push(&model);
+            }
+        }
+        Ok(models.joined())
+    })
+}
+
 /// Search texts of an exported session (`export_session`): each text part
 /// of a conversation message, and the tool name, input, output and error of
 /// tool parts. Compaction summaries are skipped like in `message_from_parts`.
@@ -707,6 +727,12 @@ impl AgentPlugin for OpencodePlugin {
     fn resume_args(&self, path: &Path, home: &Path) -> Option<Vec<String>> {
         let id = self.resolve_resume_id(path, home)?;
         Some(vec!["opencode".to_string(), "--session".to_string(), id])
+    }
+
+    fn resolve_model(&self, path: &Path) -> Option<String> {
+        let (db, id) = split_virtual_path(path)?;
+        session_row(path)?;
+        session_models(db, id).map_err(|e| warn_once(db, &e)).ok()?
     }
 
     fn parent_session_id(&self, path: &Path) -> Option<String> {
@@ -1115,5 +1141,30 @@ mod tests {
             uri_path(Path::new("/a b/c?d#e%f.db")),
             "/a%20b/c%3Fd%23e%25f.db"
         );
+    }
+
+    #[test]
+    fn model_lists_assistant_model_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = create_db(tmp.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            UPDATE message SET data = '{"role":"user","model":{"modelID":"not-this"}}'
+                WHERE id = 'msg_1';
+            UPDATE message SET data = '{"role":"assistant","modelID":"kimi-k2.7-code"}'
+                WHERE id = 'msg_2';
+            UPDATE message SET data = '{"role":"assistant","modelID":"deepseek-v4-pro"}'
+                WHERE id = 'msg_3';
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(
+            PLUGIN.resolve_model(&db.join("ses_aaa")).as_deref(),
+            Some("kimi-k2.7-code,deepseek-v4-pro")
+        );
+        assert_eq!(PLUGIN.resolve_model(&db.join("ses_empty")), None);
+        assert_eq!(PLUGIN.resolve_model(&db.join("ses_missing")), None);
     }
 }

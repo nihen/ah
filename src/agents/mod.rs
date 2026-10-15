@@ -159,6 +159,12 @@ pub trait AgentPlugin: Sync {
         None
     }
 
+    /// Models that answered in this session, comma-separated in first-use
+    /// order (see `common::ModelList`). `None` when the session records none.
+    fn resolve_model(&self, _path: &Path) -> Option<String> {
+        None
+    }
+
     /// Bytes used for full-text search. Defaults to mmapping `search_path`.
     fn session_bytes(&self, path: &Path) -> Option<SessionBytes> {
         mmap_file(&self.search_path(path)).map(SessionBytes::Mmap)

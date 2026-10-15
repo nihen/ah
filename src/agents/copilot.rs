@@ -295,6 +295,20 @@ impl AgentPlugin for CopilotPlugin {
         })
     }
 
+    /// The models that actually answered; `session.start` only records the
+    /// selection, which may be `auto`. Older logs name the model on tool
+    /// executions and at shutdown but not on assistant messages.
+    fn resolve_model(&self, path: &Path) -> Option<String> {
+        super::common::jsonl_models(&Self::events_path(path)?, b"odel\":\"", |val| {
+            let key = match val.get("type")?.as_str()? {
+                "assistant.message" | "tool.execution_complete" => "/data/model",
+                "session.shutdown" => "/data/currentModel",
+                _ => return None,
+            };
+            val.pointer(key)?.as_str().filter(|model| *model != "auto")
+        })
+    }
+
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
         let Some(events_path) = Self::events_path(path) else {
             return;
@@ -690,5 +704,30 @@ paras: >\n  one\n  two\n\n  three\n";
         let future = SystemTime::now() + Duration::from_secs(3600);
         assert!(running_in(dir.path(), |_| Some(future)).is_empty());
         assert!(running_in(&dir.path().join("missing"), |_| None).is_empty());
+    }
+
+    #[test]
+    fn model_is_the_answering_model_not_the_selection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let events = concat!(
+            r#"{"type":"session.start","data":{"selectedModel":"auto"}}"#,
+            "\n",
+            r#"{"type":"tool.execution_complete","data":{"model":"claude-opus-4.6"}}"#,
+            "\n",
+            r#"{"type":"assistant.message","data":{"model":"gpt-6-luna","content":"x"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"currentModel":"gpt-6-luna"}}"#,
+            "\n",
+        );
+        let path = session(tmp.path(), "m1", WORKSPACE, Some(events));
+        assert_eq!(
+            PLUGIN.resolve_model(&path).as_deref(),
+            Some("claude-opus-4.6,gpt-6-luna")
+        );
+        let auto_only = r#"{"type":"session.start","data":{"selectedModel":"auto"}}"#;
+        let path = session(tmp.path(), "m2", WORKSPACE, Some(auto_only));
+        assert_eq!(PLUGIN.resolve_model(&path), None);
+        let path = session(tmp.path(), "m3", WORKSPACE, None);
+        assert_eq!(PLUGIN.resolve_model(&path), None);
     }
 }

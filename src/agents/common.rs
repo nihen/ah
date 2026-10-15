@@ -93,6 +93,46 @@ pub fn for_each_jsonl_value(path: &Path, visit: impl FnMut(&serde_json::Value) -
     for_each_jsonl_value_bytes(&mmap, visit);
 }
 
+/// Distinct model names in first-use order, for `AgentPlugin::resolve_model`.
+#[derive(Default)]
+pub struct ModelList(Vec<String>);
+
+impl ModelList {
+    pub fn push(&mut self, model: &str) {
+        let model = model.trim();
+        if !model.is_empty() && !self.0.iter().any(|m| m == model) {
+            self.0.push(model.to_string());
+        }
+    }
+
+    pub fn joined(self) -> Option<String> {
+        (!self.0.is_empty()).then(|| self.0.join(","))
+    }
+}
+
+/// Models from the JSONL lines that contain `needle`; other lines are
+/// skipped without parsing.
+pub fn jsonl_models(
+    path: &Path,
+    needle: &[u8],
+    model_of: impl for<'a> Fn(&'a serde_json::Value) -> Option<&'a str>,
+) -> Option<String> {
+    let data = mmap_file(path)?;
+    let finder = memchr::memmem::Finder::new(needle);
+    let mut models = ModelList::default();
+    for line in data.split(|&b| b == b'\n') {
+        if finder.find(line).is_none() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) {
+            if let Some(model) = model_of(&val) {
+                models.push(model);
+            }
+        }
+    }
+    models.joined()
+}
+
 pub fn for_each_jsonl_value_bytes(data: &[u8], mut visit: impl FnMut(&serde_json::Value) -> bool) {
     for line_bytes in data.split(|&b| b == b'\n') {
         if line_bytes.len() < 2 {

@@ -513,6 +513,16 @@ impl AgentPlugin for CodexPlugin {
         session_meta(path)?.parent_id
     }
 
+    /// Each turn's settings, including the model, are logged as `turn_context`.
+    fn resolve_model(&self, path: &Path) -> Option<String> {
+        super::common::jsonl_models(path, b"\"turn_context\"", |val| {
+            if val.get("type")?.as_str()? != "turn_context" {
+                return None;
+            }
+            val.pointer("/payload/model")?.as_str()
+        })
+    }
+
     // `codex resume <id>` also finds archived sessions, so they keep their id.
     fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
         // A first line that is not JSON (empty or partly written file) has
@@ -888,5 +898,21 @@ mod tests {
             assert_eq!(PLUGIN.resolve_resume_id(&path, tmp.path()), None);
             assert_eq!(PLUGIN.resolve_cwd(&path, tmp.path()), None);
         }
+    }
+
+    #[test]
+    fn model_comes_from_turn_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_session(tmp.path(), "sessions");
+        let mut body = fs::read_to_string(&path).unwrap();
+        body.push_str(
+            r#"{"type":"turn_context","payload":{"model":"gpt-6-astra","effort":"high"}}"#,
+        );
+        body.push('\n');
+        body.push_str(r#"{"type":"event_msg","payload":{"type":"x","model":"not-this"}}"#);
+        body.push('\n');
+        body.push_str(r#"{"type":"turn_context","payload":{"model":"gpt-6-astra"}}"#);
+        fs::write(&path, body).unwrap();
+        assert_eq!(PLUGIN.resolve_model(&path).as_deref(), Some("gpt-6-astra"));
     }
 }
