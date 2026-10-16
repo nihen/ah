@@ -137,8 +137,9 @@ impl ModelList {
     /// Fold in the metered models replies do not name: each goes before the
     /// first known model that follows it in metering order, or last. Without
     /// a named reply, the last metered model stands in for the last one that
-    /// answered. When unnamed replies followed the last named one, a model
-    /// first metered after it is taken to have given them.
+    /// answered. When unnamed replies followed the last named one, a new
+    /// model metered after it, and after it in metering order, is taken to
+    /// have given them.
     pub fn merge_metered(&mut self) {
         let named = self.all.clone();
         let mut order = ModelList::default();
@@ -160,7 +161,17 @@ impl ModelList {
             self.metered_after_last
                 .iter()
                 .for_each(|model| recent.push(model));
-            if let Some(newer) = recent.all.iter().rev().find(|m| !named.contains(m)) {
+            let last = self.last.as_deref().unwrap_or_default();
+            let after = recent
+                .all
+                .iter()
+                .position(|m| m == last)
+                .map_or(0, |i| i + 1);
+            if let Some(newer) = recent.all[after..]
+                .iter()
+                .rev()
+                .find(|m| !named.contains(m))
+            {
                 self.last = Some(newer.clone());
             }
         }

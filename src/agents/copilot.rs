@@ -904,6 +904,22 @@ paras: >\n  one\n  two\n\n  three\n";
             (models.joined().as_str(), models.last()),
             ("claude-opus-4.6,gpt-5.6-luna", "claude-opus-4.6")
         );
+        // A model metered before the last named one is not newer.
+        let tool_last = concat!(
+            r#"{"type":"assistant.message","data":{"content":"x"}}"#,
+            "\n",
+            r#"{"type":"tool.execution_complete","data":{"model":"gpt-5.6-luna"}}"#,
+            "\n",
+            r#"{"type":"assistant.message","data":{"content":"y"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"modelMetrics":{"claude-opus-4.6":{},"gpt-5.6-luna":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m13", WORKSPACE, Some(tool_last));
+        let models = PLUGIN.resolve_models(&path).unwrap();
+        assert_eq!(
+            (models.joined().as_str(), models.last()),
+            ("claude-opus-4.6,gpt-5.6-luna", "gpt-5.6-luna")
+        );
         // Replies name both models; shutdown metrics name only the last.
         let mixed = concat!(
             r#"{"type":"assistant.message","data":{"model":"claude-opus-4.6","content":"x"}}"#,
