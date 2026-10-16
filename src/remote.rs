@@ -29,6 +29,11 @@ fn build_remote_args(remote: &RemoteDef, fields: &[Field], filter: &FilterArgs) 
             field_names.push(required.to_string());
         }
     }
+    // A remote that knows `model` but not `models` returns the model list
+    // as `model`; asking for both makes it fail instead (see `fetch_one`).
+    if fields.contains(&Field::Model) && !fields.contains(&Field::Models) {
+        field_names.push("models".to_string());
+    }
     args.push("-o".to_string());
     args.push(field_names.join(","));
     append_remote_filters(&mut args, filter);
@@ -139,13 +144,19 @@ fn fetch_one(
 ) -> Result<Vec<Session>, String> {
     let ah_args = build_remote_args(remote, fields, filter);
     let stdout = match run_ssh_capture(&remote.name, &remote.host, &ah_args) {
-        // Remotes older than the model field reject it; `model` is in the log
-        // defaults, so drop it rather than lose the whole remote.
-        Err(e) if fields.contains(&Field::Model) && e.contains("unknown field 'model'") => {
+        // Remotes older than the model fields reject them; `model` is in the
+        // log defaults, so drop both rather than lose the whole remote.
+        Err(e)
+            if fields
+                .iter()
+                .any(|f| matches!(f, Field::Model | Field::Models))
+                && (e.contains("unknown field 'model'")
+                    || e.contains("unknown field 'models'")) =>
+        {
             let fields: Vec<Field> = fields
                 .iter()
                 .copied()
-                .filter(|f| *f != Field::Model)
+                .filter(|f| !matches!(f, Field::Model | Field::Models))
                 .collect();
             let ah_args = build_remote_args(remote, &fields, filter);
             run_ssh_capture(&remote.name, &remote.host, &ah_args)?
@@ -1221,6 +1232,11 @@ mod tests {
                 "agent,title,modified_at,path,running"
             ]
         );
+        // `model` brings `models` along so a remote without it fails.
+        let args = build_remote_args(&remote, &[Field::Model], &filter);
+        assert_eq!(args[5], "model,path,modified_at,running,models");
+        let args = build_remote_args(&remote, &[Field::Model, Field::Models], &filter);
+        assert_eq!(args[5], "model,models,path,modified_at,running");
     }
 
     #[test]

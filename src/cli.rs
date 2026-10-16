@@ -1342,7 +1342,11 @@ impl MemoryResolvedArgs {
             parse_field_list(f)?
         } else if let Some(ref f) = raw.extra_fields {
             let mut fields = default_fields;
-            fields.extend(parse_field_list::<MemoryField>(f)?);
+            for field in parse_field_list::<MemoryField>(f)? {
+                if !fields.contains(&field) {
+                    fields.push(field);
+                }
+            }
             fields
         } else {
             default_fields
@@ -1476,7 +1480,11 @@ impl ListProjectsResolvedArgs {
             parse_field_list(f)?
         } else if let Some(ref f) = raw.extra_fields {
             let mut fields = default_fields;
-            fields.extend(parse_field_list::<ProjectField>(f)?);
+            for field in parse_field_list::<ProjectField>(f)? {
+                if !fields.contains(&field) {
+                    fields.push(field);
+                }
+            }
             fields
         } else {
             default_fields
@@ -1603,7 +1611,11 @@ impl Args {
             fields
         } else if let Some(ref f) = raw.extra_fields {
             let mut fields = default_fields;
-            fields.extend(parse_field_list::<Field>(f)?);
+            for field in parse_field_list::<Field>(f)? {
+                if !fields.contains(&field) {
+                    fields.push(field);
+                }
+            }
             fields
         } else {
             default_fields

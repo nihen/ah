@@ -118,10 +118,12 @@ impl ModelList {
     /// Merge `ordered`, a first-use ordering that may include models not
     /// seen here: each new model goes before the first known model that
     /// follows it in `ordered`, or last. Without a pushed reply, the last
-    /// model of `ordered` stands in for the last one that answered.
+    /// entry of `ordered` stands in for the last model that answered; a new
+    /// model first used after the last pushed one answered after it.
     pub fn merge_ordered(&mut self, ordered: &[String]) {
         let mut order = ModelList::default();
         ordered.iter().for_each(|model| order.push(model));
+        let pushed = self.all.clone();
         for (i, model) in order.all.iter().enumerate() {
             if self.all.contains(model) {
                 continue;
@@ -132,8 +134,18 @@ impl ModelList {
                 .unwrap_or(self.all.len());
             self.all.insert(at, model.clone());
         }
-        if self.last.is_none() {
-            self.last = order.all.pop();
+        match &self.last {
+            None => self.last = order.last,
+            Some(last) => {
+                let at = self.all.iter().position(|m| m == last).unwrap_or(0);
+                if let Some(newer) = self.all[at + 1..]
+                    .iter()
+                    .rev()
+                    .find(|m| !pushed.contains(m))
+                {
+                    self.last = Some(newer.clone());
+                }
+            }
         }
     }
 
@@ -542,7 +554,10 @@ mod tests {
         assert_eq!(merged(&["B"], &["A", "B"]), pair("A,B", "B"));
         assert_eq!(merged(&["A", "B"], &["B"]), pair("A,B", "B"));
         assert_eq!(merged(&[], &["A", "B", "A", "B"]), pair("A,B", "B"));
-        assert_eq!(merged(&["C"], &["A", "auto", "", "B"]), pair("C,A,B", "C"));
+        assert_eq!(merged(&[], &["A", "B", "A"]), pair("A,B", "A"));
+        assert_eq!(merged(&["A"], &["A", "B"]), pair("A,B", "B"));
+        assert_eq!(merged(&["B", "A"], &["B", "C", "A"]), pair("B,C,A", "A"));
+        assert_eq!(merged(&["C"], &["A", "auto", "", "B"]), pair("C,A,B", "B"));
         assert_eq!(merged(&[], &[]), None);
     }
 

@@ -857,6 +857,16 @@ paras: >\n  one\n  two\n\n  three\n";
             Some("claude-opus-4.6,gpt-5.6-luna")
         );
         assert_eq!(PLUGIN.resolve_models(&path).unwrap().last(), "gpt-5.6-luna");
+        // A tool run by one model, then text-only replies from another.
+        let legacy_switch = concat!(
+            r#"{"type":"tool.execution_complete","data":{"model":"claude-opus-4.6"}}"#,
+            "\n",
+            r#"{"type":"assistant.message","data":{"content":"x"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"modelMetrics":{"claude-opus-4.6":{},"gpt-5.6-luna":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m10", WORKSPACE, Some(legacy_switch));
+        assert_eq!(PLUGIN.resolve_models(&path).unwrap().last(), "gpt-5.6-luna");
         // Replies name both models; shutdown metrics name only the last.
         let mixed = concat!(
             r#"{"type":"assistant.message","data":{"model":"claude-opus-4.6","content":"x"}}"#,
