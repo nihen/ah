@@ -1550,6 +1550,7 @@ impl Args {
             if !query.is_empty() {
                 vec![
                     Field::Agent,
+                    Field::Model,
                     Field::Project,
                     Field::Cwd,
                     Field::CreatedAt,
@@ -1562,6 +1563,7 @@ impl Args {
             } else {
                 vec![
                     Field::Agent,
+                    Field::Model,
                     Field::Project,
                     Field::Cwd,
                     Field::CreatedAt,

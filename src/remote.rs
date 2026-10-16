@@ -138,7 +138,20 @@ fn fetch_one(
     filter: &FilterArgs,
 ) -> Result<Vec<Session>, String> {
     let ah_args = build_remote_args(remote, fields, filter);
-    let stdout = run_ssh_capture(&remote.name, &remote.host, &ah_args)?;
+    let stdout = match run_ssh_capture(&remote.name, &remote.host, &ah_args) {
+        // Remotes older than the model field reject it; `model` is in the log
+        // defaults, so drop it rather than lose the whole remote.
+        Err(e) if fields.contains(&Field::Model) && e.contains("unknown field 'model'") => {
+            let fields: Vec<Field> = fields
+                .iter()
+                .copied()
+                .filter(|f| *f != Field::Model)
+                .collect();
+            let ah_args = build_remote_args(remote, &fields, filter);
+            run_ssh_capture(&remote.name, &remote.host, &ah_args)?
+        }
+        result => result?,
+    };
     parse_remote_sessions(&remote.name, &stdout)
 }
 

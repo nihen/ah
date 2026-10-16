@@ -22,6 +22,7 @@ On a TTY, `ah log` outputs in `git log` style with auto-pager. Defaults to curre
 $ ah log
 session a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6
 Agent:    claude
+Model:    claude-opus-5-5
 Project:  my-webapp
 Cwd:      /home/user/src/my-webapp
 Date:     2026-03-23 14:00 - 2026-03-23 18:00
@@ -254,7 +255,7 @@ gemini           5  2026-03-21 10:50
 
 Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.json` (checking `procStart` so a reused PID is not reported), Grok's `active_sessions.json`, Copilot's `session-state/<id>/inuse.<pid>.lock`, and Codex's `thread-writer-locks/<id>.lock`. ¹ Codex is detected on Linux only, from the kernel lock table (`/proc/locks`); its PID is the lock holder, which for the interactive TUI is the Codex app-server. Running detection needs a PID liveness check, which is not implemented on Windows.
 
-The `model` field (`-o model`) lists the models that answered in a session, comma-separated in first-use order. For Copilot this is the model that actually answered, not the `auto` selection. It is empty when the session records no model (e.g. older Codex and Grok logs, or a session with no reply).
+The `model` field (`-o model`) lists the models that answered in a session, comma-separated in first-use order. For Copilot this is the model that actually answered, not the `auto` selection. It is empty when the session records no model (e.g. older Codex and Grok logs, or a session with no reply). On a TTY, `ah log` shows it as a `Model:` line, omitted when empty.
 
 ## Features
 
