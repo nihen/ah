@@ -100,48 +100,70 @@ pub fn for_each_jsonl_value(path: &Path, visit: impl FnMut(&serde_json::Value) -
 pub struct ModelList {
     all: Vec<String>,
     last: Option<String>,
-    /// A reply naming no model came after `last`.
-    unnamed_after_last: bool,
-    /// Metered models (see `push_metered`), and those metered after `last`.
+    /// Models metered so far (see `push_metered`).
     metered: Vec<String>,
-    metered_after_last: Vec<String>,
+    /// Replies in this run since its last metering: one naming its model,
+    /// one not.
+    named_since_metered: bool,
+    unnamed_since_metered: bool,
+}
+
+fn is_model(model: &str) -> bool {
+    !model.is_empty() && model != "auto"
 }
 
 impl ModelList {
     /// Record a reply by `model`; replies must be pushed in order.
     pub fn push(&mut self, model: &str) {
         let model = model.trim();
-        if model.is_empty() || model == "auto" {
+        if !is_model(model) {
             return;
         }
         if !self.all.iter().any(|m| m == model) {
             self.all.push(model.to_string());
         }
         self.last = Some(model.to_string());
-        self.unnamed_after_last = false;
-        self.metered_after_last.clear();
+        self.named_since_metered = true;
     }
 
     /// Record a reply that names no model.
     pub fn push_unnamed(&mut self) {
-        self.unnamed_after_last = true;
+        self.unnamed_since_metered = true;
     }
 
-    /// Record models that received requests, in first-use order, at this
-    /// point of the session. `merge_metered` folds them in.
+    /// Record the start of a run (a new or resumed session); replies of a
+    /// run that ended without metering do not carry over.
+    pub fn start_run(&mut self) {
+        self.named_since_metered = false;
+        self.unnamed_since_metered = false;
+    }
+
+    /// Record the models that received requests in this run since its last
+    /// metering, in first-use order. When only replies naming no model came
+    /// in between, the last of them stands in for the model that answered;
+    /// a named reply is never overridden. `merge_metered` folds them in.
     pub fn push_metered(&mut self, models: &[String]) {
-        self.metered.extend_from_slice(models);
-        self.metered_after_last.extend_from_slice(models);
+        let start = self.metered.len();
+        self.metered.extend(
+            models
+                .iter()
+                .map(|m| m.trim().to_string())
+                .filter(|m| is_model(m)),
+        );
+        if self.unnamed_since_metered && !self.named_since_metered {
+            if let Some(model) = self.metered[start..].last() {
+                self.last = Some(model.clone());
+            }
+        }
+        self.named_since_metered = false;
+        self.unnamed_since_metered = false;
     }
 
     /// Fold in the metered models replies do not name: each goes before the
     /// first known model that follows it in metering order, or last. Without
-    /// a named reply, the last metered model stands in for the last one that
-    /// answered. When unnamed replies followed the last named one, a new
-    /// model metered after it, and after it in metering order, is taken to
-    /// have given them.
+    /// any reply to go by, the last metered model stands in for the last one
+    /// that answered.
     pub fn merge_metered(&mut self) {
-        let named = self.all.clone();
         let mut order = ModelList::default();
         self.metered.iter().for_each(|model| order.push(model));
         for (i, model) in order.all.iter().enumerate() {
@@ -156,24 +178,6 @@ impl ModelList {
         }
         if self.last.is_none() {
             self.last = order.last;
-        } else if self.unnamed_after_last {
-            let mut recent = ModelList::default();
-            self.metered_after_last
-                .iter()
-                .for_each(|model| recent.push(model));
-            let last = self.last.as_deref().unwrap_or_default();
-            let after = recent
-                .all
-                .iter()
-                .position(|m| m == last)
-                .map_or(0, |i| i + 1);
-            if let Some(newer) = recent.all[after..]
-                .iter()
-                .rev()
-                .find(|m| !named.contains(m))
-            {
-                self.last = Some(newer.clone());
-            }
         }
     }
 
@@ -587,11 +591,17 @@ mod tests {
         assert_eq!(merged(&["A"], &["A", "B"]), pair("A,B", "A"));
         assert_eq!(merged(&["C"], &["A", "auto", "", "B"]), pair("C,A,B", "C"));
         assert_eq!(merged(&[], &[]), None);
+        // Metering stands in only for spans with unnamed replies alone.
         let mut list = models(&["A"]);
         list.push_unnamed();
         list.push_metered(&order(&["A", "B"]));
+        assert_eq!(list.last(), "A");
+        list.push_unnamed();
+        list.push_metered(&order(&["C"]));
+        list.push_unnamed();
+        list.push_metered(&order(&["B"]));
         list.merge_metered();
-        assert_eq!(list.last(), "B");
+        assert_eq!((list.joined().as_str(), list.last()), ("A,B,C", "B"));
     }
 
     #[test]
