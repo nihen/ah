@@ -401,8 +401,8 @@ Usage:
 
 Options:
   -o, --fields <FIELDS>   Select output fields (replaces defaults, see --list-fields)
-                          Default: agent, project, modified_at, title, id
-                          With -q: agent, project, modified_at, title, matched, id
+                          Default: agent, model, project, modified_at, title, id
+                          With -q: agent, model, project, modified_at, title, matched, id
   -O, --extra-fields <FIELDS>  Add fields to defaults (comma-separated)
   --table                 Aligned table with header row
   --tsv                   Tab-separated values (no header, no color)
