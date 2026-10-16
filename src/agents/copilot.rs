@@ -306,9 +306,6 @@ impl AgentPlugin for CopilotPlugin {
         // Replies naming no model still mark who answered last.
         let reply = memchr::memmem::Finder::new(b"assistant.message");
         let mut models = super::common::ModelList::default();
-        // `modelMetrics` keys: models that received requests, in first-use
-        // order. They fill in models older replies do not name.
-        let mut metered = Vec::new();
         for line in data.split(|&b| b == b'\n') {
             if finder.find(line).is_none() && reply.find(line).is_none() {
                 continue;
@@ -330,13 +327,15 @@ impl AgentPlugin for CopilotPlugin {
                 Some("session.shutdown") if data.get("modelMetrics").is_some() => {
                     // `Value` sorts object keys; read them in written order.
                     if let Ok(event) = serde_json::from_slice::<ShutdownEvent>(line) {
-                        metered.extend(event.data.model_metrics.0);
+                        // Models that received requests, in first-use order.
+                        // They fill in models older replies do not name.
+                        models.push_metered(&event.data.model_metrics.0);
                     }
                 }
                 _ => {}
             }
         }
-        models.merge_ordered(&metered);
+        models.merge_metered();
         models.non_empty()
     }
 
@@ -882,6 +881,24 @@ paras: >\n  one\n  two\n\n  three\n";
             r#"{"type":"session.shutdown","data":{"modelMetrics":{"claude-opus-4.6":{},"gpt-5.6-luna":{}}}}"#,
         );
         let path = session(tmp.path(), "m11", WORKSPACE, Some(named_last));
+        let models = PLUGIN.resolve_models(&path).unwrap();
+        assert_eq!(
+            (models.joined().as_str(), models.last()),
+            ("claude-opus-4.6,gpt-5.6-luna", "claude-opus-4.6")
+        );
+        // Resumed: a model metered only before the last named reply is older.
+        let resumed = concat!(
+            r#"{"type":"assistant.message","data":{"content":"x"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"modelMetrics":{"claude-opus-4.6":{},"gpt-5.6-luna":{}}}}"#,
+            "\n",
+            r#"{"type":"tool.execution_complete","data":{"model":"claude-opus-4.6"}}"#,
+            "\n",
+            r#"{"type":"assistant.message","data":{"content":"y"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"modelMetrics":{"claude-opus-4.6":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m12", WORKSPACE, Some(resumed));
         let models = PLUGIN.resolve_models(&path).unwrap();
         assert_eq!(
             (models.joined().as_str(), models.last()),

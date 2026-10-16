@@ -102,6 +102,9 @@ pub struct ModelList {
     last: Option<String>,
     /// A reply naming no model came after `last`.
     unnamed_after_last: bool,
+    /// Metered models (see `push_metered`), and those metered after `last`.
+    metered: Vec<String>,
+    metered_after_last: Vec<String>,
 }
 
 impl ModelList {
@@ -116,6 +119,7 @@ impl ModelList {
         }
         self.last = Some(model.to_string());
         self.unnamed_after_last = false;
+        self.metered_after_last.clear();
     }
 
     /// Record a reply that names no model.
@@ -123,16 +127,22 @@ impl ModelList {
         self.unnamed_after_last = true;
     }
 
-    /// Merge `ordered`, a first-use ordering that may include models not
-    /// seen here: each new model goes before the first known model that
-    /// follows it in `ordered`, or last. Without a pushed reply, the last
-    /// entry of `ordered` stands in for the last model that answered. When
-    /// unnamed replies followed the last pushed one, a new model first used
-    /// after it is taken to have given them.
-    pub fn merge_ordered(&mut self, ordered: &[String]) {
+    /// Record models that received requests, in first-use order, at this
+    /// point of the session. `merge_metered` folds them in.
+    pub fn push_metered(&mut self, models: &[String]) {
+        self.metered.extend_from_slice(models);
+        self.metered_after_last.extend_from_slice(models);
+    }
+
+    /// Fold in the metered models replies do not name: each goes before the
+    /// first known model that follows it in metering order, or last. Without
+    /// a named reply, the last metered model stands in for the last one that
+    /// answered. When unnamed replies followed the last named one, a model
+    /// first metered after it is taken to have given them.
+    pub fn merge_metered(&mut self) {
+        let named = self.all.clone();
         let mut order = ModelList::default();
-        ordered.iter().for_each(|model| order.push(model));
-        let pushed = self.all.clone();
+        self.metered.iter().for_each(|model| order.push(model));
         for (i, model) in order.all.iter().enumerate() {
             if self.all.contains(model) {
                 continue;
@@ -143,19 +153,16 @@ impl ModelList {
                 .unwrap_or(self.all.len());
             self.all.insert(at, model.clone());
         }
-        match &self.last {
-            None => self.last = order.last,
-            Some(last) if self.unnamed_after_last => {
-                let at = self.all.iter().position(|m| m == last).unwrap_or(0);
-                if let Some(newer) = self.all[at + 1..]
-                    .iter()
-                    .rev()
-                    .find(|m| !pushed.contains(m))
-                {
-                    self.last = Some(newer.clone());
-                }
+        if self.last.is_none() {
+            self.last = order.last;
+        } else if self.unnamed_after_last {
+            let mut recent = ModelList::default();
+            self.metered_after_last
+                .iter()
+                .for_each(|model| recent.push(model));
+            if let Some(newer) = recent.all.iter().rev().find(|m| !named.contains(m)) {
+                self.last = Some(newer.clone());
             }
-            Some(_) => {}
         }
     }
 
@@ -553,11 +560,12 @@ mod tests {
     }
 
     #[test]
-    fn merge_ordered_places_new_models_by_their_successors() {
+    fn merge_metered_places_new_models_by_their_successors() {
         let order = |list: &[&str]| list.iter().map(|m| m.to_string()).collect::<Vec<_>>();
         let merged = |seen: &[&str], ordered: &[&str]| {
             let mut list = models(seen);
-            list.merge_ordered(&order(ordered));
+            list.push_metered(&order(ordered));
+            list.merge_metered();
             list.non_empty().map(|m| (m.joined(), m.last().to_string()))
         };
         let pair = |all: &str, last: &str| Some((all.to_string(), last.to_string()));
@@ -570,7 +578,8 @@ mod tests {
         assert_eq!(merged(&[], &[]), None);
         let mut list = models(&["A"]);
         list.push_unnamed();
-        list.merge_ordered(&order(&["A", "B"]));
+        list.push_metered(&order(&["A", "B"]));
+        list.merge_metered();
         assert_eq!(list.last(), "B");
     }
 
