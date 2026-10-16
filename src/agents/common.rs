@@ -100,6 +100,8 @@ pub fn for_each_jsonl_value(path: &Path, visit: impl FnMut(&serde_json::Value) -
 pub struct ModelList {
     all: Vec<String>,
     last: Option<String>,
+    /// A reply naming no model came after `last`.
+    unnamed_after_last: bool,
 }
 
 impl ModelList {
@@ -113,13 +115,20 @@ impl ModelList {
             self.all.push(model.to_string());
         }
         self.last = Some(model.to_string());
+        self.unnamed_after_last = false;
+    }
+
+    /// Record a reply that names no model.
+    pub fn push_unnamed(&mut self) {
+        self.unnamed_after_last = true;
     }
 
     /// Merge `ordered`, a first-use ordering that may include models not
     /// seen here: each new model goes before the first known model that
     /// follows it in `ordered`, or last. Without a pushed reply, the last
-    /// entry of `ordered` stands in for the last model that answered; a new
-    /// model first used after the last pushed one answered after it.
+    /// entry of `ordered` stands in for the last model that answered. When
+    /// unnamed replies followed the last pushed one, a new model first used
+    /// after it is taken to have given them.
     pub fn merge_ordered(&mut self, ordered: &[String]) {
         let mut order = ModelList::default();
         ordered.iter().for_each(|model| order.push(model));
@@ -136,7 +145,7 @@ impl ModelList {
         }
         match &self.last {
             None => self.last = order.last,
-            Some(last) => {
+            Some(last) if self.unnamed_after_last => {
                 let at = self.all.iter().position(|m| m == last).unwrap_or(0);
                 if let Some(newer) = self.all[at + 1..]
                     .iter()
@@ -146,6 +155,7 @@ impl ModelList {
                     self.last = Some(newer.clone());
                 }
             }
+            Some(_) => {}
         }
     }
 
@@ -555,10 +565,13 @@ mod tests {
         assert_eq!(merged(&["A", "B"], &["B"]), pair("A,B", "B"));
         assert_eq!(merged(&[], &["A", "B", "A", "B"]), pair("A,B", "B"));
         assert_eq!(merged(&[], &["A", "B", "A"]), pair("A,B", "A"));
-        assert_eq!(merged(&["A"], &["A", "B"]), pair("A,B", "B"));
-        assert_eq!(merged(&["B", "A"], &["B", "C", "A"]), pair("B,C,A", "A"));
-        assert_eq!(merged(&["C"], &["A", "auto", "", "B"]), pair("C,A,B", "B"));
+        assert_eq!(merged(&["A"], &["A", "B"]), pair("A,B", "A"));
+        assert_eq!(merged(&["C"], &["A", "auto", "", "B"]), pair("C,A,B", "C"));
         assert_eq!(merged(&[], &[]), None);
+        let mut list = models(&["A"]);
+        list.push_unnamed();
+        list.merge_ordered(&order(&["A", "B"]));
+        assert_eq!(list.last(), "B");
     }
 
     #[test]

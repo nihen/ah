@@ -303,12 +303,14 @@ impl AgentPlugin for CopilotPlugin {
     fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
         let data = super::common::mmap_file(&Self::events_path(path)?)?;
         let finder = memchr::memmem::Finder::new(b"odel");
+        // Replies naming no model still mark who answered last.
+        let reply = memchr::memmem::Finder::new(b"assistant.message");
         let mut models = super::common::ModelList::default();
         // `modelMetrics` keys: models that received requests, in first-use
         // order. They fill in models older replies do not name.
         let mut metered = Vec::new();
         for line in data.split(|&b| b == b'\n') {
-            if finder.find(line).is_none() {
+            if finder.find(line).is_none() && reply.find(line).is_none() {
                 continue;
             }
             let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) else {
@@ -318,9 +320,11 @@ impl AgentPlugin for CopilotPlugin {
                 continue;
             };
             match val.get("type").and_then(|v| v.as_str()) {
-                Some("assistant.message" | "tool.execution_complete") => {
-                    if let Some(model) = data.get("model").and_then(|v| v.as_str()) {
-                        models.push(model);
+                Some(kind @ ("assistant.message" | "tool.execution_complete")) => {
+                    match data.get("model").and_then(|v| v.as_str()) {
+                        Some(model) => models.push(model),
+                        None if kind == "assistant.message" => models.push_unnamed(),
+                        None => {}
                     }
                 }
                 Some("session.shutdown") if data.get("modelMetrics").is_some() => {
@@ -867,6 +871,22 @@ paras: >\n  one\n  two\n\n  three\n";
         );
         let path = session(tmp.path(), "m10", WORKSPACE, Some(legacy_switch));
         assert_eq!(PLUGIN.resolve_models(&path).unwrap().last(), "gpt-5.6-luna");
+        // The last reply names its model; metrics order does not override it.
+        let named_last = concat!(
+            r#"{"type":"assistant.message","data":{"model":"claude-opus-4.6","content":"x"}}"#,
+            "\n",
+            r#"{"type":"assistant.message","data":{"content":"y"}}"#,
+            "\n",
+            r#"{"type":"assistant.message","data":{"model":"claude-opus-4.6","content":"z"}}"#,
+            "\n",
+            r#"{"type":"session.shutdown","data":{"modelMetrics":{"claude-opus-4.6":{},"gpt-5.6-luna":{}}}}"#,
+        );
+        let path = session(tmp.path(), "m11", WORKSPACE, Some(named_last));
+        let models = PLUGIN.resolve_models(&path).unwrap();
+        assert_eq!(
+            (models.joined().as_str(), models.last()),
+            ("claude-opus-4.6,gpt-5.6-luna", "claude-opus-4.6")
+        );
         // Replies name both models; shutdown metrics name only the last.
         let mixed = concat!(
             r#"{"type":"assistant.message","data":{"model":"claude-opus-4.6","content":"x"}}"#,
