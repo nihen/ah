@@ -93,39 +93,63 @@ pub fn for_each_jsonl_value(path: &Path, visit: impl FnMut(&serde_json::Value) -
     for_each_jsonl_value_bytes(&mmap, visit);
 }
 
-/// Distinct model names in first-use order, for `AgentPlugin::resolve_model`.
-/// `auto` is a selection, not a model, and is skipped.
-#[derive(Default)]
-pub struct ModelList(Vec<String>);
+/// Distinct model names in first-use order plus the model that answered
+/// last, for `AgentPlugin::resolve_models`. `auto` is a selection, not a
+/// model, and is skipped.
+#[derive(Debug, Default)]
+pub struct ModelList {
+    all: Vec<String>,
+    last: Option<String>,
+}
 
 impl ModelList {
+    /// Record a reply by `model`; replies must be pushed in order.
     pub fn push(&mut self, model: &str) {
         let model = model.trim();
-        if !model.is_empty() && model != "auto" && !self.0.iter().any(|m| m == model) {
-            self.0.push(model.to_string());
+        if model.is_empty() || model == "auto" {
+            return;
         }
+        if !self.all.iter().any(|m| m == model) {
+            self.all.push(model.to_string());
+        }
+        self.last = Some(model.to_string());
     }
 
     /// Merge `ordered`, a first-use ordering that may include models not
     /// seen here: each new model goes before the first known model that
-    /// follows it in `ordered`, or last.
+    /// follows it in `ordered`, or last. Without a pushed reply, the last
+    /// model of `ordered` stands in for the last one that answered.
     pub fn merge_ordered(&mut self, ordered: &[String]) {
         let mut order = ModelList::default();
         ordered.iter().for_each(|model| order.push(model));
-        for (i, model) in order.0.iter().enumerate() {
-            if self.0.contains(model) {
+        for (i, model) in order.all.iter().enumerate() {
+            if self.all.contains(model) {
                 continue;
             }
-            let at = order.0[i + 1..]
+            let at = order.all[i + 1..]
                 .iter()
-                .find_map(|next| self.0.iter().position(|m| m == next))
-                .unwrap_or(self.0.len());
-            self.0.insert(at, model.clone());
+                .find_map(|next| self.all.iter().position(|m| m == next))
+                .unwrap_or(self.all.len());
+            self.all.insert(at, model.clone());
+        }
+        if self.last.is_none() {
+            self.last = order.all.pop();
         }
     }
 
-    pub fn joined(self) -> Option<String> {
-        (!self.0.is_empty()).then(|| self.0.join(","))
+    /// `None` when no model was recorded.
+    pub fn non_empty(self) -> Option<Self> {
+        (!self.all.is_empty()).then_some(self)
+    }
+
+    /// The model that answered last.
+    pub fn last(&self) -> &str {
+        self.last.as_deref().unwrap_or_default()
+    }
+
+    /// All models, comma-separated in first-use order.
+    pub fn joined(&self) -> String {
+        self.all.join(",")
     }
 }
 
@@ -135,7 +159,7 @@ pub fn jsonl_models(
     path: &Path,
     needle: &[u8],
     model_of: impl for<'a> Fn(&'a serde_json::Value) -> Option<&'a str>,
-) -> Option<String> {
+) -> Option<ModelList> {
     let data = mmap_file(path)?;
     let finder = memchr::memmem::Finder::new(needle);
     let mut models = ModelList::default();
@@ -149,7 +173,7 @@ pub fn jsonl_models(
             }
         }
     }
-    models.joined()
+    models.non_empty()
 }
 
 pub fn for_each_jsonl_value_bytes(data: &[u8], mut visit: impl FnMut(&serde_json::Value) -> bool) {
@@ -512,16 +536,20 @@ mod tests {
         let merged = |seen: &[&str], ordered: &[&str]| {
             let mut list = models(seen);
             list.merge_ordered(&order(ordered));
-            list.joined()
+            list.non_empty().map(|m| (m.joined(), m.last().to_string()))
         };
-        assert_eq!(merged(&["B"], &["A", "B"]).as_deref(), Some("A,B"));
-        assert_eq!(merged(&["A", "B"], &["B"]).as_deref(), Some("A,B"));
-        assert_eq!(merged(&[], &["A", "B", "A", "B"]).as_deref(), Some("A,B"));
-        assert_eq!(
-            merged(&["C"], &["A", "auto", "", "B"]).as_deref(),
-            Some("C,A,B")
-        );
+        let pair = |all: &str, last: &str| Some((all.to_string(), last.to_string()));
+        assert_eq!(merged(&["B"], &["A", "B"]), pair("A,B", "B"));
+        assert_eq!(merged(&["A", "B"], &["B"]), pair("A,B", "B"));
+        assert_eq!(merged(&[], &["A", "B", "A", "B"]), pair("A,B", "B"));
+        assert_eq!(merged(&["C"], &["A", "auto", "", "B"]), pair("C,A,B", "C"));
         assert_eq!(merged(&[], &[]), None);
+    }
+
+    #[test]
+    fn model_list_last_is_the_latest_reply() {
+        let list = models(&["A", "B", "A", "auto", " "]);
+        assert_eq!((list.joined().as_str(), list.last()), ("A,B", "A"));
     }
     use super::*;
 

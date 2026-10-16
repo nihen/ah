@@ -300,7 +300,7 @@ impl AgentPlugin for CopilotPlugin {
     /// executions and at shutdown but not on assistant messages. At shutdown
     /// the models that received requests are the keys of `modelMetrics`
     /// (`currentModel` is only the selection, even with no reply).
-    fn resolve_model(&self, path: &Path) -> Option<String> {
+    fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
         let data = super::common::mmap_file(&Self::events_path(path)?)?;
         let finder = memchr::memmem::Finder::new(b"odel");
         let mut models = super::common::ModelList::default();
@@ -333,7 +333,7 @@ impl AgentPlugin for CopilotPlugin {
             }
         }
         models.merge_ordered(&metered);
-        models.joined()
+        models.non_empty()
     }
 
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
@@ -787,14 +787,14 @@ paras: >\n  one\n  two\n\n  three\n";
         );
         let path = session(tmp.path(), "m1", WORKSPACE, Some(events));
         assert_eq!(
-            PLUGIN.resolve_model(&path).as_deref(),
+            PLUGIN.resolve_models(&path).map(|m| m.joined()).as_deref(),
             Some("claude-opus-4.6,gpt-6-luna")
         );
         let auto_only = r#"{"type":"session.start","data":{"selectedModel":"auto"}}"#;
         let path = session(tmp.path(), "m2", WORKSPACE, Some(auto_only));
-        assert_eq!(PLUGIN.resolve_model(&path), None);
+        assert!(PLUGIN.resolve_models(&path).is_none());
         let path = session(tmp.path(), "m3", WORKSPACE, None);
-        assert_eq!(PLUGIN.resolve_model(&path), None);
+        assert!(PLUGIN.resolve_models(&path).is_none());
         // Closed before any reply: shutdown only repeats the selection.
         let no_reply = concat!(
             r#"{"type":"session.start","data":{"selectedModel":"gpt-6-luna"}}"#,
@@ -802,7 +802,7 @@ paras: >\n  one\n  two\n\n  three\n";
             r#"{"type":"session.shutdown","data":{"currentModel":"gpt-6-luna"}}"#,
         );
         let path = session(tmp.path(), "m4", WORKSPACE, Some(no_reply));
-        assert_eq!(PLUGIN.resolve_model(&path), None);
+        assert!(PLUGIN.resolve_models(&path).is_none());
         // Older log: the reply names no model, shutdown does.
         let legacy = concat!(
             r#"{"type":"assistant.message","data":{"content":"x"}}"#,
@@ -811,7 +811,7 @@ paras: >\n  one\n  two\n\n  three\n";
         );
         let path = session(tmp.path(), "m5", WORKSPACE, Some(legacy));
         assert_eq!(
-            PLUGIN.resolve_model(&path).as_deref(),
+            PLUGIN.resolve_models(&path).map(|m| m.joined()).as_deref(),
             Some("claude-opus-4.6")
         );
         // Switched to another model after the last reply.
@@ -823,7 +823,10 @@ paras: >\n  one\n  two\n\n  three\n";
             r#"{"type":"session.shutdown","data":{"currentModel":"claude-opus-4.6","modelMetrics":{"gpt-6-luna":{}}}}"#,
         );
         let path = session(tmp.path(), "m6", WORKSPACE, Some(switched));
-        assert_eq!(PLUGIN.resolve_model(&path).as_deref(), Some("gpt-6-luna"));
+        assert_eq!(
+            PLUGIN.resolve_models(&path).map(|m| m.joined()).as_deref(),
+            Some("gpt-6-luna")
+        );
         // Older log with text-only replies from two models.
         let legacy_two = concat!(
             r#"{"type":"assistant.message","data":{"content":"x"}}"#,
@@ -832,8 +835,13 @@ paras: >\n  one\n  two\n\n  three\n";
         );
         let path = session(tmp.path(), "m7", WORKSPACE, Some(legacy_two));
         assert_eq!(
-            PLUGIN.resolve_model(&path).as_deref(),
+            PLUGIN.resolve_models(&path).map(|m| m.joined()).as_deref(),
             Some("gpt-5.6-luna,claude-opus-4.6")
+        );
+        // No reply names a model: the last metered model stands in.
+        assert_eq!(
+            PLUGIN.resolve_models(&path).unwrap().last(),
+            "claude-opus-4.6"
         );
         // A text-only reply from one model, then a tool run by another.
         let legacy_tool = concat!(
@@ -845,9 +853,10 @@ paras: >\n  one\n  two\n\n  three\n";
         );
         let path = session(tmp.path(), "m8", WORKSPACE, Some(legacy_tool));
         assert_eq!(
-            PLUGIN.resolve_model(&path).as_deref(),
+            PLUGIN.resolve_models(&path).map(|m| m.joined()).as_deref(),
             Some("claude-opus-4.6,gpt-5.6-luna")
         );
+        assert_eq!(PLUGIN.resolve_models(&path).unwrap().last(), "gpt-5.6-luna");
         // Replies name both models; shutdown metrics name only the last.
         let mixed = concat!(
             r#"{"type":"assistant.message","data":{"model":"claude-opus-4.6","content":"x"}}"#,
@@ -858,7 +867,7 @@ paras: >\n  one\n  two\n\n  three\n";
         );
         let path = session(tmp.path(), "m9", WORKSPACE, Some(mixed));
         assert_eq!(
-            PLUGIN.resolve_model(&path).as_deref(),
+            PLUGIN.resolve_models(&path).map(|m| m.joined()).as_deref(),
             Some("claude-opus-4.6,gpt-5.6-luna")
         );
     }

@@ -628,7 +628,7 @@ impl AgentPlugin for GeminiPlugin {
         None
     }
 
-    fn resolve_model(&self, path: &Path) -> Option<String> {
+    fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
         let mut models = super::common::ModelList::default();
         Self::for_each_root_message(path, |val| {
             if val.get("type").and_then(|v| v.as_str()) == Some("gemini") {
@@ -638,7 +638,7 @@ impl AgentPlugin for GeminiPlugin {
             }
             true
         });
-        models.joined()
+        models.non_empty()
     }
 
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
@@ -1032,7 +1032,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            PLUGIN.resolve_model(&json).as_deref(),
+            PLUGIN.resolve_models(&json).map(|m| m.joined()).as_deref(),
             Some("gemini-3-flash-preview")
         );
         let jsonl = chats.join("session-2026-01-02T00-00-bbbb.jsonl");
@@ -1049,7 +1049,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            PLUGIN.resolve_model(&jsonl).as_deref(),
+            PLUGIN.resolve_models(&jsonl).map(|m| m.joined()).as_deref(),
             Some("gemini-3.1-pro-preview")
         );
     }

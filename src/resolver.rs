@@ -674,7 +674,14 @@ pub fn resolve_fields_with_mmap(
             Field::Cwd => cwd.clone().unwrap_or_default(),
             Field::Id => plugin.session_id(path, home).unwrap_or_default(),
             Field::ParentId => plugin.parent_session_id(path).unwrap_or_default(),
-            Field::Model => plugin.resolve_model(path).unwrap_or_default(),
+            Field::Model => plugin
+                .resolve_models(path)
+                .map(|m| m.last().to_string())
+                .unwrap_or_default(),
+            Field::Models => plugin
+                .resolve_models(path)
+                .map(|m| m.joined())
+                .unwrap_or_default(),
             Field::ResumeCmd => resolve_resume_command(path, plugin, home, &cwd),
             Field::Size => resolve_size(path, plugin).to_string(),
             Field::Archived => plugin.is_archived(path).to_string(),
