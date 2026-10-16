@@ -463,7 +463,7 @@ fn text_messages(db: &Path, id: &str) -> Result<Vec<Message>, String> {
 /// Models of the session's assistant messages (`modelID`), in time order.
 /// Compaction summaries and responses interrupted before any text,
 /// reasoning or tool part are not answers.
-fn session_models(db: &Path, id: &str) -> Result<Option<String>, String> {
+fn session_models(db: &Path, id: &str) -> Result<Option<super::common::ModelList>, String> {
     with_connection(db, |conn| {
         let mut stmt = conn.prepare_cached(
             "SELECT json_extract(data, '$.modelID') FROM message \
@@ -485,7 +485,7 @@ fn session_models(db: &Path, id: &str) -> Result<Option<String>, String> {
                 models.push(&model);
             }
         }
-        Ok(models.joined())
+        Ok(models.non_empty())
     })
 }
 
@@ -738,7 +738,7 @@ impl AgentPlugin for OpencodePlugin {
         Some(vec!["opencode".to_string(), "--session".to_string(), id])
     }
 
-    fn resolve_model(&self, path: &Path) -> Option<String> {
+    fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
         let (db, id) = split_virtual_path(path)?;
         session_row(path)?;
         session_models(db, id).map_err(|e| warn_once(db, &e)).ok()?
@@ -1180,10 +1180,13 @@ mod tests {
         .unwrap();
         drop(conn);
         assert_eq!(
-            PLUGIN.resolve_model(&db.join("ses_aaa")).as_deref(),
+            PLUGIN
+                .resolve_models(&db.join("ses_aaa"))
+                .map(|m| m.joined())
+                .as_deref(),
             Some("kimi-k2.7-code,deepseek-v4-pro")
         );
-        assert_eq!(PLUGIN.resolve_model(&db.join("ses_empty")), None);
-        assert_eq!(PLUGIN.resolve_model(&db.join("ses_missing")), None);
+        assert!(PLUGIN.resolve_models(&db.join("ses_empty")).is_none());
+        assert!(PLUGIN.resolve_models(&db.join("ses_missing")).is_none());
     }
 }

@@ -110,6 +110,7 @@ pub enum Field {
     Archived,
     ParentId,
     Model,
+    Models,
 }
 
 impl Field {
@@ -139,6 +140,7 @@ impl Field {
             Field::Archived => "archived",
             Field::ParentId => "parent_id",
             Field::Model => "model",
+            Field::Models => "models",
         }
     }
 
@@ -168,11 +170,12 @@ impl Field {
             Field::Archived,
             Field::ParentId,
             Field::Model,
+            Field::Models,
         ]
     }
 
     pub fn all_names() -> &'static str {
-        "agent, project, project_raw, modified_at, created_at, title, first_prompt, last_prompt, prompts, responses, messages, transcript, matched, path, cwd, id, resume_cmd, turns, size, running, pid, archived, parent_id, model"
+        "agent, project, project_raw, modified_at, created_at, title, first_prompt, last_prompt, prompts, responses, messages, transcript, matched, path, cwd, id, resume_cmd, turns, size, running, pid, archived, parent_id, model, models"
     }
 
     pub fn description(&self) -> &'static str {
@@ -200,7 +203,8 @@ impl Field {
             Field::Pid => "PID of running agent process",
             Field::Archived => "Whether the agent archived the session (Codex)",
             Field::ParentId => "Id of the session that spawned this subagent session",
-            Field::Model => "Models that answered, comma-separated in first-use order",
+            Field::Model => "Model that answered last",
+            Field::Models => "Models that answered, comma-separated in first-use order",
         }
     }
 
@@ -232,6 +236,7 @@ impl Field {
             Field::Archived => "false",
             Field::ParentId => "abc12345-...",
             Field::Model => "claude-opus-5-5",
+            Field::Models => "claude-sonnet-5-5,claude-opus-5-5",
         }
     }
 
@@ -269,6 +274,7 @@ impl FromStr for Field {
             "archived" => Ok(Field::Archived),
             "parent_id" => Ok(Field::ParentId),
             "model" => Ok(Field::Model),
+            "models" => Ok(Field::Models),
             _ => Err(format!(
                 "unknown field '{}'. available: {}",
                 s,
@@ -1336,7 +1342,11 @@ impl MemoryResolvedArgs {
             parse_field_list(f)?
         } else if let Some(ref f) = raw.extra_fields {
             let mut fields = default_fields;
-            fields.extend(parse_field_list::<MemoryField>(f)?);
+            for field in parse_field_list::<MemoryField>(f)? {
+                if !fields.contains(&field) {
+                    fields.push(field);
+                }
+            }
             fields
         } else {
             default_fields
@@ -1470,7 +1480,11 @@ impl ListProjectsResolvedArgs {
             parse_field_list(f)?
         } else if let Some(ref f) = raw.extra_fields {
             let mut fields = default_fields;
-            fields.extend(parse_field_list::<ProjectField>(f)?);
+            for field in parse_field_list::<ProjectField>(f)? {
+                if !fields.contains(&field) {
+                    fields.push(field);
+                }
+            }
             fields
         } else {
             default_fields
@@ -1550,6 +1564,7 @@ impl Args {
             if !query.is_empty() {
                 vec![
                     Field::Agent,
+                    Field::Model,
                     Field::Project,
                     Field::Cwd,
                     Field::CreatedAt,
@@ -1562,6 +1577,7 @@ impl Args {
             } else {
                 vec![
                     Field::Agent,
+                    Field::Model,
                     Field::Project,
                     Field::Cwd,
                     Field::CreatedAt,
@@ -1574,6 +1590,7 @@ impl Args {
         } else if !query.is_empty() {
             vec![
                 Field::Agent,
+                Field::Model,
                 Field::Project,
                 Field::ModifiedAt,
                 Field::Title,
@@ -1583,6 +1600,7 @@ impl Args {
         } else {
             vec![
                 Field::Agent,
+                Field::Model,
                 Field::Project,
                 Field::ModifiedAt,
                 Field::Title,
@@ -1593,7 +1611,11 @@ impl Args {
             fields
         } else if let Some(ref f) = raw.extra_fields {
             let mut fields = default_fields;
-            fields.extend(parse_field_list::<Field>(f)?);
+            for field in parse_field_list::<Field>(f)? {
+                if !fields.contains(&field) {
+                    fields.push(field);
+                }
+            }
             fields
         } else {
             default_fields
@@ -1813,8 +1835,8 @@ Usage:
 
 Options:
   -o, --fields <FIELDS>   Select output fields (replaces defaults, see --list-fields)
-                          Default: agent, project, modified_at, title, id
-                          With -q: agent, project, modified_at, title, matched, id
+                          Default: agent, model, project, modified_at, title, id
+                          With -q: agent, model, project, modified_at, title, matched, id
   -O, --extra-fields <FIELDS>  Add fields to defaults (comma-separated)
   --table                 Aligned table with header row
   --tsv                   Tab-separated values (no header, no color)
@@ -2120,7 +2142,7 @@ mod tests {
 
     #[test]
     fn test_field_all_count() {
-        assert_eq!(Field::all().len(), 24);
+        assert_eq!(Field::all().len(), 25);
     }
 
     #[test]

@@ -270,7 +270,7 @@ impl AgentPlugin for ClaudePlugin {
     }
 
     /// `<synthetic>` marks messages Claude Code wrote itself (e.g. API errors).
-    fn resolve_model(&self, path: &Path) -> Option<String> {
+    fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
         super::common::jsonl_models(path, b"\"model\"", |val| {
             if val.get("type")?.as_str()? != "assistant" {
                 return None;
@@ -843,10 +843,14 @@ mod tests {
         ];
         fs::write(&path, lines.join("\n")).unwrap();
         assert_eq!(
-            PLUGIN.resolve_model(&path).as_deref(),
+            PLUGIN.resolve_models(&path).map(|m| m.joined()).as_deref(),
             Some("claude-sonnet-5,claude-opus-5-5")
         );
+        assert_eq!(
+            PLUGIN.resolve_models(&path).unwrap().last(),
+            "claude-sonnet-5"
+        );
         fs::write(&path, lines[0]).unwrap();
-        assert_eq!(PLUGIN.resolve_model(&path), None);
+        assert!(PLUGIN.resolve_models(&path).is_none());
     }
 }

@@ -159,9 +159,9 @@ pub trait AgentPlugin: Sync {
         None
     }
 
-    /// Models that answered in this session, comma-separated in first-use
-    /// order (see `common::ModelList`). `None` when the session records none.
-    fn resolve_model(&self, _path: &Path) -> Option<String> {
+    /// Models that answered in this session (see `common::ModelList`).
+    /// `None` when the session records none.
+    fn resolve_models(&self, _path: &Path) -> Option<common::ModelList> {
         None
     }
 

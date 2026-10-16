@@ -236,6 +236,11 @@ fn output_log(sessions: &[Session], query: &str) {
             .get(&Field::Agent)
             .map(|v| v.as_str())
             .unwrap_or("");
+        let model = session
+            .fields
+            .get(&Field::Model)
+            .map(|v| v.as_str())
+            .unwrap_or("");
         let project = session
             .fields
             .get(&Field::Project)
@@ -279,6 +284,9 @@ fn output_log(sessions: &[Session], query: &str) {
             };
             println!("{}session {}{}{}", YELLOW, id, RESET, running_marker);
             println!("Agent:    {}", agent);
+            if !model.is_empty() {
+                println!("Model:    {}", model);
+            }
             println!("Project:  {}", project);
             if !cwd.is_empty() {
                 println!("Cwd:      {}", cwd);
@@ -288,6 +296,9 @@ fn output_log(sessions: &[Session], query: &str) {
             let running_marker = if is_running { " (running)" } else { "" };
             println!("session {}{}", id, running_marker);
             println!("Agent:    {}", agent);
+            if !model.is_empty() {
+                println!("Model:    {}", model);
+            }
             println!("Project:  {}", project);
             if !cwd.is_empty() {
                 println!("Cwd:      {}", cwd);

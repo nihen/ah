@@ -192,7 +192,7 @@ impl AgentPlugin for GrokPlugin {
             .or_else(|| Self::encoded_cwd(path))
     }
 
-    fn resolve_model(&self, path: &Path) -> Option<String> {
+    fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
         super::common::jsonl_models(path, b"\"model_id\"", |val| val.get("model_id")?.as_str())
     }
 
@@ -646,7 +646,7 @@ mod tests {
         );
         let path = write_session(&tmp.path().join("s"), history, None);
         assert_eq!(
-            PLUGIN.resolve_model(&path).as_deref(),
+            PLUGIN.resolve_models(&path).map(|m| m.joined()).as_deref(),
             Some("grok-4.6-build,grok-4.7-build")
         );
     }

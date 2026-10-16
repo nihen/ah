@@ -516,7 +516,7 @@ impl AgentPlugin for CodexPlugin {
     /// Each turn's settings, including the model, are logged as
     /// `turn_context`. A turn's model counts only once the model produced
     /// output in it, so a turn aborted before any reply adds nothing.
-    fn resolve_model(&self, path: &Path) -> Option<String> {
+    fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
         let data = mmap_file(path)?;
         let turn = memchr::memmem::Finder::new(b"\"turn_context\"");
         let item = memchr::memmem::Finder::new(b"\"response_item\"");
@@ -545,7 +545,7 @@ impl AgentPlugin for CodexPlugin {
                 _ => {}
             }
         }
-        models.joined()
+        models.non_empty()
     }
 
     // `codex resume <id>` also finds archived sessions, so they keep their id.
@@ -982,7 +982,7 @@ mod tests {
         body.push_str(r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}"#);
         fs::write(&path, body).unwrap();
         assert_eq!(
-            PLUGIN.resolve_model(&path).as_deref(),
+            PLUGIN.resolve_models(&path).map(|m| m.joined()).as_deref(),
             Some("gpt-6-astra,gpt-6-sol")
         );
     }
