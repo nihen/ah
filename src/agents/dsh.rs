@@ -61,7 +61,7 @@ fn decode_frames(mut data: &[u8], max_frames: usize) -> Vec<u8> {
 }
 
 /// Format generation in a log's file name: `session.jsonl[.zstd]` is 0 and
-/// `session.v<N>.jsonl[.zstd]` is N. `None` for any other name.
+/// `session.v<N>.jsonl[.zstd]` is N (1 or more). `None` for any other name.
 fn generation(path: &Path) -> Option<u32> {
     let name = path.file_name()?.to_str()?;
     let name = name.strip_suffix(".zstd").unwrap_or(name);
@@ -69,11 +69,11 @@ fn generation(path: &Path) -> Option<u32> {
     if middle.is_empty() {
         return Some(0);
     }
+    // As the harness names them: no leading zero, so `v05` is not a log.
     let digits = middle.strip_prefix(".v")?;
-    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    (!digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit()))
         .then(|| digits.parse().ok())
         .flatten()
-        .filter(|n| *n > 0)
 }
 
 /// The log as text: the file itself, or its decoded frames.
@@ -664,6 +664,8 @@ mod tests {
         }
         assert_eq!(generation(Path::new("session.v12.jsonl")), Some(12));
         assert_eq!(generation(Path::new("session.v0.jsonl")), None);
+        assert_eq!(generation(Path::new("session.v05.jsonl.zstd")), None);
+        assert_eq!(generation(Path::new("session.v.jsonl")), None);
         assert_eq!(generation(Path::new("session.vx.jsonl.zstd")), None);
     }
 
