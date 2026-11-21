@@ -3038,6 +3038,18 @@ fn dsh_sessions_are_decoded_listed_and_shown() {
         ]),
     )
     .unwrap();
+    // A session in which nothing was asked is not listed.
+    write(
+        "session-unused",
+        vec![
+            frame(&[
+                r#"{"type":"session","version":4,"id":"session-unused","createdAt":1795258135225,"cwd":"/srv/proj","isSeeded":false,"delegationDepth":0}"#,
+            ]),
+            frame(&[
+                r#"{"type":"permission/preset","seq":0,"time":1795258135228,"data":{"preset":"workspace-write"}}"#,
+            ]),
+        ],
+    );
     let ah_dsh = || {
         let mut cmd = ah_opencode(&home);
         cmd.env("DSH_HOME", &dsh_home);
