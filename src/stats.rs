@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 use serde::Serialize;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::cli::{self, Field, FieldFilter, SearchMode, SortOrder};
 use crate::color;
@@ -21,14 +22,30 @@ const AGENT_NAME_WIDTH: usize = 12;
 /// Longest model name shown in full on an era line.
 const MODEL_NAME_WIDTH: usize = WIDTH - 13;
 
-/// `text` cut to `max` characters, the last one an ellipsis when cut.
+/// Terminal columns `text` takes (a CJK character takes two).
+fn width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+/// `text` cut to `max` columns, the last one an ellipsis when cut.
 fn fit(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
+    if width(text) <= max {
         return text.to_string();
     }
-    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    let mut cut = String::new();
+    for c in text.chars() {
+        if width(&cut) + UnicodeWidthChar::width(c).unwrap_or(0) + 1 > max {
+            break;
+        }
+        cut.push(c);
+    }
     cut.push('…');
     cut
+}
+
+/// `text` padded with spaces to `columns`.
+fn padded(text: &str, columns: usize) -> String {
+    format!("{text}{}", " ".repeat(columns.saturating_sub(width(text))))
 }
 
 /// One year of sessions, as `ah stats` shows it. A session counts when it
@@ -136,9 +153,13 @@ fn leader(counts: &HashMap<&str, usize>) -> Option<String> {
         .map(|(name, _)| name.to_string())
 }
 
-/// Sum up the prompts of `year` sent up to `now` (a record dated later is a
-/// clock error, not activity). `None` when there are none.
-pub fn build(year: i32, now: NaiveDateTime, sessions: &[SessionInput]) -> Option<Stats> {
+/// Sum up the prompts of `year` sent up to `now` (Unix seconds; a record
+/// dated later is a clock error, not activity). `None` when there are none.
+pub fn build(year: i32, now: i64, sessions: &[SessionInput]) -> Option<Stats> {
+    // Local times repeat when clocks are set back, so recorded times are
+    // compared as instants; only a session's modification time, which
+    // stands in for a missing one, is compared as a local time.
+    let now_local = local_time(now);
     let mut prompts = 0;
     let mut session_count = 0;
     let mut longest_session = 0;
@@ -154,11 +175,12 @@ pub fn build(year: i32, now: NaiveDateTime, sessions: &[SessionInput]) -> Option
     for session in sessions {
         let mut in_year = 0;
         for time in &session.prompt_times {
+            if time.is_some_and(|t| t > now) {
+                continue;
+            }
             let dated = time.and_then(local_time);
-            let Some(at) = dated
-                .or(session.modified)
-                .filter(|at| at.year() == year && *at <= now)
-            else {
+            let stand_in = || session.modified.filter(|at| Some(*at) <= now_local);
+            let Some(at) = dated.or_else(stand_in).filter(|at| at.year() == year) else {
                 continue;
             };
             in_year += 1;
@@ -288,15 +310,18 @@ fn persona(
     let top = &agents[0];
     // Of all prompts: one without a recorded time is not a night prompt.
     let night = percent(night_prompts, prompts);
+    // Eras also end at a month without prompts; only a different model
+    // after an era is a change.
+    let switches = eras.windows(2).filter(|w| w[0].model != w[1].model).count();
     let (title, line) = if agents.len() >= 5 {
         (
             "The Polyglot",
             format!("{} agents, one human.", agents.len()),
         )
-    } else if eras.len() >= 6 {
+    } else if switches >= 5 {
         (
             "The Model Hopper",
-            format!("{} lead models in one year.", eras.len()),
+            format!("{switches} lead-model changes in one year."),
         )
     } else if night >= 30 {
         (
@@ -429,10 +454,9 @@ impl Painter {
     }
 }
 
-/// `left` and `right` on one line of `WIDTH` columns. Both are plain ASCII
-/// apart from the glyphs, which are one column each.
+/// Spaces between `left` and `right` on one line of `WIDTH` columns.
 fn spread(left: &str, right: &str) -> usize {
-    WIDTH.saturating_sub(left.chars().count() + right.chars().count())
+    WIDTH.saturating_sub(width(left) + width(right))
 }
 
 /// The screen as lines, without a trailing newline.
@@ -499,12 +523,13 @@ pub fn render(stats: &Stats, ascii: bool, color: bool) -> Vec<String> {
         ));
     }
     let longest = rows.iter().map(|r| r.1).max().unwrap_or(1).max(1);
-    let name_width = rows.iter().map(|r| r.0.chars().count()).max().unwrap_or(0);
+    let name_width = rows.iter().map(|r| width(&r.0)).max().unwrap_or(0);
     for (name, prompts, color) in &rows {
         let cells = (prompts * BAR_WIDTH).div_ceil(longest).clamp(1, BAR_WIDTH);
         let bar: String = std::iter::repeat_n(glyphs.bar, cells).collect();
         out.push(format!(
-            "   {name:<name_width$}  {}{}  {:>3}%",
+            "   {}  {}{}  {:>3}%",
+            padded(name, name_width),
             p.color(*color, &bar),
             " ".repeat(BAR_WIDTH - cells),
             (prompts * 100 + stats.prompts / 2) / stats.prompts.max(1),
@@ -546,7 +571,7 @@ pub fn render(stats: &Stats, ascii: bool, color: bool) -> Vec<String> {
     let you_are = format!("   You are: {}", stats.persona.title);
     let one_line = format!("{you_are} {} {line}", glyphs.long_dash);
     let title = format!("   You are: {}", p.bold(stats.persona.title));
-    if one_line.chars().count() <= WIDTH {
+    if width(&one_line) <= WIDTH {
         out.push(format!("{title} {} {line}", glyphs.long_dash));
     } else {
         out.push(title);
@@ -705,10 +730,10 @@ pub fn run(args: &cli::StatsArgs, filter: &cli::FilterArgs) -> Result<(), String
     if filter.running || filter.prompt_only || filter.raw_search {
         return Err("ah stats does not take --running, -p or --raw-search.".into());
     }
-    let now = Local::now().naive_local();
+    let now = Local::now();
     let year = args.year.unwrap_or_else(|| now.year());
     let sessions = collect(filter)?;
-    let Some(stats) = build(year, now, &sessions) else {
+    let Some(stats) = build(year, now.timestamp(), &sessions) else {
         return Err(format!("No prompts found in {year}."));
     };
     if args.json {
@@ -739,8 +764,8 @@ mod tests {
     }
 
     /// A `now` after every date the tests use.
-    fn later() -> NaiveDateTime {
-        parse_modified("2099-01-01 00:00").unwrap()
+    fn later() -> i64 {
+        unix("2099-01-01", 0).unwrap()
     }
 
     fn session(agent: &str, model: &str, times: Vec<Option<i64>>) -> SessionInput {
@@ -937,7 +962,7 @@ mod tests {
             "m",
             vec![unix("2026-03-01", 9), unix("2026-12-31", 9)],
         )];
-        let now = parse_modified("2026-06-01 00:00").unwrap();
+        let now = unix("2026-06-01", 0).unwrap();
         let stats = build(2026, now, &sessions).unwrap();
         assert_eq!(stats.prompts, 1);
         assert_eq!(stats.last_day, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
@@ -1006,6 +1031,71 @@ mod tests {
         )];
         let persona = build(2040, later(), &loyal).unwrap().persona;
         assert_eq!(persona.line, "100% a-custom-ag…. No regrets.");
+    }
+
+    #[test]
+    fn a_prompt_before_now_counts_even_if_its_local_time_reads_later() {
+        // When clocks are set back, an earlier instant can read as a later
+        // local time. Whatever the zone, 20 minutes ago is not the future.
+        let sent = unix("2026-11-01", 1).unwrap() + 50 * 60;
+        let stats = build(
+            2026,
+            sent + 20 * 60,
+            &[session("claude", "m", vec![Some(sent)])],
+        );
+        assert_eq!(stats.unwrap().prompts, 1);
+        // One second later than now is.
+        assert!(build(2026, sent - 1, &[session("claude", "m", vec![Some(sent)])]).is_none());
+
+        // A stand-in time after now is left out too.
+        let mut undated = session("cursor", "", vec![None]);
+        undated.modified = parse_modified("2026-12-31 12:00");
+        assert!(build(2026, unix("2026-06-01", 0).unwrap(), &[undated]).is_none());
+    }
+
+    #[test]
+    fn model_hopper_counts_changes_of_model_not_eras() {
+        let month = |m: u32, model: &str| {
+            session("claude", model, vec![unix(&format!("2026-{m:02}-10"), 14)])
+        };
+        // One model every other month: six eras, no change.
+        let same: Vec<_> = [1, 3, 5, 7, 9, 11].iter().map(|m| month(*m, "a")).collect();
+        let stats = build(2026, later(), &same).unwrap();
+        assert_eq!(stats.eras.len(), 6);
+        assert_eq!(stats.persona.title, "The Loyalist");
+
+        // Six models in six months: five changes.
+        let hop: Vec<_> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .enumerate()
+            .map(|(i, model)| month(i as u32 + 1, model))
+            .collect();
+        let persona = build(2026, later(), &hop).unwrap().persona;
+        assert_eq!(persona.title, "The Model Hopper");
+        assert_eq!(persona.line, "5 lead-model changes in one year.");
+    }
+
+    #[test]
+    fn wide_characters_are_measured_in_columns() {
+        assert_eq!(fit("abc", 3), "abc");
+        assert_eq!(fit("abcd", 3), "ab…");
+        assert_eq!(fit("あいう", 6), "あいう");
+        assert_eq!(fit("あいうえ", 6), "あい…");
+        assert_eq!(padded("あ", 4), "あ  ");
+
+        let wide_model = "あ".repeat(47);
+        let sessions = [
+            session(
+                "エージェント名が長い",
+                &wide_model,
+                vec![unix("2026-02-01", 14); 3],
+            ),
+            session("claude", &wide_model, vec![unix("2026-02-02", 14)]),
+        ];
+        let stats = build(2026, later(), &sessions).unwrap();
+        for line in render(&stats, false, false) {
+            assert!(width(&line) <= WIDTH, "{line:?}");
+        }
     }
 
     #[test]
