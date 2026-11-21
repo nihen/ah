@@ -353,8 +353,37 @@ const ASCII: Glyphs = Glyphs {
     dot: "/",
 };
 
-/// 256-color codes for the agents, by rank; the rest share the last one.
-const AGENT_COLORS: [u8; TOP_AGENTS + 1] = [39, 208, 77, 170, 220, 245];
+/// 256-color code of each built-in agent. An agent keeps its color on every
+/// user's screen, so shared screens can be compared at a glance.
+const AGENT_COLORS: [(&str, u8); 8] = [
+    ("claude", 209),
+    ("codex", 36),
+    ("copilot", 99),
+    ("gemini", 33),
+    ("cursor", 44),
+    ("agy", 213),
+    ("grok", 255),
+    ("opencode", 220),
+];
+/// Colors for other agents (custom ones in `~/.ahrc`), handed out in the
+/// order of their share and reused when they run out.
+const SPARE_COLORS: [u8; 4] = [141, 180, 203, 110];
+/// Color of the row that sums up the agents not listed by name.
+const REST_COLOR: u8 = 245;
+
+/// The color of every agent in `stats`.
+fn agent_colors(stats: &Stats) -> HashMap<&str, u8> {
+    let mut spare = SPARE_COLORS.iter().cycle();
+    stats
+        .agents
+        .iter()
+        .map(|a| {
+            let fixed = AGENT_COLORS.iter().find(|(name, _)| *name == a.agent);
+            let color = fixed.map_or_else(|| *spare.next().unwrap(), |(_, color)| *color);
+            (a.agent.as_str(), color)
+        })
+        .collect()
+}
 
 struct Painter {
     color: bool,
@@ -374,8 +403,7 @@ impl Painter {
     fn dim(&self, text: &str) -> String {
         self.paint("2", text)
     }
-    fn agent(&self, rank: usize, text: &str) -> String {
-        let code = AGENT_COLORS[rank.min(TOP_AGENTS)];
+    fn color(&self, code: u8, text: &str) -> String {
         self.paint(&format!("38;5;{code}"), text)
     }
 }
@@ -431,34 +459,29 @@ pub fn render(stats: &Stats, ascii: bool, color: bool) -> Vec<String> {
     out.extend(render_calendar(stats, glyphs, &p));
     out.push(String::new());
 
-    let rank_of: HashMap<&str, usize> = stats
-        .agents
-        .iter()
-        .enumerate()
-        .map(|(rank, a)| (a.agent.as_str(), rank))
-        .collect();
-    let mut rows: Vec<(String, usize, usize)> = stats
+    let colors = agent_colors(stats);
+    let mut rows: Vec<(String, usize, u8)> = stats
         .agents
         .iter()
         .take(TOP_AGENTS)
-        .map(|a| (a.agent.clone(), a.prompts, rank_of[a.agent.as_str()]))
+        .map(|a| (a.agent.clone(), a.prompts, colors[a.agent.as_str()]))
         .collect();
     let rest = &stats.agents[stats.agents.len().min(TOP_AGENTS)..];
     if !rest.is_empty() {
         rows.push((
             format!("+{} more", rest.len()),
             rest.iter().map(|a| a.prompts).sum(),
-            TOP_AGENTS,
+            REST_COLOR,
         ));
     }
     let longest = rows.iter().map(|r| r.1).max().unwrap_or(1).max(1);
     let name_width = rows.iter().map(|r| r.0.chars().count()).max().unwrap_or(0);
-    for (name, prompts, rank) in &rows {
+    for (name, prompts, color) in &rows {
         let cells = (prompts * BAR_WIDTH).div_ceil(longest).clamp(1, BAR_WIDTH);
         let bar: String = std::iter::repeat_n(glyphs.bar, cells).collect();
         out.push(format!(
             "   {name:<name_width$}  {}{}  {:>3}%",
-            p.agent(*rank, &bar),
+            p.color(*color, &bar),
             " ".repeat(BAR_WIDTH - cells),
             (prompts * 100 + stats.prompts / 2) / stats.prompts.max(1),
         ));
@@ -535,12 +558,7 @@ fn render_calendar(stats: &Stats, glyphs: &Glyphs, p: &Painter) -> Vec<String> {
     let quartile = |q: usize| counts[(counts.len() * q / 4).min(counts.len() - 1)];
     let bounds = [quartile(1), quartile(2), quartile(3)];
     let level = |prompts: usize| 1 + bounds.iter().filter(|b| prompts > **b).count();
-    let rank_of: HashMap<&str, usize> = stats
-        .agents
-        .iter()
-        .enumerate()
-        .map(|(rank, a)| (a.agent.as_str(), rank))
-        .collect();
+    let colors = agent_colors(stats);
 
     let mut labels = vec![' '; weeks];
     for month in 1..=12 {
@@ -570,8 +588,8 @@ fn render_calendar(stats: &Stats, glyphs: &Glyphs, p: &Painter) -> Vec<String> {
             match stats.days.get(&day) {
                 Some(d) => {
                     let glyph = glyphs.levels[level(d.prompts)].to_string();
-                    let rank = rank_of.get(d.agent.as_str()).copied().unwrap_or(TOP_AGENTS);
-                    row.push_str(&p.agent(rank, &glyph));
+                    let color = colors.get(d.agent.as_str()).copied().unwrap_or(REST_COLOR);
+                    row.push_str(&p.color(color, &glyph));
                 }
                 None => row.push_str(&p.dim(&glyphs.levels[0].to_string())),
             }
@@ -824,6 +842,34 @@ mod tests {
             assert!(lines[0].starts_with(" ah wrapped 2026"));
             assert!(lines.iter().any(|l| l.contains("+2 more")));
         }
+    }
+
+    #[test]
+    fn agents_keep_their_color_whatever_their_rank() {
+        let stats_of = |agents: &[(&str, usize)]| {
+            let sessions: Vec<_> = agents
+                .iter()
+                .map(|(agent, n)| session(agent, "m", vec![unix("2026-02-01", 14); *n]))
+                .collect();
+            build(2026, &sessions).unwrap()
+        };
+        let first = stats_of(&[("claude", 9), ("codex", 1), ("mine", 1), ("other", 1)]);
+        let second = stats_of(&[("codex", 9), ("claude", 1), ("other", 2)]);
+        let (a, b) = (agent_colors(&first), agent_colors(&second));
+        assert_eq!(a["claude"], b["claude"]);
+        assert_eq!(a["codex"], b["codex"]);
+        assert_ne!(a["claude"], a["codex"]);
+        // Custom agents take the spare colors in the order of their share.
+        assert_eq!((a["mine"], a["other"]), (SPARE_COLORS[0], SPARE_COLORS[1]));
+        assert_eq!(b["other"], SPARE_COLORS[0]);
+
+        // The bar of an agent is drawn in its color.
+        let screen = render(&first, false, true).join("\n");
+        let claude = AGENT_COLORS.iter().find(|(n, _)| *n == "claude").unwrap().1;
+        assert!(
+            screen.contains(&format!("claude  \x1b[38;5;{claude}m")),
+            "{screen}"
+        );
     }
 
     #[test]

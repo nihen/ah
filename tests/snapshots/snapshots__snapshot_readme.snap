@@ -278,7 +278,7 @@ $ ah stats
  ~376 prompts dated by file time       github.com/nihen/ah
 ```
 
-A prompt counts on the local day it was sent, and a session counts when it has a prompt in the year. The calendar shades each day by its prompts and colors it by the agent used most that day; the bars are shares of prompts. An era is a run of months led by one model: the model whose sessions took the most prompts that month. Cursor records no prompt times, so its prompts count at their session's modification time (the note at the bottom left). The screen shows agent and model names only, never project names or prompt text. `--year 2025` picks another year, `--json` prints the numbers, and `--ascii` avoids block characters on terminals that draw them two columns wide.
+A prompt counts on the local day it was sent, and a session counts when it has a prompt in the year. The calendar shades each day by its prompts and colors it by the agent used most that day (each agent has its own fixed color, the same on everyone's screen); the bars are shares of prompts. An era is a run of months led by one model: the model whose sessions took the most prompts that month. Cursor records no prompt times, so its prompts count at their session's modification time (the note at the bottom left). The screen shows agent and model names only, never project names or prompt text. `--year 2025` picks another year, `--json` prints the numbers, and `--ascii` avoids block characters on terminals that draw them two columns wide.
 
 ## Support Matrix
 
