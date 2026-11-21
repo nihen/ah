@@ -16,6 +16,14 @@ This runs: setup → pre-recording (dismiss effort dialog) → main recording.
 
 Output: `demo/demo.svg` (embedded in README).
 
+## Stats screen
+
+`demo/stats.svg` is a still picture of `ah stats`, made from real output:
+
+```bash
+ah --color stats | python3 demo/stats_svg.py > demo/stats.svg
+```
+
 ## Manual recording
 
 ```bash
