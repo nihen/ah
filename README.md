@@ -948,7 +948,7 @@ Each built-in agent respects the environment variable its CLI uses to relocate s
 | Pi | `sessions/*/*.jsonl`, and `*.jsonl` in `PI_CODING_AGENT_SESSION_DIR` | `PI_CODING_AGENT_DIR` | `~/.pi/agent` |
 | DeepSeek Harness (dsh) | `sessions/*/*/session*.jsonl.zstd` (and uncompressed `.jsonl`) | `DSH_HOME` | `~/.dsh` |
 
-DeepSeek Harness compresses its session logs with Zstandard by default; `ah` decodes them in memory, and `ah show --raw` prints the decoded log. Its shipped profiles have no command that reopens a session interactively, so `ah resume` is not available for it.
+DeepSeek Harness compresses its session logs with Zstandard by default; `ah` decodes them in memory, and `ah show --raw` prints the decoded log. Its shipped profiles have no command that reopens a session interactively, so `ah resume` is not available for it. A session in which nothing was asked (the harness writes one whenever its UI is opened) is not listed.
 
 opencode stores all sessions in one SQLite database. `ah` reads it read-only and lists each session under the virtual path `<db>/<session-id>`, which works with `ah show`, `ah resume`, and `-o path` like a regular session file. `ah show --raw` prints one JSON line per message with its parts.
 

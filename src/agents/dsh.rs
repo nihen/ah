@@ -33,33 +33,47 @@ const MAX_LOG_BYTES: u64 = 1 << 30;
 /// Largest header line that is decoded; a header is a few hundred bytes.
 const MAX_HEADER_BYTES: u64 = 1 << 20;
 
-/// Decode the Zstandard frames of `data`, at most `max_frames` of them and
-/// `max_bytes` of text. A frame that cannot be decoded ends the log, and
-/// the frames before it are returned: a write that was cut short, a
-/// checksum that does not match, or a frame that would take the text past
-/// `max_bytes`.
-fn decode_frames(mut data: &[u8], max_frames: usize, max_bytes: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    for _ in 0..max_frames {
-        if data.is_empty() {
-            break;
-        }
-        let complete = out.len();
-        let room = max_bytes - complete as u64;
+/// Decode the Zstandard frames of `data` one at a time, up to `max_bytes`
+/// of text in all, until `visit` returns `false`. A frame that cannot be
+/// decoded ends the log, and only the frames before it are visited: a
+/// write that was cut short, a checksum that does not match, or a frame
+/// that would take the text past `max_bytes`.
+fn for_each_frame(mut data: &[u8], max_bytes: u64, mut visit: impl FnMut(Vec<u8>) -> bool) {
+    let mut room = max_bytes;
+    while !data.is_empty() {
+        let mut text = Vec::new();
         let decoded = zstd::stream::read::Decoder::with_buffer(&mut data)
             .ok()
             .and_then(|frame| {
                 frame
                     .single_frame()
                     .take(room + 1)
-                    .read_to_end(&mut out)
+                    .read_to_end(&mut text)
                     .ok()
             });
         if decoded.is_none_or(|read| read as u64 > room) {
-            out.truncate(complete);
-            break;
+            return;
+        }
+        room -= text.len() as u64;
+        if !visit(text) {
+            return;
         }
     }
+}
+
+/// The text of the first `max_frames` frames of `data` (see `for_each_frame`).
+fn decode_frames(data: &[u8], max_frames: usize, max_bytes: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut frames = 0;
+    for_each_frame(data, max_bytes, |text| {
+        if out.is_empty() {
+            out = text;
+        } else {
+            out.extend_from_slice(&text);
+        }
+        frames += 1;
+        frames < max_frames
+    });
     out
 }
 
@@ -149,6 +163,31 @@ fn read_header(path: &Path) -> Option<serde_json::Value> {
         &data
     };
     header_of(text)
+}
+
+/// Whether the log holds a prompt. A compressed log is decoded only as far
+/// as its first prompt, which is in the first batch of events.
+fn has_prompt(path: &Path) -> bool {
+    let Some(data) = mmap_file(path) else {
+        return false;
+    };
+    let holds_prompt = |text: &[u8]| {
+        let mut found = false;
+        for_each_event(text, |kind, val| {
+            found = !messages_of(kind, val).is_empty() && kind == "user/message";
+            !found
+        });
+        found
+    };
+    if !is_compressed(path) {
+        return holds_prompt(&data);
+    }
+    let mut found = false;
+    for_each_frame(&data, MAX_LOG_BYTES, |text| {
+        found = holds_prompt(&text);
+        !found
+    });
+    found
 }
 
 fn header_of(log: &[u8]) -> Option<serde_json::Value> {
@@ -333,6 +372,8 @@ impl AgentPlugin for DshPlugin {
 
     /// A session directory keeps the logs of earlier format generations
     /// next to the current one; only the highest generation is the session.
+    /// A log without a prompt is not listed either: the harness writes one
+    /// whenever its UI is opened, and nothing tells such sessions apart.
     fn expand_sessions(&self, file: &Path) -> Option<Vec<(PathBuf, SystemTime)>> {
         let Some(own) = generation(file) else {
             return Some(Vec::new());
@@ -341,7 +382,7 @@ impl AgentPlugin for DshPlugin {
             .ok()?
             .flatten()
             .any(|entry| generation(&entry.path()).is_some_and(|other| other > own));
-        superseded.then(Vec::new)
+        (superseded || !has_prompt(file)).then(Vec::new)
     }
 
     /// The decoded log. Decoding is not free, so it is loaded only for a
@@ -687,6 +728,32 @@ mod tests {
         assert_eq!(generation(Path::new("session.v05.jsonl.zstd")), None);
         assert_eq!(generation(Path::new("session.v.jsonl")), None);
         assert_eq!(generation(Path::new("session.vx.jsonl.zstd")), None);
+    }
+
+    #[test]
+    fn a_log_without_a_prompt_is_not_a_session() {
+        // What the harness writes when its UI is opened and nothing is asked.
+        let setup = &[
+            r#"{"type":"permission/preset","seq":0,"time":1795258135228,"data":{"preset":"workspace-write"}}"#,
+            r#"{"type":"user/message","seq":1,"time":1795258135281,"data":{"content":[{"type":"text","text":"<system-reminder>runtime context</system-reminder>"}],"source":{"kind":"runtime-context"},"role":"user"}}"#,
+        ];
+        let (_tmp, path) = write_log(
+            "session.v4.jsonl.zstd",
+            &[frame(&[HEADER]), frame(setup)].concat(),
+        );
+        assert_eq!(PLUGIN.expand_sessions(&path), Some(Vec::new()));
+        let plain = [&[HEADER][..], setup].concat().join("\n");
+        let (_tmp, path) = write_log("session.v4.jsonl", plain.as_bytes());
+        assert_eq!(PLUGIN.expand_sessions(&path), Some(Vec::new()));
+        // The first prompt makes it one, in either encoding.
+        let (_tmp, path) = write_log(
+            "session.v4.jsonl.zstd",
+            &[frame(&[HEADER]), frame(setup), frame(TURN_2)].concat(),
+        );
+        assert_eq!(PLUGIN.expand_sessions(&path), None);
+        let plain = [&[HEADER][..], setup, TURN_2].concat().join("\n");
+        let (_tmp, path) = write_log("session.v4.jsonl", plain.as_bytes());
+        assert_eq!(PLUGIN.expand_sessions(&path), None);
     }
 
     #[test]
