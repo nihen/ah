@@ -18,6 +18,7 @@ Commands:
   resume              Resume an agent session
   memory              List agent memory and instruction files
   agent               Show session summary per agent
+  stats               Show your year in review
 
 Help / setup:
   list-agents         List supported agents

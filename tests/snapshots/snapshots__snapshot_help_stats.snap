@@ -1,0 +1,35 @@
+---
+source: tests/snapshots.rs
+expression: "help_output(&[\"stats\", \"--help\"])"
+---
+Show your year in review
+
+Usage:
+  ah stats [OPTIONS]
+
+One screen for one calendar year: prompts, sessions and active days, a
+calendar of the year, the agents by share of prompts, the model that led each
+month, and a title. Covers every directory unless -d or --project is given.
+
+A prompt counts on the local day it was sent, and a session counts when it has
+a prompt in the year. Prompts of agents that record no time (Cursor) count at
+their session's modification time.
+
+Options:
+  --year <YEAR>           Calendar year to sum up (default: this year)
+  --ascii                 Draw with ASCII characters only (for terminals that
+                          draw block characters two columns wide)
+  --json                  Output the numbers as one JSON object
+
+Global options:
+  --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
+  --project <NAME>        Filter by project name
+  -d, --dir <PATH>        Filter by working directory (default: all directories)
+  -n, --limit N           Max session files to scan (default: 0, no limit)
+  --subagents             Include subagent sessions (spawned by another session)
+
+Display options:
+  --color                 Force colored output (even through pipes)
+  --no-color              Disable colored output
+  --no-pager              Disable automatic pager
+  --debug                 Show debug info (glob expansion, scan counts, timing) on stderr

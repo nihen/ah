@@ -22,6 +22,7 @@ mod search;
 mod search_hits;
 mod session;
 mod show;
+mod stats;
 mod subcmd;
 
 use std::process;
@@ -250,6 +251,12 @@ fn main() {
                     eprintln!("{}", e);
                     process::exit(1);
                 }
+            }
+        }
+        Commands::Stats(args) => {
+            if let Err(e) = stats::run(&args, &filter) {
+                eprintln!("{}", e);
+                process::exit(1);
             }
         }
         Commands::Agent(agent_args) => {

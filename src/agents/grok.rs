@@ -115,6 +115,35 @@ impl AgentPlugin for GrokPlugin {
         &["/.grok/"]
     }
 
+    /// `chat_history.jsonl` carries no times. `updates.jsonl` next to it logs
+    /// each prompt as a run of `user_message_chunk` updates with a
+    /// `timestamp`; the first chunk of a run is when the prompt was sent.
+    fn prompt_times(&self, path: &Path) -> Option<Vec<Option<i64>>> {
+        const CHUNK: &str = "user_message_chunk";
+        let data = mmap_file(&path.with_file_name("updates.jsonl"))?;
+        let chunk = memchr::memmem::Finder::new(CHUNK.as_bytes());
+        let mut times = Vec::new();
+        let mut in_prompt = false;
+        for line in data.split(|&b| b == b'\n').filter(|line| line.len() > 1) {
+            // Only the head is checked: tool output later in a line may
+            // quote the marker.
+            let head = &line[..line.len().min(512)];
+            let is_chunk = chunk.find(head).is_some()
+                && serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|val| {
+                    let update = val.pointer("/params/update/sessionUpdate");
+                    if update.and_then(|v| v.as_str()) != Some(CHUNK) {
+                        return false;
+                    }
+                    if !in_prompt {
+                        times.push(val.get("timestamp").and_then(super::common::unix_time));
+                    }
+                    true
+                });
+            in_prompt = is_chunk;
+        }
+        Some(times)
+    }
+
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
         if let Some(mmap) = mmap_file(path) {
             self.iter_messages_from_bytes(path, &mmap, visit);

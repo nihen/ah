@@ -25,6 +25,8 @@ pub enum MessageRole {
 pub struct Message {
     pub role: MessageRole,
     pub text: String,
+    /// When the message was sent (Unix seconds), if the session records it.
+    pub time: Option<i64>,
 }
 
 impl Message {
@@ -32,6 +34,7 @@ impl Message {
         Self {
             role: MessageRole::User,
             text,
+            time: None,
         }
     }
 
@@ -39,7 +42,15 @@ impl Message {
         Self {
             role: MessageRole::Assistant,
             text,
+            time: None,
         }
+    }
+
+    /// Set the time from a session record's timestamp value
+    /// (see `common::unix_time`).
+    pub fn at(mut self, time: Option<&serde_json::Value>) -> Self {
+        self.time = time.and_then(common::unix_time);
+        self
     }
 }
 
@@ -162,6 +173,14 @@ pub trait AgentPlugin: Sync {
     /// Models that answered in this session (see `common::ModelList`).
     /// `None` when the session records none.
     fn resolve_models(&self, _path: &Path) -> Option<common::ModelList> {
+        None
+    }
+
+    /// Times (Unix seconds) of the user prompts `iter_messages` yields, in
+    /// order, for agents that record them outside the messages (the
+    /// messages' own `time` is used otherwise). Ignored unless there is one
+    /// entry per prompt.
+    fn prompt_times(&self, _path: &Path) -> Option<Vec<Option<i64>>> {
         None
     }
 

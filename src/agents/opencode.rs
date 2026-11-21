@@ -523,8 +523,8 @@ fn message_from_parts(info: &serde_json::Value, parts: &[serde_json::Value]) -> 
     }
     let text = texts.join("\n\n");
     match role {
-        "user" => Some(Message::user(text)),
-        "assistant" => Some(Message::assistant(text)),
+        "user" => Some(Message::user(text).at(info.pointer("/time/created"))),
+        "assistant" => Some(Message::assistant(text).at(info.pointer("/time/created"))),
         _ => None,
     }
 }
@@ -926,8 +926,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = create_db(tmp.path());
         let expected = vec![
-            Message::user("hello there".to_string()),
-            Message::assistant("hi back".to_string()),
+            // `time.created` of the message, where the fixture has one
+            Message::user("hello there".to_string()).at(Some(&1.into())),
+            Message::assistant("hi back".to_string()).at(Some(&3.into())),
             Message::user("second prompt".to_string()),
         ];
         let path = db.join("ses_aaa");

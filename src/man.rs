@@ -31,6 +31,7 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("ah project", "List all known projects with session counts"),
     ("ah memory", "List agent memory and instruction files"),
     ("ah agent", "Show session summary per agent"),
+    ("ah stats", "Show your year in review"),
     ("ah list-agents", "List supported agents and capabilities"),
     ("ah mcp", "Serve sessions to MCP clients over stdio"),
 ];
@@ -238,6 +239,7 @@ fn render_see_also(w: &mut dyn Write) -> Result<(), std::io::Error> {
         "ah-resume",
         "ah-project",
         "ah-agent",
+        "ah-stats",
         "ah-memory",
         "ah-list-agents",
         "ah-mcp",

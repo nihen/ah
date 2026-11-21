@@ -236,6 +236,46 @@ cursor          12  2026-03-22 13:40
 gemini           5  2026-03-21 10:50
 ```
 
+Sum up your year across every agent, in one screen made to be shared:
+
+```console
+$ ah stats
+ ah wrapped 2026                            Jan 2 – Dec 20
+
+   9,412 prompts   2,318 sessions   231 active days
+   5 agents · 14 models · 19-day streak
+
+     Jan Feb Mar  Apr May  Jun Jul Aug  Sep Oct Nov  Dec
+ Mon  ░·▓▓▓░·░·▓░··▓░░░····▓·▓·▓█▓▓▒··█▓··░▓▓▓██▓▓█·░·██
+      ····▒·▒▓░▒░▒▒▒···▒··░░█▒·▒▓█▒·█··█·▓▓░▒░░█░·░·▒▓▓▓
+ Wed  ···░·····▓█·▓█··▒·░▓░···░··██░·▒··█··▒▓▒█·███▓▒▒██
+     ····░▓··▓··▓·█···░·▒▓▓▓░█▒··█▒░··▒▓░▓█░·▒░█░█·▒▓▓▒▓
+ Fri ··▒░·█░▒··█·▒··░▒█·▒·▒▒▒▓█▓▓░▒·▓▒▒··▓█·█▓█░░▓▒░▓·▓░
+     ··░···········░··▒·········░······░█·░█···░·░▒▒···▒
+ Sun ···▒···▒·▓░··▓·█·······█····▓···█····░█·▒·····░····
+
+   claude    ██████████████████████████████   46%
+   codex     ████████████████████             31%
+   copilot   ███████                          11%
+   gemini    █████                             8%
+   cursor    ███                               4%
+
+   Your eras (lead model)
+   Jan–Mar   gpt-5.3-codex
+   Apr–Jun   gpt-5.5
+   Jul–Aug   claude-fable-5
+   Sep       claude-sonnet-5
+   Oct–Dec   claude-opus-5-5
+
+   Peak hour 11:00 · Longest session 87 prompts
+
+   You are: The Polyglot — 5 agents, one human.
+
+ ~376 prompts dated by file time       github.com/nihen/ah
+```
+
+A prompt counts on the local day it was sent, and a session counts when it has a prompt in the year. The calendar shades each day by its prompts and colors it by the agent used most that day; the bars are shares of prompts. An era is a run of months led by one model: the model whose sessions took the most prompts that month. Cursor records no prompt times, so its prompts count at their session's modification time (the note at the bottom left). The screen shows agent and model names only, never project names or prompt text. `--year 2025` picks another year, `--json` prints the numbers, and `--ascii` avoids block characters on terminals that draw them two columns wide.
+
 ## Support Matrix
 
 | Agent | List | Search | Show | Resume | Running | Memory | Model |
@@ -252,6 +292,8 @@ gemini           5  2026-03-21 10:50
 Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.json` (checking `procStart` so a reused PID is not reported), Grok's `active_sessions.json`, Copilot's `session-state/<id>/inuse.<pid>.lock`, and Codex's `thread-writer-locks/<id>.lock`. ¹ Codex is detected on Linux only, from the kernel lock table (`/proc/locks`); its PID is the lock holder, which for the interactive TUI is the Codex app-server. Running detection needs a PID liveness check, which is not implemented on Windows.
 
 The `model` field is the model that answered last in a session, and `models` (`-o models`) lists every model that answered, comma-separated in first-use order. For Copilot these are the models that actually answered, not the `auto` selection; for older Copilot logs whose replies name no model, `model` falls back to the last model in the session's usage metrics. Both are empty when the session records no model (e.g. older Codex and Grok logs, or a session with no reply). `model` is a default column, and on a TTY `ah log` shows it as a `Model:` line, omitted when empty.
+
+The `prompt_times` field (`-o prompt_times`) is a JSON array with the time of each user prompt in Unix seconds, read from the session's own records rather than from file times. An entry is `null` when the agent records no time for that prompt (Cursor, and Grok sessions without a matching `updates.jsonl`).
 
 ## Features
 
@@ -343,6 +385,7 @@ Commands:
   resume              Resume an agent session
   memory              List agent memory and instruction files
   agent               Show session summary per agent
+  stats               Show your year in review
 
 Help / setup:
   list-agents         List supported agents
@@ -683,6 +726,31 @@ Options:
 
 Default output (when no format flag is given):
   Aligned table with auto-pager on TTY, plain TSV when piped
+
+Global options are also available (see ah -h).
+```
+
+### `ah stats --help`
+
+```
+Show your year in review
+
+Usage:
+  ah stats [OPTIONS]
+
+One screen for one calendar year: prompts, sessions and active days, a
+calendar of the year, the agents by share of prompts, the model that led each
+month, and a title. Covers every directory unless -d or --project is given.
+
+A prompt counts on the local day it was sent, and a session counts when it has
+a prompt in the year. Prompts of agents that record no time (Cursor) count at
+their session's modification time.
+
+Options:
+  --year <YEAR>           Calendar year to sum up (default: this year)
+  --ascii                 Draw with ASCII characters only (for terminals that
+                          draw block characters two columns wide)
+  --json                  Output the numbers as one JSON object
 
 Global options are also available (see ah -h).
 ```
