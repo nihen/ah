@@ -252,6 +252,8 @@ fn add_pi_session_dir(agents: &mut [AgentDef], home: &Path) {
             Err(_) => return,
         }
     };
+    // Repeated separators and `.` are dropped, as in the paths glob returns.
+    let dir: PathBuf = dir.components().collect();
     let dir = dir.to_string_lossy();
     let dir = dir.trim_end_matches('/');
     if dir.is_empty() {

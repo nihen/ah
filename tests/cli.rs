@@ -2959,7 +2959,7 @@ fn pi_sessions_are_listed_shown_and_resumed() {
     // A relative value is resolved against the current directory, as Pi does.
     ah_pi()
         .current_dir(&home)
-        .env("PI_CODING_AGENT_SESSION_DIR", "[pi]-sessions")
+        .env("PI_CODING_AGENT_SESSION_DIR", ".//[pi]-sessions/")
         .args(["log", "-a", "-o", "id", "-S", "id", "--asc"])
         .assert()
         .success()
