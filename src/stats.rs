@@ -1,8 +1,7 @@
 //! `ah stats`: one screen that sums up a year of agent sessions.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::time::SystemTime;
 
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 use serde::Serialize;
 
 use crate::cli::{self, Field, FieldFilter, SearchMode, SortOrder};
@@ -11,11 +10,26 @@ use crate::pipeline;
 use crate::resolver::ResolveOpts;
 
 /// Width of the screen, in terminal columns.
-const WIDTH: usize = 58;
+const WIDTH: usize = 60;
 /// Agents listed by name; the rest are summed in one row.
 const TOP_AGENTS: usize = 5;
 /// Columns of the longest agent bar.
 const BAR_WIDTH: usize = 30;
+/// Longest agent name shown in full; longer ones are cut (custom agents
+/// can have any name).
+const AGENT_NAME_WIDTH: usize = 12;
+/// Longest model name shown in full on an era line.
+const MODEL_NAME_WIDTH: usize = WIDTH - 13;
+
+/// `text` cut to `max` characters, the last one an ellipsis when cut.
+fn fit(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
 
 /// One year of sessions, as `ah stats` shows it. A session counts when it
 /// has a prompt in the year, and each prompt counts on the local day it was
@@ -122,8 +136,9 @@ fn leader(counts: &HashMap<&str, usize>) -> Option<String> {
         .map(|(name, _)| name.to_string())
 }
 
-/// Sum up the prompts of `year`. `None` when there are none.
-pub fn build(year: i32, sessions: &[SessionInput]) -> Option<Stats> {
+/// Sum up the prompts of `year` sent up to `now` (a record dated later is a
+/// clock error, not activity). `None` when there are none.
+pub fn build(year: i32, now: NaiveDateTime, sessions: &[SessionInput]) -> Option<Stats> {
     let mut prompts = 0;
     let mut session_count = 0;
     let mut longest_session = 0;
@@ -140,7 +155,10 @@ pub fn build(year: i32, sessions: &[SessionInput]) -> Option<Stats> {
         let mut in_year = 0;
         for time in &session.prompt_times {
             let dated = time.and_then(local_time);
-            let Some(at) = dated.or(session.modified).filter(|at| at.year() == year) else {
+            let Some(at) = dated
+                .or(session.modified)
+                .filter(|at| at.year() == year && *at <= now)
+            else {
                 continue;
             };
             in_year += 1;
@@ -212,7 +230,9 @@ pub fn build(year: i32, sessions: &[SessionInput]) -> Option<Stats> {
             continue;
         };
         match eras.last_mut() {
-            Some(era) if era.model == model => era.to = *month,
+            // Only months next to each other: a month without prompts
+            // belongs to no era.
+            Some(era) if era.model == model && era.to + 1 == *month => era.to = *month,
             _ => eras.push(Era {
                 from: *month,
                 to: *month,
@@ -224,14 +244,7 @@ pub fn build(year: i32, sessions: &[SessionInput]) -> Option<Stats> {
     let peak_hour = (timed_prompts > 0)
         .then(|| (0..24).max_by_key(|h| (hours[*h as usize], std::cmp::Reverse(*h))))
         .flatten();
-    let persona = persona(
-        &agents,
-        prompts,
-        &eras,
-        streak,
-        night_prompts,
-        timed_prompts,
-    );
+    let persona = persona(&agents, prompts, &eras, streak, night_prompts);
     let days = by_day
         .into_iter()
         .map(|(day, counts)| {
@@ -270,11 +283,11 @@ fn persona(
     eras: &[Era],
     streak: usize,
     night_prompts: usize,
-    timed_prompts: usize,
 ) -> Persona {
     let percent = |part: usize, whole: usize| (part * 100).checked_div(whole).unwrap_or(0);
     let top = &agents[0];
-    let night = percent(night_prompts, timed_prompts);
+    // Of all prompts: one without a recorded time is not a night prompt.
+    let night = percent(night_prompts, prompts);
     let (title, line) = if agents.len() >= 5 {
         (
             "The Polyglot",
@@ -301,7 +314,7 @@ fn persona(
             format!(
                 "{}% {}. No regrets.",
                 percent(top.prompts, prompts),
-                top.agent
+                fit(&top.agent, AGENT_NAME_WIDTH)
             ),
         )
     } else {
@@ -338,6 +351,10 @@ struct Glyphs {
     bar: char,
     dash: &'static str,
     dot: &'static str,
+    /// Between the title and its line.
+    long_dash: &'static str,
+    /// Marks a name cut by `fit`.
+    ellipsis: &'static str,
 }
 
 const UNICODE: Glyphs = Glyphs {
@@ -345,12 +362,16 @@ const UNICODE: Glyphs = Glyphs {
     bar: '█',
     dash: "–",
     dot: "·",
+    long_dash: "—",
+    ellipsis: "…",
 };
 const ASCII: Glyphs = Glyphs {
     levels: ['.', '-', '=', '+', '#'],
     bar: '#',
     dash: "-",
     dot: "/",
+    long_dash: "-",
+    ellipsis: "~",
 };
 
 /// 256-color code of each built-in agent. An agent keeps its color on every
@@ -464,7 +485,10 @@ pub fn render(stats: &Stats, ascii: bool, color: bool) -> Vec<String> {
         .agents
         .iter()
         .take(TOP_AGENTS)
-        .map(|a| (a.agent.clone(), a.prompts, colors[a.agent.as_str()]))
+        .map(|a| {
+            let name = fit(&a.agent, AGENT_NAME_WIDTH).replace('…', glyphs.ellipsis);
+            (name, a.prompts, colors[a.agent.as_str()])
+        })
         .collect();
     let rest = &stats.agents[stats.agents.len().min(TOP_AGENTS)..];
     if !rest.is_empty() {
@@ -501,7 +525,8 @@ pub fn render(stats: &Stats, ascii: bool, color: bool) -> Vec<String> {
                     month_name(era.to)
                 )
             };
-            out.push(format!("   {months:<9} {}", era.model));
+            let model = fit(&era.model, MODEL_NAME_WIDTH).replace('…', glyphs.ellipsis);
+            out.push(format!("   {months:<9} {model}"));
         }
     }
     out.push(String::new());
@@ -516,12 +541,17 @@ pub fn render(stats: &Stats, ascii: bool, color: bool) -> Vec<String> {
     ));
     out.push(format!("   {}", facts.join(&format!(" {} ", glyphs.dot))));
     out.push(String::new());
-    out.push(format!(
-        "   You are: {} {} {}",
-        p.bold(stats.persona.title),
-        if ascii { "-" } else { "—" },
-        stats.persona.line
-    ));
+    // On one line when it fits, else the line goes under the title.
+    let line = stats.persona.line.replace('…', glyphs.ellipsis);
+    let you_are = format!("   You are: {}", stats.persona.title);
+    let one_line = format!("{you_are} {} {line}", glyphs.long_dash);
+    let title = format!("   You are: {}", p.bold(stats.persona.title));
+    if one_line.chars().count() <= WIDTH {
+        out.push(format!("{title} {} {line}", glyphs.long_dash));
+    } else {
+        out.push(title);
+        out.push(format!("   {line}"));
+    }
     out.push(String::new());
 
     let note = if stats.undated_prompts > 0 {
@@ -607,9 +637,9 @@ fn parse_modified(value: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M").ok()
 }
 
-/// Sessions with a prompt that may fall in `year`, read through the same
-/// pipeline as `ah log` (filters, one row per session).
-fn collect(filter: &cli::FilterArgs, year: i32) -> Result<Vec<SessionInput>, String> {
+/// Every session, read through the same pipeline as `ah log` (filters, one
+/// row per session).
+fn collect(filter: &cli::FilterArgs) -> Result<Vec<SessionInput>, String> {
     // Like `ah project`, every directory unless one is named.
     let mut filters = FieldFilter::from_options(&filter.agent, &filter.project);
     if let Some(dir) = filter.dir.as_ref().filter(|_| !filter.all) {
@@ -618,11 +648,6 @@ fn collect(filter: &cli::FilterArgs, year: i32) -> Result<Vec<SessionInput>, Str
             value: cli::FilterArgs::resolve_dir(dir),
         });
     }
-    // A session last written before the year began has no prompt in it.
-    let year_start: Option<SystemTime> = Local
-        .with_ymd_and_hms(year, 1, 1, 0, 0, 0)
-        .earliest()
-        .map(|t: DateTime<Local>| t.into());
     let result = pipeline::run_pipeline(&pipeline::PipelineParams {
         resolve_fields: vec![
             Field::Agent,
@@ -633,7 +658,10 @@ fn collect(filter: &cli::FilterArgs, year: i32) -> Result<Vec<SessionInput>, Str
         ],
         resolve_opts: ResolveOpts::default(),
         filters,
-        since: year_start,
+        // Every session is read: prompts are dated by their own records,
+        // which a file's modification time can predate (a copied or
+        // restored file, a clock that was off).
+        since: None,
         until: None,
         query: String::new(),
         search_mode: SearchMode::Text,
@@ -673,9 +701,14 @@ pub fn run(args: &cli::StatsArgs, filter: &cli::FilterArgs) -> Result<(), String
             "ah stats covers one calendar year: use --year instead of -q/--since/--until.".into(),
         );
     }
-    let year = args.year.unwrap_or_else(|| Local::now().year());
-    let sessions = collect(filter, year)?;
-    let Some(stats) = build(year, &sessions) else {
+    // Options that narrow other commands must not pass for a narrowed count.
+    if filter.running || filter.prompt_only || filter.raw_search {
+        return Err("ah stats does not take --running, -p or --raw-search.".into());
+    }
+    let now = Local::now().naive_local();
+    let year = args.year.unwrap_or_else(|| now.year());
+    let sessions = collect(filter)?;
+    let Some(stats) = build(year, now, &sessions) else {
         return Err(format!("No prompts found in {year}."));
     };
     if args.json {
@@ -705,6 +738,11 @@ mod tests {
         )
     }
 
+    /// A `now` after every date the tests use.
+    fn later() -> NaiveDateTime {
+        parse_modified("2099-01-01 00:00").unwrap()
+    }
+
     fn session(agent: &str, model: &str, times: Vec<Option<i64>>) -> SessionInput {
         SessionInput {
             agent: agent.to_string(),
@@ -732,7 +770,7 @@ mod tests {
             // Entirely outside the year: not a session of 2026.
             session("grok", "m3", vec![unix("2025-06-01", 10)]),
         ];
-        let stats = build(2026, &sessions).unwrap();
+        let stats = build(2026, later(), &sessions).unwrap();
         assert_eq!(stats.prompts, 5);
         assert_eq!(stats.sessions, 2);
         assert_eq!(stats.active_days, 3);
@@ -750,14 +788,14 @@ mod tests {
             stats.days[&NaiveDate::from_ymd_opt(2026, 1, 3).unwrap()].agent,
             "claude"
         );
-        assert!(build(2024, &sessions).is_none());
+        assert!(build(2024, later(), &sessions).is_none());
     }
 
     #[test]
     fn prompts_without_a_time_use_the_session_time() {
         let mut undated = session("cursor", "", vec![None, None]);
         undated.modified = parse_modified("2026-03-05 12:30");
-        let stats = build(2026, &[undated]).unwrap();
+        let stats = build(2026, later(), &[undated]).unwrap();
         assert_eq!(stats.prompts, 2);
         assert_eq!(stats.undated_prompts, 2);
         assert_eq!(
@@ -778,37 +816,57 @@ mod tests {
             session("claude", "b", vec![unix("2026-04-10", 9)]),
             session("claude", "a", vec![unix("2026-05-10", 9)]),
         ];
-        let eras = build(2026, &sessions).unwrap().eras;
+        let eras = build(2026, later(), &sessions).unwrap().eras;
         let era = |from, to, model: &str| Era {
             from,
             to,
             model: model.to_string(),
         };
         assert_eq!(eras, [era(1, 2, "a"), era(4, 4, "b"), era(5, 5, "a")]);
+
+        // A month without prompts ends an era, even between two months
+        // led by the same model.
+        let gap = [
+            session("codex", "a", vec![unix("2026-01-10", 9)]),
+            session("codex", "a", vec![unix("2026-03-10", 9)]),
+        ];
+        assert_eq!(
+            build(2026, later(), &gap).unwrap().eras,
+            [era(1, 1, "a"), era(3, 3, "a")]
+        );
     }
 
     #[test]
     fn persona_takes_the_first_rule_that_applies() {
         let loyal = [session("claude", "m", vec![unix("2026-02-01", 14); 10])];
-        assert_eq!(build(2026, &loyal).unwrap().persona.title, "The Loyalist");
+        assert_eq!(
+            build(2026, later(), &loyal).unwrap().persona.title,
+            "The Loyalist"
+        );
 
         let owl = [
             session("claude", "m", vec![unix("2026-02-01", 2); 4]),
             session("codex", "m", vec![unix("2026-02-01", 14); 6]),
         ];
-        assert_eq!(build(2026, &owl).unwrap().persona.title, "The Night Owl");
+        assert_eq!(
+            build(2026, later(), &owl).unwrap().persona.title,
+            "The Night Owl"
+        );
 
         let split = [
             session("claude", "m", vec![unix("2026-02-01", 14); 5]),
             session("codex", "m", vec![unix("2026-02-01", 14); 5]),
         ];
-        assert_eq!(build(2026, &split).unwrap().persona.title, "The Explorer");
+        assert_eq!(
+            build(2026, later(), &split).unwrap().persona.title,
+            "The Explorer"
+        );
 
         let many: Vec<_> = ["a", "b", "c", "d", "e"]
             .iter()
             .map(|agent| session(agent, "m", vec![unix("2026-02-01", 14)]))
             .collect();
-        let persona = build(2026, &many).unwrap().persona;
+        let persona = build(2026, later(), &many).unwrap().persona;
         assert_eq!(persona.title, "The Polyglot");
         assert_eq!(persona.line, "5 agents, one human.");
     }
@@ -831,7 +889,7 @@ mod tests {
                 ));
             }
         }
-        let stats = build(2026, &sessions).unwrap();
+        let stats = build(2026, later(), &sessions).unwrap();
         for ascii in [false, true] {
             let lines = render(&stats, ascii, false);
             for line in &lines {
@@ -851,7 +909,7 @@ mod tests {
                 .iter()
                 .map(|(agent, n)| session(agent, "m", vec![unix("2026-02-01", 14); *n]))
                 .collect();
-            build(2026, &sessions).unwrap()
+            build(2026, later(), &sessions).unwrap()
         };
         let first = stats_of(&[("claude", 9), ("codex", 1), ("mine", 1), ("other", 1)]);
         let second = stats_of(&[("codex", 9), ("claude", 1), ("other", 2)]);
@@ -870,6 +928,84 @@ mod tests {
             screen.contains(&format!("claude  \x1b[38;5;{claude}m")),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn prompts_dated_after_now_are_left_out() {
+        let sessions = [session(
+            "claude",
+            "m",
+            vec![unix("2026-03-01", 9), unix("2026-12-31", 9)],
+        )];
+        let now = parse_modified("2026-06-01 00:00").unwrap();
+        let stats = build(2026, now, &sessions).unwrap();
+        assert_eq!(stats.prompts, 1);
+        assert_eq!(stats.last_day, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+    }
+
+    #[test]
+    fn night_share_is_of_all_prompts() {
+        // 2 of 3 timed prompts are at night, but only 2 of 10 prompts.
+        let mut undated = session("cursor", "", vec![None; 7]);
+        undated.modified = parse_modified("2026-03-05 12:30");
+        let sessions = [
+            session(
+                "claude",
+                "m",
+                vec![
+                    unix("2026-03-05", 2),
+                    unix("2026-03-05", 3),
+                    unix("2026-03-05", 14),
+                ],
+            ),
+            undated,
+        ];
+        assert_eq!(
+            build(2026, later(), &sessions).unwrap().persona.title,
+            "The Explorer"
+        );
+    }
+
+    #[test]
+    fn every_line_fits_with_long_names_long_titles_and_54_weeks() {
+        // 2040 starts on a Sunday and is a leap year: 54 calendar columns.
+        let long_model = "m".repeat(80);
+        let sessions = [
+            session(
+                "a-custom-agent-with-a-long-name",
+                &long_model,
+                vec![unix("2040-01-01", 2); 4],
+            ),
+            session("claude", &long_model, vec![unix("2040-12-31", 14); 6]),
+        ];
+        let stats = build(2040, later(), &sessions).unwrap();
+        assert_eq!(stats.persona.title, "The Night Owl");
+        for ascii in [false, true] {
+            let lines = render(&stats, ascii, false);
+            for line in &lines {
+                assert!(line.chars().count() <= WIDTH, "{line:?}");
+                assert!(!ascii || line.is_ascii(), "{line:?}");
+            }
+            // The title's line moves below it when one line is too long.
+            let title = lines.iter().position(|l| l == "   You are: The Night Owl");
+            let line = &lines[title.expect("title on its own line") + 1];
+            assert_eq!(line, "   40% of your prompts came after midnight.");
+            let ellipsis = if ascii { "~" } else { "…" };
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains(&format!("a-custom-ag{ellipsis}  ")))
+            );
+        }
+
+        // A long agent name is cut in the title's line too.
+        let loyal = [session(
+            "a-custom-agent-with-a-long-name",
+            "m",
+            vec![unix("2040-06-01", 14)],
+        )];
+        let persona = build(2040, later(), &loyal).unwrap().persona;
+        assert_eq!(persona.line, "100% a-custom-ag…. No regrets.");
     }
 
     #[test]

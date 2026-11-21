@@ -12,8 +12,8 @@ calendar of the year, the agents by share of prompts, the model that led each
 month, and a title. Covers every directory unless -d or --project is given.
 
 A prompt counts on the local day it was sent, and a session counts when it has
-a prompt in the year. Prompts of agents that record no time (Cursor) count at
-their session's modification time.
+a prompt in the year. Prompts without a recorded time (Cursor, and some of
+Grok) count at their session's modification time.
 
 Options:
   --year <YEAR>           Calendar year to sum up (default: this year)

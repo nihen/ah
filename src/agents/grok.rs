@@ -5,6 +5,7 @@ use std::path::Path;
 
 use super::AgentPlugin;
 use super::Message;
+use super::MessageRole;
 use super::common::canonicalize_if_exists;
 use super::common::first_text_part;
 use super::common::for_each_jsonl_value_bytes;
@@ -118,30 +119,64 @@ impl AgentPlugin for GrokPlugin {
     /// `chat_history.jsonl` carries no times. `updates.jsonl` next to it logs
     /// each prompt as a run of `user_message_chunk` updates with a
     /// `timestamp`; the first chunk of a run is when the prompt was sent.
+    /// A prompt is matched to its run by number (`prompt_index` in the
+    /// history, `_meta.promptIndex` on the chunk), since either file can
+    /// miss prompts the other has. Sessions written before those numbers
+    /// existed are matched by position.
     fn prompt_times(&self, path: &Path) -> Option<Vec<Option<i64>>> {
         const CHUNK: &str = "user_message_chunk";
-        let data = mmap_file(&path.with_file_name("updates.jsonl"))?;
+        let updates = mmap_file(&path.with_file_name("updates.jsonl"))?;
         let chunk = memchr::memmem::Finder::new(CHUNK.as_bytes());
-        let mut times = Vec::new();
+        // Start of each run, in order, with its prompt number if it has one.
+        let mut runs: Vec<(Option<u64>, Option<i64>)> = Vec::new();
         let mut in_prompt = false;
-        for line in data.split(|&b| b == b'\n').filter(|line| line.len() > 1) {
+        for line in updates.split(|&b| b == b'\n').filter(|line| line.len() > 1) {
             // Only the head is checked: tool output later in a line may
             // quote the marker.
             let head = &line[..line.len().min(512)];
             let is_chunk = chunk.find(head).is_some()
                 && serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|val| {
-                    let update = val.pointer("/params/update/sessionUpdate");
-                    if update.and_then(|v| v.as_str()) != Some(CHUNK) {
+                    let update = val.pointer("/params/update");
+                    let kind = update.and_then(|u| u.get("sessionUpdate"));
+                    if kind.and_then(|v| v.as_str()) != Some(CHUNK) {
                         return false;
                     }
-                    if !in_prompt {
-                        times.push(val.get("timestamp").and_then(super::common::unix_time));
+                    let index = update
+                        .and_then(|u| u.pointer("/_meta/promptIndex"))
+                        .and_then(|v| v.as_u64());
+                    // A new number starts a new run even without a gap.
+                    if !in_prompt || runs.last().is_some_and(|run| run.0 != index) {
+                        runs.push((
+                            index,
+                            val.get("timestamp").and_then(super::common::unix_time),
+                        ));
                     }
                     true
                 });
             in_prompt = is_chunk;
         }
-        Some(times)
+
+        // The prompt numbers of the prompts `iter_messages` yields.
+        let history = mmap_file(path)?;
+        let mut prompts: Vec<Option<u64>> = Vec::new();
+        for_each_jsonl_value_bytes(&history, |val| {
+            if Self::message_from_value(val).is_some_and(|m| m.role == MessageRole::User) {
+                prompts.push(val.get("prompt_index").and_then(|v| v.as_u64()));
+            }
+            true
+        });
+        if prompts.iter().all(Option::is_none) {
+            return Some(runs.into_iter().map(|(_, time)| time).collect());
+        }
+        Some(
+            prompts
+                .into_iter()
+                .map(|index| {
+                    let index = index?;
+                    runs.iter().find(|run| run.0 == Some(index))?.1
+                })
+                .collect(),
+        )
     }
 
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
@@ -535,6 +570,65 @@ mod tests {
             fs::write(dir.join("summary.json"), s).unwrap();
         }
         jsonl
+    }
+
+    #[test]
+    fn prompt_times_match_prompts_to_update_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".grok/sessions/%2Fsrv%2Fproj/0192-bbbb");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chat_history.jsonl");
+        let user = |index: Option<u64>, text: &str| {
+            let index = index.map_or(String::new(), |i| format!(r#","prompt_index":{i}"#));
+            format!(
+                r#"{{"type":"user","content":[{{"type":"text","text":"<user_query>{text}</user_query>"}}]{index}}}"#
+            )
+        };
+        let chunk = |index: Option<u64>, timestamp: u64| {
+            let meta = index.map_or(String::new(), |i| {
+                format!(r#","_meta":{{"promptIndex":{i}}}"#)
+            });
+            format!(
+                r#"{{"timestamp":{timestamp},"method":"session/update","params":{{"update":{{"sessionUpdate":"user_message_chunk","content":{{"type":"text","text":"x"}}{meta}}}}}}}"#
+            )
+        };
+        let other = r#"{"timestamp":5,"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"}}}"#;
+        let write = |history: &[String], updates: &[String]| {
+            fs::write(&path, history.join("\n")).unwrap();
+            fs::write(dir.join("updates.jsonl"), updates.join("\n")).unwrap();
+            PLUGIN.prompt_times(&path)
+        };
+
+        // By number: the history lost prompt 0 (compaction), and prompt 2
+        // was never logged. A run is several chunks; its first one counts.
+        let times = write(
+            &[user(Some(1), "second"), user(Some(2), "third")],
+            &[
+                chunk(Some(0), 100),
+                other.to_string(),
+                chunk(Some(1), 200),
+                chunk(Some(1), 201),
+            ],
+        );
+        assert_eq!(times, Some(vec![Some(200), None]));
+
+        // Runs that follow each other without a gap are told apart by number.
+        let times = write(
+            &[user(Some(0), "first"), user(Some(1), "second")],
+            &[chunk(Some(0), 100), chunk(Some(1), 200)],
+        );
+        assert_eq!(times, Some(vec![Some(100), Some(200)]));
+
+        // Older sessions have no numbers: runs are taken in order, and the
+        // caller uses them only when there is one per prompt.
+        let times = write(
+            &[user(None, "first"), user(None, "second")],
+            &[chunk(None, 100), other.to_string(), chunk(None, 200)],
+        );
+        assert_eq!(times, Some(vec![Some(100), Some(200)]));
+
+        fs::remove_file(dir.join("updates.jsonl")).unwrap();
+        assert_eq!(PLUGIN.prompt_times(&path), None);
     }
 
     #[test]

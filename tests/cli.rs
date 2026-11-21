@@ -1747,6 +1747,15 @@ fn stats_sums_up_the_prompts_of_one_year() {
         &["2026-03-02T10:30:00Z"],
     );
 
+    // The files' modification times say nothing about the prompts' year.
+    for id in [
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    ] {
+        let path = home.join(format!(".claude/projects/-tmp-proj/{id}.jsonl"));
+        set_mtime(path.to_str().unwrap(), 20 * 366 * 86400);
+    }
+
     let out = ah_claude(&home)
         .args(["stats", "--year", "2026", "--json"])
         .output()
@@ -1768,7 +1777,7 @@ fn stats_sums_up_the_prompts_of_one_year() {
     assert_eq!(stats["days"]["2026-03-02"]["prompts"], 1);
     assert_eq!(stats["undated_prompts"], 0);
 
-    // The screen: plain text when piped, no wider than 58 columns.
+    // The screen: plain text when piped, no wider than 60 columns.
     let out = ah_claude(&home)
         .args(["stats", "--year", "2026"])
         .output()
@@ -1789,7 +1798,7 @@ fn stats_sums_up_the_prompts_of_one_year() {
     );
     assert!(screen.contains("You are: The Loyalist"), "{screen}");
     assert!(!screen.contains('\x1b'), "no color when piped");
-    assert!(screen.lines().all(|l| l.chars().count() <= 58), "{screen}");
+    assert!(screen.lines().all(|l| l.chars().count() <= 60), "{screen}");
 
     // 2025 has the one older prompt; a year without prompts is an error.
     ah_claude(&home)
@@ -1809,6 +1818,11 @@ fn stats_sums_up_the_prompts_of_one_year() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("--year"));
+    ah_claude(&home)
+        .args(["stats", "--running"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--running"));
 }
 
 #[test]
