@@ -2930,7 +2930,8 @@ fn pi_sessions_are_listed_shown_and_resumed() {
         .stdout(predicate::str::contains("fix the parser"))
         .stdout(predicate::str::contains("fixed it"));
     // PI_CODING_AGENT_SESSION_DIR holds session files directly, under any name.
-    let session_dir = home.join("pi-sessions");
+    // The directory name is taken literally.
+    let session_dir = home.join("[pi]-sessions");
     fs::create_dir_all(&session_dir).unwrap();
     fs::write(
         session_dir.join("my_session.jsonl"),
@@ -2954,6 +2955,31 @@ fn pi_sessions_are_listed_shown_and_resumed() {
         .assert()
         .success()
         .stdout(predicate::str::contains("kept elsewhere"));
+
+    // A relative value is resolved against the current directory, as Pi does.
+    ah_pi()
+        .current_dir(&home)
+        .env("PI_CODING_AGENT_SESSION_DIR", "[pi]-sessions")
+        .args(["log", "-a", "-o", "id", "-S", "id", "--asc"])
+        .assert()
+        .success()
+        .stdout("0192-elsewhere\n0192-pi\n");
+    // Pointing it into another agent's directory does not claim that
+    // agent's sessions.
+    let claude_project = home.join(".claude/projects/-srv-proj");
+    fs::create_dir_all(&claude_project).unwrap();
+    fs::write(
+        claude_project.join("0192-claude.jsonl"),
+        "{\"type\":\"user\",\"cwd\":\"/srv/proj\",\"message\":{\"content\":\"hello claude\"}}\n",
+    )
+    .unwrap();
+    ah_pi()
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env("PI_CODING_AGENT_SESSION_DIR", &claude_project)
+        .args(["log", "-a", "-o", "agent,id", "-S", "id", "--asc"])
+        .assert()
+        .success()
+        .stdout("claude\t0192-claude\npi\t0192-pi\n");
 
     ah_pi()
         .args(["resume", "--print", "0192-pi"])
