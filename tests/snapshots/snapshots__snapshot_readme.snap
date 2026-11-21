@@ -948,7 +948,7 @@ Each built-in agent respects the environment variable its CLI uses to relocate s
 | Antigravity (agy) | `antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl` | — | `~/.gemini` |
 | Grok    | `sessions/*/*/chat_history.jsonl` | `GROK_HOME`        | `~/.grok`   |
 | opencode | `opencode/opencode*.db` (SQLite) | `XDG_DATA_HOME` | `~/.local/share` |
-| Pi | `sessions/*/*.jsonl` | `PI_CODING_AGENT_DIR` | `~/.pi/agent` |
+| Pi | `sessions/*/*.jsonl`, and `*.jsonl` in `PI_CODING_AGENT_SESSION_DIR` | `PI_CODING_AGENT_DIR` | `~/.pi/agent` |
 
 opencode stores all sessions in one SQLite database. `ah` reads it read-only and lists each session under the virtual path `<db>/<session-id>`, which works with `ah show`, `ah resume`, and `-o path` like a regular session file. `ah show --raw` prints one JSON line per message with its parts.
 

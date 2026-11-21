@@ -745,6 +745,19 @@ mod tests {
         )
         .unwrap();
         cases.push(("grok", grok));
+        cases.push((
+            "pi",
+            write(
+                "2026-11-21T10-43-51-669Z_0192-pi.jsonl",
+                &[
+                    r#"{"type":"session","version":3,"id":"0192-pi","timestamp":"2026-11-21T10:43:51.669Z","cwd":"/srv/proj"}"#,
+                    r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-11-21T10:43:52.000Z","message":{"role":"user","content":[{"type":"text","text":"fix the auth \u4fee\u6b63"}]}}"#,
+                    r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-11-21T10:43:53.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_id_p","name":"bash","arguments":{"command":"echo tool-arg-needle"}},{"type":"text","text":"the redis cache"}],"model":"m"}}"#,
+                    r#"{"type":"message","id":"t1","parentId":"a1","timestamp":"2026-11-21T10:43:54.000Z","message":{"role":"toolResult","toolCallId":"call_id_p","toolName":"bash","content":[{"type":"text","text":"tool-out-needle"}]}}"#,
+                    r#"{"type":"custom_message","id":"c1","parentId":"t1","timestamp":"2026-11-21T10:43:55.000Z","customType":"notes","content":"dark mode done","display":true}"#,
+                ],
+            ),
+        ));
         let agy = tmp.join("agy.jsonl");
         std::fs::write(
             &agy,
@@ -804,7 +817,8 @@ mod tests {
                                 || (record == previous.0 && fragment == previous.1 + 1)
                         );
                         assert!(
-                            kind != crate::agents::entries::SearchKind::Unknown || agent == "agy",
+                            kind != crate::agents::entries::SearchKind::Unknown
+                                || matches!(agent, "agy" | "pi"),
                             "{agent}: {text}"
                         );
                         previous = (record, fragment);

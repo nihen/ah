@@ -2316,6 +2316,7 @@ fn memory_lists_each_agents_instruction_rule_and_memory_files() {
             "CURSOR_DATA_DIR",
             "GROK_HOME",
             "PI_CODING_AGENT_DIR",
+            "PI_CODING_AGENT_SESSION_DIR",
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
         ] {
@@ -2395,6 +2396,7 @@ fn memory_cmd(home: &Path, cwd: &Path) -> Command {
         "CURSOR_DATA_DIR",
         "GROK_HOME",
         "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
     ] {
@@ -2927,6 +2929,32 @@ fn pi_sessions_are_listed_shown_and_resumed() {
         .success()
         .stdout(predicate::str::contains("fix the parser"))
         .stdout(predicate::str::contains("fixed it"));
+    // PI_CODING_AGENT_SESSION_DIR holds session files directly, under any name.
+    let session_dir = home.join("pi-sessions");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(
+        session_dir.join("my_session.jsonl"),
+        concat!(
+            r#"{"type":"session","version":3,"id":"0192-elsewhere","timestamp":"2026-11-21T11:00:00.000Z","cwd":"/srv/other"}"#,
+            "\n",
+            r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-11-21T11:00:01.000Z","message":{"role":"user","content":"kept elsewhere"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    ah_pi()
+        .env("PI_CODING_AGENT_SESSION_DIR", &session_dir)
+        .args(["log", "-a", "-o", "agent,id,title", "-S", "id", "--asc"])
+        .assert()
+        .success()
+        .stdout("pi\t0192-elsewhere\tkept elsewhere\npi\t0192-pi\tfix the parser\n");
+    ah_pi()
+        .env("PI_CODING_AGENT_SESSION_DIR", &session_dir)
+        .args(["show", "0192-elsewhere"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("kept elsewhere"));
+
     ah_pi()
         .args(["resume", "--print", "0192-pi"])
         .assert()

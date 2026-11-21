@@ -229,6 +229,39 @@ fn apply_env_override(patterns: &[&str], home: &Path, info: &BuiltinInfo) -> Vec
     }
 }
 
+/// Pi keeps new sessions directly in `PI_CODING_AGENT_SESSION_DIR` when it
+/// is set, whatever `PI_CODING_AGENT_DIR` says, so that directory is scanned
+/// as well. As with `extra_patterns`, a directory that cannot be told apart
+/// from HOME or another agent's location gets no path marker.
+fn add_pi_session_dir(agents: &mut [AgentDef], home: &Path) {
+    let Ok(dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR") else {
+        return;
+    };
+    let dir = expand_tilde(dir.trim(), home);
+    let dir = dir.trim_end_matches('/');
+    if !dir.starts_with('/') {
+        return;
+    }
+    let pattern = format!("{}/*.jsonl", glob::Pattern::escape(dir));
+    let other_patterns: Vec<String> = agents
+        .iter()
+        .filter(|a| a.id != "pi")
+        .flat_map(|a| a.glob_patterns.iter().cloned())
+        .collect();
+    let Some(pi) = agents.iter_mut().find(|a| a.id == "pi") else {
+        return;
+    };
+    match extra_path_marker(&format!("{dir}/*.jsonl"), home, &other_patterns) {
+        Some(marker) => {
+            if !pi.path_markers.contains(&marker) {
+                pi.path_markers.push(marker);
+            }
+        }
+        None => pi.unattributed_patterns.push(pattern.clone()),
+    }
+    pi.glob_patterns.push(pattern);
+}
+
 /// Load config and build agent + remote registries.
 fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
     // 1. Build defaults from built-in plugins
@@ -280,6 +313,8 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
             }
         })
         .collect();
+
+    add_pi_session_dir(&mut agents, home);
 
     // 2. Read ~/.ahrc if it exists
     let ahrc_path = home.join(".ahrc");

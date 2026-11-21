@@ -91,7 +91,7 @@ impl PiPlugin {
     }
 
     /// Session id from the file name (`<timestamp>_<id>.jsonl`; the
-    /// timestamp has no `_`).
+    /// timestamp has no `_`), for a file whose header cannot be read.
     fn id_from_name(path: &Path) -> Option<String> {
         let stem = path.file_stem()?.to_str()?;
         let (_, id) = stem.split_once('_')?;
@@ -99,9 +99,15 @@ impl PiPlugin {
     }
 
     /// Search texts of one entry: message texts, tool calls and tool
-    /// results, and commands run with `!` with their output. Returns
+    /// results, commands run with `!` with their output, and the text an
+    /// extension adds to the conversation (`custom_message`). Returns
     /// `false` when `visit` stops.
     fn visit_search_texts(val: &serde_json::Value, visit: &mut TypedVisitor<'_>) -> bool {
+        if val.get("type").and_then(|v| v.as_str()) == Some("custom_message") {
+            return val
+                .get("content")
+                .is_none_or(|content| text_parts(content).all(|text| visit(K::Unknown, text)));
+        }
         let Some((role, message)) = entry_message(val) else {
             return true;
         };
@@ -183,10 +189,11 @@ impl AgentPlugin for PiPlugin {
         &["/.pi/agent/"]
     }
 
-    /// Only `message` entries hold search texts. The needle is matched
-    /// loosely, so a line is skipped only when it cannot be one.
+    /// Only `message` and `custom_message` entries hold search texts. The
+    /// needle is matched loosely, so a line is skipped only when it cannot
+    /// be one.
     fn line_may_hold_search_texts(&self, line: &[u8]) -> bool {
-        memmem::find(line, b"\"message\"").is_some()
+        memmem::find(line, b"message\"").is_some()
     }
 
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
@@ -292,12 +299,13 @@ impl AgentPlugin for PiPlugin {
         Self::title_from_bytes(mmap)
     }
 
+    /// The id in the header; a session opened with `--session <file>` can
+    /// have any file name.
     fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
-        Self::id_from_name(path)
-            .or_else(|| {
-                let header = Self::header(&mmap_file(path)?)?;
-                Some(header.get("id")?.as_str()?.to_string())
-            })
+        mmap_file(path)
+            .and_then(|data| Some(Self::header(&data)?.get("id")?.as_str()?.to_string()))
+            .filter(|id| !id.is_empty())
+            .or_else(|| Self::id_from_name(path))
             .filter(|id| is_safe_cli_id(id))
     }
 
@@ -368,6 +376,8 @@ mod tests {
         "\n",
         r#"{"type":"message","id":"a4","parentId":"u2","timestamp":"2026-11-21T10:44:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"one line"}],"model":"model-b"}}"#,
         "\n",
+        r#"{"type":"custom_message","id":"c1","parentId":"a4","timestamp":"2026-11-21T10:44:03.000Z","customType":"notes","content":"note from an extension","display":true}"#,
+        "\n",
     );
 
     fn write_session(extra: &str) -> (tempfile::TempDir, PathBuf) {
@@ -416,6 +426,17 @@ mod tests {
             PLUGIN.resolve_title(&path, home).as_deref(),
             Some("count the words")
         );
+        // The header names the session whatever the file is called.
+        let renamed = path.with_file_name("my_session.jsonl");
+        fs::copy(&path, &renamed).unwrap();
+        assert_eq!(
+            PLUGIN.session_id(&renamed, home).as_deref(),
+            Some("0192-aaaa")
+        );
+        // Without a header, the file name does.
+        let bare = path.with_file_name("2026-11-21T10-43-51-669Z_0192-bbbb.jsonl");
+        fs::write(&bare, "").unwrap();
+        assert_eq!(PLUGIN.session_id(&bare, home).as_deref(), Some("0192-bbbb"));
         assert_eq!(
             PLUGIN.resume_args(&path, home),
             Some(vec![
@@ -474,6 +495,7 @@ mod tests {
         assert!(has(K::ToolOutput, "hello world"));
         assert!(has(K::ToolInput, "wc -w note.txt"));
         assert!(has(K::ToolOutput, "2 note.txt"));
+        assert!(has(K::Unknown, "note from an extension"));
         // Neither the system prompt, thinking, nor image data is searched.
         assert!(!texts.iter().any(|(_, text)| {
             text.contains("coding assistant") || text.contains("hidden") || text == "AAAA"
