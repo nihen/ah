@@ -91,11 +91,11 @@ fn build_resume_command_for_lookup(
 
 fn build_resume_command_for_ref(
     args: &ResumeArgs,
-    _filter: &FilterArgs,
+    filter: &FilterArgs,
     session: &str,
     home: &std::path::Path,
 ) -> Result<String, String> {
-    let path = subcmd::resolve_session_ref(session, home)?;
+    let path = subcmd::resolve_session_ref_of(session, home, filter.agent.as_deref())?;
     build_resume_command_for_path(args, &path, home)
 }
 

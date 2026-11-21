@@ -74,7 +74,7 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
 
     let filters = filter.to_filters();
     let path = if let Some(session) = explicit_session.as_deref() {
-        subcmd::resolve_session_ref(session, &home)?
+        subcmd::resolve_session_ref_of(session, &home, filter.agent.as_deref())?
     } else {
         subcmd::resolve_session(
             None,

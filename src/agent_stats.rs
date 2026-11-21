@@ -121,26 +121,45 @@ pub fn build_agent_stats(
             })
         })
         .collect();
-    let keep = unique_session_copies(candidates.iter().map(|c| SessionCopy {
-        path: c.path,
-        mtime: c.mtime,
-        id: &c.id,
-        parent_id: &c.parent_id,
-    }));
+    // Like `ah log`, which filters by directory before collapsing copies:
+    // the directory's sessions are counted among the copies found there, so
+    // a copy elsewhere that ranks higher does not hide them.
+    let unique = |in_scope: bool| {
+        unique_session_copies(
+            candidates
+                .iter()
+                .filter(|c| !in_scope || c.in_cwd)
+                .map(|c| SessionCopy {
+                    path: c.path,
+                    mtime: c.mtime,
+                    id: &c.id,
+                    parent_id: &c.parent_id,
+                }),
+        )
+    };
+    let new_stats = || AgentStats {
+        total: 0,
+        latest: SystemTime::UNIX_EPOCH,
+        cwd_count: 0,
+        cwd_latest: None,
+    };
 
     let mut stats: BTreeMap<&str, AgentStats> = BTreeMap::new();
-    for (c, _) in candidates.iter().zip(keep).filter(|(_, keep)| *keep) {
-        let entry = stats.entry(c.agent).or_insert(AgentStats {
-            total: 0,
-            latest: SystemTime::UNIX_EPOCH,
-            cwd_count: 0,
-            cwd_latest: None,
-        });
+    for (c, _) in candidates
+        .iter()
+        .zip(unique(false))
+        .filter(|(_, keep)| *keep)
+    {
+        let entry = stats.entry(c.agent).or_insert_with(new_stats);
         entry.total += 1;
         if c.mtime > entry.latest {
             entry.latest = c.mtime;
         }
-        if c.in_cwd {
+    }
+    if scope_dir.is_some() {
+        let in_cwd = candidates.iter().filter(|c| c.in_cwd);
+        for (c, _) in in_cwd.zip(unique(true)).filter(|(_, keep)| *keep) {
+            let entry = stats.entry(c.agent).or_insert_with(new_stats);
             entry.cwd_count += 1;
             if entry.cwd_latest.is_none_or(|t| c.mtime > t) {
                 entry.cwd_latest = Some(c.mtime);
