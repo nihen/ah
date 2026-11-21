@@ -1575,6 +1575,55 @@ fn duplicate_session_id_resolves_to_newest_copy() {
 }
 
 #[test]
+fn sessions_of_two_agents_sharing_an_id_are_both_listed_and_counted_once() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let id = "019c0000-0000-7000-8000-00000000dddd";
+    // Two files of one Codex session, and a Copilot session with the same id.
+    let codex = home.join(".codex");
+    let old = write_codex_rollout(
+        &codex.join("sessions/2026/09/26"),
+        "2026-09-26T10-00-00",
+        id,
+    );
+    write_codex_rollout(
+        &codex.join("sessions/2026/09/27"),
+        "2026-09-27T10-00-00",
+        id,
+    );
+    set_mtime(&old, 3600);
+    let dir = home.join(".copilot/session-state").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("workspace.yaml"),
+        format!("id: {id}\ncwd: /tmp/proj\nname: copilot session\n"),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("events.jsonl"),
+        "{\"type\":\"user.message\",\"data\":{\"content\":\"hello\"}}\n",
+    )
+    .unwrap();
+
+    let ah = || {
+        let mut cmd = ah_codex(&home);
+        cmd.env("COPILOT_HOME", home.join(".copilot"));
+        cmd
+    };
+    ah().args(["log", "-a", "-o", "agent,id", "-S", "agent", "--asc"])
+        .assert()
+        .success()
+        .stdout(format!("codex\t{id}\ncopilot\t{id}\n"));
+    let out = ah().args(["agent", "-a", "--tsv"]).output().unwrap();
+    let counts: Vec<String> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| l.split('\t').take(2).collect::<Vec<_>>().join("="))
+        .collect();
+    assert_eq!(counts, ["codex=1", "copilot=1"]);
+}
+
+#[test]
 fn copilot_time_filters_use_events_mtime() {
     let tmp = TempDir::new().unwrap();
     let home = fs::canonicalize(tmp.path()).unwrap();

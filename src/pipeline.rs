@@ -9,6 +9,7 @@ use crate::agents;
 use crate::cli::{Field, FieldFilter, SearchMode, SortOrder};
 use crate::collector;
 use crate::color;
+use crate::config;
 use crate::resolver::{self, ResolveOpts};
 use crate::search;
 use crate::session::Session;
@@ -406,24 +407,34 @@ pub fn copy_preference(path: &Path, mtime: SystemTime) -> (bool, SystemTime, &Pa
     (!secondary, mtime, path)
 }
 
-/// Keep one session per id (and parent, so subagents of different sessions
-/// that share an id stay distinct), the copy `copy_preference` ranks
-/// highest. Sessions without an id are distinct and all kept.
-fn dedup_by_id(sessions: Vec<(Session, SystemTime)>) -> Vec<Session> {
-    fn field(session: &Session, field: Field) -> &str {
-        session.fields.get(&field).map(|v| v.as_str()).unwrap_or("")
-    }
-    let mut best: std::collections::HashMap<(&str, &str), usize> = std::collections::HashMap::new();
-    for (i, (session, mtime)) in sessions.iter().enumerate() {
-        let id = field(session, Field::Id);
-        if id.is_empty() {
+/// One file of a session, as the id dedup sees it.
+pub struct SessionCopy<'a> {
+    pub path: &'a Path,
+    pub mtime: SystemTime,
+    pub id: &'a str,
+    pub parent_id: &'a str,
+}
+
+/// Which of `copies` to keep, in input order: one per agent, id and parent,
+/// the copy `copy_preference` ranks highest. The parent keeps subagents of
+/// different sessions that share an id distinct, and the agent keeps
+/// sessions of different agents that happen to share one. Copies without an
+/// id are distinct and all kept.
+pub fn unique_session_copies<'a>(copies: impl Iterator<Item = SessionCopy<'a>>) -> Vec<bool> {
+    let copies: Vec<SessionCopy<'a>> = copies.collect();
+    let mut best: std::collections::HashMap<(&str, &str, &str), usize> =
+        std::collections::HashMap::new();
+    for (i, copy) in copies.iter().enumerate() {
+        if copy.id.is_empty() {
             continue;
         }
-        best.entry((id, field(session, Field::ParentId)))
+        let agent = config::find_agent_for_path(copy.path)
+            .map(|a| a.id.as_str())
+            .unwrap_or("");
+        best.entry((agent, copy.id, copy.parent_id))
             .and_modify(|j| {
-                let (other, other_mtime) = &sessions[*j];
-                if copy_preference(&session.path, *mtime)
-                    > copy_preference(&other.path, *other_mtime)
+                let other = &copies[*j];
+                if copy_preference(copy.path, copy.mtime) > copy_preference(other.path, other.mtime)
                 {
                     *j = i;
                 }
@@ -431,13 +442,29 @@ fn dedup_by_id(sessions: Vec<(Session, SystemTime)>) -> Vec<Session> {
             .or_insert(i);
     }
     let keep: std::collections::HashSet<usize> = best.into_values().collect();
+    copies
+        .iter()
+        .enumerate()
+        .map(|(i, copy)| copy.id.is_empty() || keep.contains(&i))
+        .collect()
+}
+
+/// Keep one session per agent, id and parent (see `unique_session_copies`).
+fn dedup_by_id(sessions: Vec<(Session, SystemTime)>) -> Vec<Session> {
+    fn field(session: &Session, field: Field) -> &str {
+        session.fields.get(&field).map(|v| v.as_str()).unwrap_or("")
+    }
+    let keep = unique_session_copies(sessions.iter().map(|(session, mtime)| SessionCopy {
+        path: &session.path,
+        mtime: *mtime,
+        id: field(session, Field::Id),
+        parent_id: field(session, Field::ParentId),
+    }));
     sessions
         .into_iter()
-        .enumerate()
-        .filter(|(i, (session, _))| {
-            keep.contains(i) || session.fields.get(&Field::Id).is_none_or(|v| v.is_empty())
-        })
-        .map(|(_, (session, _))| session)
+        .zip(keep)
+        .filter(|(_, keep)| *keep)
+        .map(|((session, _), _)| session)
         .collect()
 }
 
