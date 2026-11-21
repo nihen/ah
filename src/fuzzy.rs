@@ -838,11 +838,16 @@ pub fn run_resume(
         if args.print {
             println!(
                 "{}",
-                remote::format_remote_resume_command(remote_def, remote_ref, &args.extra_args,)
+                remote::format_remote_resume_command(
+                    remote_def,
+                    remote_ref,
+                    &args.extra_args,
+                    None
+                )
             );
             return Ok(());
         }
-        remote::exec_remote_resume(remote_def, remote_ref, args);
+        remote::exec_remote_resume(remote_def, remote_ref, args, None);
     }
 
     let path = PathBuf::from(&path_str);

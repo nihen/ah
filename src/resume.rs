@@ -27,11 +27,16 @@ fn run_with_session(
             if args.print {
                 println!(
                     "{}",
-                    remote::format_remote_resume_command(remote_def, remote_ref, &args.extra_args,)
+                    remote::format_remote_resume_command(
+                        remote_def,
+                        remote_ref,
+                        &args.extra_args,
+                        filter.agent.as_deref(),
+                    )
                 );
                 return Ok(());
             }
-            remote::exec_remote_resume(remote_def, remote_ref, &args);
+            remote::exec_remote_resume(remote_def, remote_ref, &args, filter.agent.as_deref());
         }
         remote::check_unknown_remote(unquoted)?;
     }
@@ -276,7 +281,7 @@ mod tests {
             host: "mydev.example.com".to_string(),
             ah_path: "/usr/local/bin/ah".to_string(),
         };
-        let cmd = remote::format_remote_resume_command(&remote, "abc123", &[]);
+        let cmd = remote::format_remote_resume_command(&remote, "abc123", &[], None);
         assert_eq!(
             cmd,
             "ssh -t -- 'mydev.example.com' '/usr/local/bin/ah' resume 'abc123'"
@@ -294,10 +299,11 @@ mod tests {
             &remote,
             "abc123",
             &["--model".to_string(), "opus".to_string()],
+            Some("codex"),
         );
         assert_eq!(
             cmd,
-            "ssh -t -- 'mydev.example.com' 'ah' resume 'abc123' -- '--model' 'opus'"
+            "ssh -t -- 'mydev.example.com' 'ah' resume --agent 'codex' 'abc123' -- '--model' 'opus'"
         );
     }
 }

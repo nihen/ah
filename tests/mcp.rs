@@ -765,6 +765,12 @@ fn show_formats_and_truncation() {
             call(6, "show", json!({"session": SESSION_ID, "format": "xml"})),
             call(7, "show", json!({})),
             call(8, "show", json!({"session": "abc12345"})),
+            call(
+                9,
+                "show",
+                json!({"session": SESSION_ID, "agent": "claude", "format": "json", "head": 1}),
+            ),
+            call(10, "show", json!({"session": SESSION_ID, "agent": "codex"})),
         ],
     );
     let r1 = by_id(&out, 1);
@@ -810,6 +816,10 @@ fn show_formats_and_truncation() {
     assert!(tool_error(&out, 6).contains("format"));
     assert!(tool_error(&out, 7).contains("session"));
     assert!(tool_error(&out, 8).contains("Ambiguous"));
+
+    // `agent` limits the id lookup to that agent's sessions.
+    assert_eq!(structured(&out, 9)["messages"], r2["messages"]);
+    assert!(tool_error(&out, 10).contains("No session found"));
 }
 
 // ─── project, memory, agent, list_agents ─────────────────────────────
