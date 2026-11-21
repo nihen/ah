@@ -52,6 +52,11 @@ fn snapshot_help_agent() {
 }
 
 #[test]
+fn snapshot_help_stats() {
+    insta::assert_snapshot!(help_output(&["stats", "--help"]));
+}
+
+#[test]
 fn snapshot_help_list_agents() {
     insta::assert_snapshot!(help_output(&["list-agents", "--help"]));
 }

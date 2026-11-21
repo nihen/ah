@@ -296,13 +296,13 @@ fn visit_message(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -> bool
                 .or_else(|| val.get("message").and_then(|v| v.as_str()));
             if let Some(text) = text {
                 if !text.starts_with('<') {
-                    return visit(Message::user(text.to_string()));
+                    return visit(Message::user(text.to_string()).at(val.get("timestamp")));
                 }
             }
         }
         Some("gemini") => {
             if let Some(text) = val.get("content").and_then(assistant_text) {
-                return visit(Message::assistant(text));
+                return visit(Message::assistant(text).at(val.get("timestamp")));
             }
         }
         _ => {}

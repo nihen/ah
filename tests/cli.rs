@@ -1690,6 +1690,141 @@ fn agent_counts_the_copy_in_the_directory_even_when_a_newer_copy_is_elsewhere() 
     assert!(row.starts_with("codex\t1\t"), "unexpected: {row:?}");
 }
 
+/// A Claude session whose prompts carry the given `timestamp`s.
+fn write_claude_session(home: &Path, id: &str, model: &str, timestamps: &[&str]) {
+    let dir = home.join(".claude/projects/-tmp-proj");
+    fs::create_dir_all(&dir).unwrap();
+    let mut body = String::from("{\"type\":\"system\",\"cwd\":\"/tmp/proj\"}\n");
+    for (i, ts) in timestamps.iter().enumerate() {
+        body.push_str(&format!(
+            "{{\"type\":\"user\",\"timestamp\":\"{ts}\",\"message\":{{\"role\":\"user\",\"content\":\"prompt {i}\"}}}}\n\
+             {{\"type\":\"assistant\",\"timestamp\":\"{ts}\",\"message\":{{\"role\":\"assistant\",\"model\":\"{model}\",\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]}}}}\n"
+        ));
+    }
+    fs::write(dir.join(format!("{id}.jsonl")), body).unwrap();
+}
+
+fn ah_claude(home: &Path) -> Command {
+    let mut cmd = ah_opencode(home);
+    cmd.env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env("TZ", "UTC");
+    cmd
+}
+
+#[test]
+fn prompt_times_field_lists_the_recorded_times() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    write_claude_session(
+        &home,
+        "11111111-1111-4111-8111-111111111111",
+        "claude-opus-5-5",
+        &["2026-03-01T10:00:00.000Z", "2026-03-01T10:07:00Z"],
+    );
+    ah_claude(&home)
+        .args(["log", "-a", "-o", "turns,prompt_times"])
+        .assert()
+        .success()
+        .stdout("2\t[1772359200,1772359620]\n");
+}
+
+#[test]
+fn stats_sums_up_the_prompts_of_one_year() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    // Two prompts in 2026 (one session also has a prompt from 2025), on
+    // consecutive days.
+    write_claude_session(
+        &home,
+        "11111111-1111-4111-8111-111111111111",
+        "claude-opus-5-5",
+        &["2025-12-31T23:00:00Z", "2026-03-01T10:00:00Z"],
+    );
+    write_claude_session(
+        &home,
+        "22222222-2222-4222-8222-222222222222",
+        "claude-sonnet-5",
+        &["2026-03-02T10:30:00Z"],
+    );
+
+    // The files' modification times say nothing about the prompts' year.
+    for id in [
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    ] {
+        let path = home.join(format!(".claude/projects/-tmp-proj/{id}.jsonl"));
+        set_mtime(path.to_str().unwrap(), 20 * 366 * 86400);
+    }
+
+    let out = ah_claude(&home)
+        .args(["stats", "--year", "2026", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stats: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(stats["prompts"], 2);
+    assert_eq!(stats["sessions"], 2);
+    assert_eq!(stats["active_days"], 2);
+    assert_eq!(stats["streak"], 2);
+    assert_eq!(stats["models"], 2);
+    assert_eq!(stats["first_day"], "2026-03-01");
+    assert_eq!(stats["peak_hour"], 10);
+    assert_eq!(stats["agents"][0]["agent"], "claude");
+    assert_eq!(stats["days"]["2026-03-02"]["prompts"], 1);
+    assert_eq!(stats["undated_prompts"], 0);
+
+    // The screen: plain text when piped, no wider than 60 columns.
+    let out = ah_claude(&home)
+        .args(["stats", "--year", "2026"])
+        .output()
+        .unwrap();
+    let screen = String::from_utf8(out.stdout).unwrap();
+    assert!(screen.starts_with(" ah wrapped 2026"), "{screen}");
+    assert!(
+        screen.contains("2 prompts   2 sessions   2 active days"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("1 agent · 2 models · 2-day streak"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("claude  ██████████████████████████████  100%"),
+        "{screen}"
+    );
+    assert!(screen.contains("You are: The Loyalist"), "{screen}");
+    assert!(!screen.contains('\x1b'), "no color when piped");
+    assert!(screen.lines().all(|l| l.chars().count() <= 60), "{screen}");
+
+    // 2025 has the one older prompt; a year without prompts is an error.
+    ah_claude(&home)
+        .args(["stats", "--year", "2025", "--ascii"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "1 prompt   1 session   1 active day",
+        ));
+    ah_claude(&home)
+        .args(["stats", "--year", "2024"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No prompts found in 2024."));
+    ah_claude(&home)
+        .args(["stats", "--since", "3d"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--year"));
+    ah_claude(&home)
+        .args(["stats", "--running"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--running"));
+}
+
 #[test]
 fn copilot_time_filters_use_events_mtime() {
     let tmp = TempDir::new().unwrap();

@@ -19,6 +19,7 @@ const MESSAGE_FIELDS: &[Field] = &[
     Field::Messages,
     Field::Transcript,
     Field::Turns,
+    Field::PromptTimes,
 ];
 
 /// Fields that require collecting ALL messages (not just the first user message).
@@ -402,12 +403,34 @@ fn resolve_message_fields(
                 .filter(|m| m.role == MessageRole::User)
                 .count()
                 .to_string(),
+            // Replaced by the caller, which can ask the plugin for times
+            // recorded outside the messages.
+            Field::PromptTimes => String::new(),
             _ => unreachable!(),
         };
         map.insert(*field, value);
     }
 
     map
+}
+
+/// `prompt_times` value: a JSON array with one entry per user prompt. Times
+/// missing from the messages come from `AgentPlugin::prompt_times` when it
+/// accounts for every prompt.
+fn prompt_times_json(plugin: &dyn AgentPlugin, path: &Path, mut times: Vec<Option<i64>>) -> String {
+    if times.iter().any(Option::is_none) {
+        if let Some(recorded) = plugin
+            .prompt_times(path)
+            .filter(|recorded| recorded.len() == times.len())
+        {
+            times = recorded;
+        }
+    }
+    let times: Vec<String> = times
+        .into_iter()
+        .map(|t| t.map_or_else(|| "null".to_string(), |t| t.to_string()))
+        .collect();
+    format!("[{}]", times.join(","))
 }
 
 /// Options for resolve_fields that remain constant across files.
@@ -590,16 +613,27 @@ pub fn resolve_fields_with_mmap(
             collected.push(message);
             true
         });
-        resolve_message_fields(
+        let mut result = resolve_message_fields(
             &collected,
             &resolve_message_fields_list,
             opts.transcript_limit,
-        )
+        );
+        if resolve_message_fields_list.contains(&Field::PromptTimes) {
+            let times = collected
+                .iter()
+                .filter(|m| m.role == MessageRole::User)
+                .map(|m| m.time)
+                .collect();
+            result.insert(Field::PromptTimes, prompt_times_json(plugin, path, times));
+        }
+        result
     } else if needs_any_message {
         let needs_first_prompt = resolve_message_fields_list.contains(&Field::FirstPrompt);
-        let needs_turns = resolve_message_fields_list.contains(&Field::Turns);
+        let needs_times = resolve_message_fields_list.contains(&Field::PromptTimes);
+        let needs_turns = needs_times || resolve_message_fields_list.contains(&Field::Turns);
         let mut first_prompt: Option<String> = None;
         let mut turn_count: usize = 0;
+        let mut prompt_times: Vec<Option<i64>> = Vec::new();
 
         iter_msgs!(plugin, path, &mut |message| {
             if crate::cancel::requested() {
@@ -607,6 +641,9 @@ pub fn resolve_fields_with_mmap(
             }
             if message.role == MessageRole::User {
                 turn_count += 1;
+                if needs_times {
+                    prompt_times.push(message.time);
+                }
                 if first_prompt.is_none() && needs_first_prompt {
                     first_prompt = Some(message.text.clone());
                     if !needs_turns {
@@ -621,8 +658,14 @@ pub fn resolve_fields_with_mmap(
         if let Some(fp) = first_prompt {
             result.insert(Field::FirstPrompt, fp);
         }
-        if needs_turns {
+        if resolve_message_fields_list.contains(&Field::Turns) {
             result.insert(Field::Turns, turn_count.to_string());
+        }
+        if needs_times {
+            result.insert(
+                Field::PromptTimes,
+                prompt_times_json(plugin, path, prompt_times),
+            );
         }
         result
     } else {

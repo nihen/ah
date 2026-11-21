@@ -262,7 +262,7 @@ fn visit_message_value(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -
                     if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                         if !text.starts_with('<')
                             && !text.starts_with("# ")
-                            && !visit(Message::user(text.to_string()))
+                            && !visit(Message::user(text.to_string()).at(val.get("timestamp")))
                         {
                             return false;
                         }
@@ -274,7 +274,7 @@ fn visit_message_value(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -
             for item in contents {
                 if item.get("type").and_then(|v| v.as_str()) == Some("output_text") {
                     if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        if !visit(Message::assistant(text.to_string())) {
+                        if !visit(Message::assistant(text.to_string()).at(val.get("timestamp"))) {
                             return false;
                         }
                     }

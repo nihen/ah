@@ -360,7 +360,7 @@ impl AgentPlugin for ClaudePlugin {
                     .or_else(|| msg.as_str())
                 {
                     if !text.starts_with('<') {
-                        msgs.push(Message::user(text.to_string()));
+                        msgs.push(Message::user(text.to_string()).at(val.get("timestamp")));
                     }
                     return msgs;
                 }
@@ -374,7 +374,7 @@ impl AgentPlugin for ClaudePlugin {
                         };
                         if let Some(text) = text {
                             if !text.starts_with('<') && !text.starts_with("# ") {
-                                msgs.push(Message::user(text.to_string()));
+                                msgs.push(Message::user(text.to_string()).at(val.get("timestamp")));
                                 return msgs;
                             }
                         }
@@ -386,7 +386,9 @@ impl AgentPlugin for ClaudePlugin {
                     for item in contents {
                         if item.get("type").and_then(|v| v.as_str()) == Some("text") {
                             if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                                msgs.push(Message::assistant(text.to_string()));
+                                msgs.push(
+                                    Message::assistant(text.to_string()).at(val.get("timestamp")),
+                                );
                             }
                         }
                     }

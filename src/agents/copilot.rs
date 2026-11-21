@@ -358,9 +358,11 @@ impl AgentPlugin for CopilotPlugin {
                 .and_then(|v| v.as_str())
                 .filter(|text| !text.trim().is_empty());
             match (val.get("type").and_then(|v| v.as_str()), text) {
-                (Some("user.message"), Some(text)) => visit(Message::user(text.to_string())),
+                (Some("user.message"), Some(text)) => {
+                    visit(Message::user(text.to_string()).at(val.get("timestamp")))
+                }
                 (Some("assistant.message"), Some(text)) => {
-                    visit(Message::assistant(text.to_string()))
+                    visit(Message::assistant(text.to_string()).at(val.get("timestamp")))
                 }
                 _ => true,
             }

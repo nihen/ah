@@ -111,6 +111,7 @@ pub enum Field {
     ParentId,
     Model,
     Models,
+    PromptTimes,
 }
 
 impl Field {
@@ -141,6 +142,7 @@ impl Field {
             Field::ParentId => "parent_id",
             Field::Model => "model",
             Field::Models => "models",
+            Field::PromptTimes => "prompt_times",
         }
     }
 
@@ -171,11 +173,12 @@ impl Field {
             Field::ParentId,
             Field::Model,
             Field::Models,
+            Field::PromptTimes,
         ]
     }
 
     pub fn all_names() -> &'static str {
-        "agent, project, project_raw, modified_at, created_at, title, first_prompt, last_prompt, prompts, responses, messages, transcript, matched, path, cwd, id, resume_cmd, turns, size, running, pid, archived, parent_id, model, models"
+        "agent, project, project_raw, modified_at, created_at, title, first_prompt, last_prompt, prompts, responses, messages, transcript, matched, path, cwd, id, resume_cmd, turns, size, running, pid, archived, parent_id, model, models, prompt_times"
     }
 
     pub fn description(&self) -> &'static str {
@@ -205,6 +208,9 @@ impl Field {
             Field::ParentId => "Id of the session that spawned this subagent session",
             Field::Model => "Model that answered last",
             Field::Models => "Models that answered, comma-separated in first-use order",
+            Field::PromptTimes => {
+                "Times of the user prompts as JSON array (Unix seconds; null if not recorded)"
+            }
         }
     }
 
@@ -237,6 +243,7 @@ impl Field {
             Field::ParentId => "abc12345-...",
             Field::Model => "claude-opus-5-5",
             Field::Models => "claude-sonnet-5-5,claude-opus-5-5",
+            Field::PromptTimes => "[1774000000,1774000420]",
         }
     }
 
@@ -274,6 +281,7 @@ impl FromStr for Field {
             "archived" => Ok(Field::Archived),
             "parent_id" => Ok(Field::ParentId),
             "model" => Ok(Field::Model),
+            "prompt_times" => Ok(Field::PromptTimes),
             "models" => Ok(Field::Models),
             _ => Err(format!(
                 "unknown field '{}'. available: {}",
@@ -420,6 +428,10 @@ pub enum Commands {
     /// Show session summary per agent
     #[command(name = "agent", override_help = AGENT_HELP_TEXT)]
     Agent(AgentArgs),
+
+    /// Show your year in review
+    #[command(name = "stats", override_help = STATS_HELP_TEXT)]
+    Stats(StatsArgs),
 
     /// List agent memory files
     #[command(name = "memory", override_help = MEMORY_HELP_TEXT)]
@@ -944,6 +956,21 @@ impl AgentArgs {
     pub fn wants_pager(&self) -> bool {
         !self.json && !self.ltsv && !self.tsv && !self.table
     }
+}
+
+#[derive(Parser, Debug)]
+pub struct StatsArgs {
+    /// Calendar year to sum up (default: this year)
+    #[arg(long = "year", value_name = "YEAR", value_parser = clap::value_parser!(i32).range(1970..=9999))]
+    pub year: Option<i32>,
+
+    /// Output the numbers as one JSON object
+    #[arg(long = "json", conflicts_with = "ascii")]
+    pub json: bool,
+
+    /// Draw with ASCII characters only
+    #[arg(long = "ascii")]
+    pub ascii: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -1663,6 +1690,7 @@ Commands:
   resume              Resume an agent session
   memory              List agent memory and instruction files
   agent               Show session summary per agent
+  stats               Show your year in review
 
 Help / setup:
   list-agents         List supported agents
@@ -1763,6 +1791,18 @@ const MEMORY_GLOBAL_OPTIONS: &str = concatcp!(
   --remote <NAME>         Include memory files from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show files newer than (e.g. "2026-03-20", "3d", "1w")
   --until <SPEC>          Show files older than (e.g. "2026-03-20", "3d", "1w")
+
+"#,
+    DISPLAY_OPTIONS
+);
+
+const STATS_GLOBAL_OPTIONS: &str = concatcp!(
+    r#"Global options:
+  --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
+  --project <NAME>        Filter by project name
+  -d, --dir <PATH>        Filter by working directory (default: all directories)
+  -n, --limit N           Max session files to scan (default: 0, no limit)
+  --subagents             Include subagent sessions (spawned by another session)
 
 "#,
     DISPLAY_OPTIONS
@@ -2001,6 +2041,30 @@ Default output (when no format flag is given):
     AGENT_GLOBAL_OPTIONS
 );
 
+const STATS_HELP_TEXT: &str = concatcp!(
+    "Show your year in review
+
+Usage:
+  ah stats [OPTIONS]
+
+One screen for one calendar year: prompts, sessions and active days, a
+calendar of the year, the agents by share of prompts, the model that led each
+month, and a title. Covers every directory unless -d or --project is given.
+
+A prompt counts on the local day it was sent, and a session counts when it has
+a prompt in the year. Prompts without a recorded time (Cursor, and some of
+Grok) count at their session's modification time.
+
+Options:
+  --year <YEAR>           Calendar year to sum up (default: this year)
+  --ascii                 Draw with ASCII characters only (for terminals that
+                          draw block characters two columns wide)
+  --json                  Output the numbers as one JSON object
+
+",
+    STATS_GLOBAL_OPTIONS
+);
+
 const MEMORY_HELP_TEXT: &str = concatcp!(
     "List agent memory files
 
@@ -2142,7 +2206,7 @@ mod tests {
 
     #[test]
     fn test_field_all_count() {
-        assert_eq!(Field::all().len(), 25);
+        assert_eq!(Field::all().len(), 26);
     }
 
     #[test]

@@ -123,14 +123,14 @@ impl AgyPlugin {
             ("USER_EXPLICIT", "USER_INPUT") => {
                 let raw = val.get("content").and_then(|v| v.as_str())?;
                 let text = tagged_user_body(raw, "USER_REQUEST")?;
-                Some(Message::user(text.to_string()))
+                Some(Message::user(text.to_string()).at(val.get("created_at")))
             }
             ("MODEL", "PLANNER_RESPONSE") => {
                 let text = val.get("content").and_then(|v| v.as_str())?;
                 if text.trim().is_empty() {
                     return None;
                 }
-                Some(Message::assistant(text.to_string()))
+                Some(Message::assistant(text.to_string()).at(val.get("created_at")))
             }
             _ => None,
         }
@@ -349,7 +349,8 @@ mod tests {
         assert_eq!(
             msgs,
             vec![
-                Message::user("fix the bug".to_string()),
+                // 2026-08-20T08:11:44Z, the step's `created_at`
+                Message::user("fix the bug".to_string()).at(Some(&1787213504.into())),
                 Message::assistant("Done.".to_string()),
             ]
         );
