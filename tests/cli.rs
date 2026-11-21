@@ -2996,13 +2996,12 @@ fn pi_sessions_are_listed_shown_and_resumed() {
 
 #[test]
 fn dsh_sessions_are_decoded_listed_and_shown() {
-    use ruzstd::encoding::{CompressionLevel, compress_to_vec};
     let tmp = TempDir::new().unwrap();
     let home = fs::canonicalize(tmp.path()).unwrap();
     let dsh_home = home.join("dsh-home");
     let frame = |lines: &[&str]| {
         let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
-        compress_to_vec(text.as_bytes(), CompressionLevel::Fastest)
+        zstd::encode_all(text.as_bytes(), 3).unwrap()
     };
     let write = |id: &str, frames: Vec<Vec<u8>>| {
         let dir = dsh_home.join("sessions/--srv-proj--").join(id);
@@ -3029,6 +3028,16 @@ fn dsh_sessions_are_decoded_listed_and_shown() {
             r#"{"type":"user/message","seq":9,"time":1795258444100,"data":{"content":[{"type":"text","text":"run the tests"}],"source":{"kind":"user"},"role":"user"}}"#,
         ])],
     );
+    // The log of an earlier format generation stays next to the current
+    // one and is not a session of its own, however new its file is.
+    fs::write(
+        dsh_home.join("sessions/--srv-proj--/session-0192/session.v3.jsonl.zstd"),
+        frame(&[
+            r#"{"type":"session","version":3,"id":"session-0192","createdAt":1795258135225,"cwd":"/srv/proj","isSeeded":false,"delegationDepth":0}"#,
+            r#"{"type":"user/message","seq":9,"time":1795258135280,"data":{"content":[{"type":"text","text":"superseded prompt"}],"source":{"kind":"user"},"role":"user"}}"#,
+        ]),
+    )
+    .unwrap();
     let ah_dsh = || {
         let mut cmd = ah_opencode(&home);
         cmd.env("DSH_HOME", &dsh_home);

@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use super::common::{
@@ -26,9 +27,14 @@ fn is_compressed(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "zstd")
 }
 
+/// Largest log that is decoded. A log is a few megabytes; the limit keeps a
+/// damaged or hostile file from exhausting memory.
+const MAX_LOG_BYTES: u64 = 1 << 30;
+
 /// Decode the Zstandard frames of `data`, at most `max_frames` of them.
-/// A frame that cannot be decoded (a write that was cut short) ends the
-/// log: the frames before it are returned.
+/// A frame that cannot be decoded ends the log, and the frames before it
+/// are returned: a write that was cut short, a checksum that does not
+/// match, or a frame that would take the log past `MAX_LOG_BYTES`.
 fn decode_frames(mut data: &[u8], max_frames: usize) -> Vec<u8> {
     let mut out = Vec::new();
     for _ in 0..max_frames {
@@ -36,15 +42,38 @@ fn decode_frames(mut data: &[u8], max_frames: usize) -> Vec<u8> {
             break;
         }
         let complete = out.len();
-        let decoded = ruzstd::decoding::StreamingDecoder::new(&mut data)
+        let room = MAX_LOG_BYTES - complete as u64;
+        let decoded = zstd::stream::read::Decoder::with_buffer(&mut data)
             .ok()
-            .and_then(|mut frame| frame.read_to_end(&mut out).ok());
-        if decoded.is_none() {
+            .and_then(|frame| {
+                frame
+                    .single_frame()
+                    .take(room + 1)
+                    .read_to_end(&mut out)
+                    .ok()
+            });
+        if decoded.is_none_or(|read| read as u64 > room) {
             out.truncate(complete);
             break;
         }
     }
     out
+}
+
+/// Format generation in a log's file name: `session.jsonl[.zstd]` is 0 and
+/// `session.v<N>.jsonl[.zstd]` is N. `None` for any other name.
+fn generation(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    let name = name.strip_suffix(".zstd").unwrap_or(name);
+    let middle = name.strip_prefix("session")?.strip_suffix(".jsonl")?;
+    if middle.is_empty() {
+        return Some(0);
+    }
+    let digits = middle.strip_prefix(".v")?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+        .filter(|n| *n > 0)
 }
 
 /// The log as text: the file itself, or its decoded frames.
@@ -70,7 +99,11 @@ struct Source {
     path: PathBuf,
     len: u64,
     modified: Option<SystemTime>,
+    epoch: u64,
 }
+
+/// Raised by `clear_caches`; a decoded log from an earlier epoch is stale.
+static EPOCH: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// The log decoded last on this thread. The fields of one session are
@@ -87,6 +120,7 @@ fn read_log(path: &Path) -> Option<Log> {
         path: path.to_path_buf(),
         len: meta.len(),
         modified: meta.modified().ok(),
+        epoch: EPOCH.load(Ordering::Relaxed),
     };
     let cached = LAST_DECODED.with_borrow(|last| {
         last.as_ref()
@@ -168,14 +202,18 @@ fn text_parts(content: Option<&serde_json::Value>) -> impl Iterator<Item = &str>
         .filter_map(|part| part.get("text").and_then(|v| v.as_str()))
 }
 
-/// The content of a `user/message` the user wrote. The harness adds its own
-/// user-role messages (runtime context, the skill catalog), told apart by
-/// `source.kind`.
+/// The content of a `user/message` the user wrote: a prompt, or the answer
+/// to a question the agent asked. The harness adds its own user-role
+/// messages (runtime context, the skill catalog, goal rounds, messages from
+/// other agents), told apart by `source.kind`.
 fn prompt_content(val: &serde_json::Value) -> Option<&serde_json::Value> {
     let data = val.get("data")?;
-    (data.pointer("/source/kind")?.as_str()? == "user")
-        .then(|| data.get("content"))
-        .flatten()
+    matches!(
+        data.pointer("/source/kind")?.as_str()?,
+        "user" | "user-question-reply"
+    )
+    .then(|| data.get("content"))
+    .flatten()
 }
 
 fn messages_of(kind: &str, val: &serde_json::Value) -> Vec<Message> {
@@ -286,12 +324,35 @@ impl AgentPlugin for DshPlugin {
         &["/.dsh/sessions/"]
     }
 
+    fn clear_caches(&self) {
+        EPOCH.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A session directory keeps the logs of earlier format generations
+    /// next to the current one; only the highest generation is the session.
+    fn expand_sessions(&self, file: &Path) -> Option<Vec<(PathBuf, SystemTime)>> {
+        let Some(own) = generation(file) else {
+            return Some(Vec::new());
+        };
+        let superseded = std::fs::read_dir(file.parent()?)
+            .ok()?
+            .flatten()
+            .any(|entry| generation(&entry.path()).is_some_and(|other| other > own));
+        superseded.then(Vec::new)
+    }
+
     /// The decoded log. Decoding is not free, so it is loaded only for a
-    /// full-text search.
+    /// full-text search. The decoded bytes are handed over rather than
+    /// copied when nothing else holds them.
     fn session_bytes(&self, path: &Path) -> Option<SessionBytes> {
         match read_log(path)? {
             Log::Plain(mmap) => Some(SessionBytes::Mmap(mmap)),
-            Log::Decoded(bytes) => Some(SessionBytes::Owned(bytes.to_vec())),
+            Log::Decoded(bytes) => {
+                LAST_DECODED.with_borrow_mut(|last| *last = None);
+                Some(SessionBytes::Owned(
+                    Rc::try_unwrap(bytes).unwrap_or_else(|shared| shared.to_vec()),
+                ))
+            }
         }
     }
 
@@ -421,7 +482,6 @@ impl AgentPlugin for DshPlugin {
 mod tests {
     use super::*;
     use crate::agents::MessageRole;
-    use ruzstd::encoding::{CompressionLevel, compress_to_vec};
     use std::fs;
 
     const HEADER: &str = r#"{"type":"session","version":4,"id":"session-0192","createdAt":1795258135225,"cwd":"/home/me/proj","isSeeded":false,"delegationDepth":0}"#;
@@ -448,7 +508,10 @@ mod tests {
             .iter()
             .map(|line| format!("{line}\n"))
             .collect::<String>();
-        compress_to_vec(text.as_bytes(), CompressionLevel::Fastest)
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.include_checksum(true).unwrap();
+        std::io::Write::write_all(&mut encoder, text.as_bytes()).unwrap();
+        encoder.finish().unwrap()
     }
 
     /// A compressed log: one frame for the header, one per turn.
@@ -554,6 +617,73 @@ mod tests {
             PLUGIN.session_id(&path, tmp.path()).as_deref(),
             Some("session-0192")
         );
+    }
+
+    #[test]
+    fn a_frame_with_a_wrong_checksum_ends_the_log() {
+        let mut bytes = [frame(&[HEADER]), frame(TURN_1)].concat();
+        let mut damaged = frame(TURN_2);
+        // The checksum is the last four bytes of a frame.
+        let last = damaged.len() - 1;
+        damaged[last] ^= 0xff;
+        bytes.extend_from_slice(&damaged);
+        let (_tmp, path) = write_log("session.v4.jsonl.zstd", &bytes);
+        assert_eq!(messages(&path).len(), 2);
+    }
+
+    #[test]
+    fn answers_to_questions_are_prompts() {
+        let reply = r#"{"type":"user/message","seq":40,"time":1795258150000,"data":{"content":[{"type":"text","text":"yes, both"}],"source":{"kind":"user-question-reply","callId":"c9","outcome":"answered"},"role":"user"}}"#;
+        let goal = r#"{"type":"user/message","seq":41,"time":1795258151000,"data":{"content":[{"type":"text","text":"continue toward the goal"}],"source":{"kind":"goal"},"role":"user"}}"#;
+        let bytes = [frame(&[HEADER]), frame(&[reply, goal])].concat();
+        let (_tmp, path) = write_log("session.v4.jsonl.zstd", &bytes);
+        assert_eq!(
+            messages(&path),
+            [(MessageRole::User, "yes, both".to_string(), Some(1795258150))]
+        );
+    }
+
+    #[test]
+    fn only_the_highest_generation_is_the_session() {
+        let (_tmp, current) = write_log("session.v4.jsonl.zstd", &compressed());
+        let dir = current.parent().unwrap();
+        for name in [
+            "session.jsonl.zstd",
+            "session.v3.jsonl.zstd",
+            "session-notes.jsonl",
+        ] {
+            fs::write(dir.join(name), frame(&[HEADER])).unwrap();
+        }
+        assert_eq!(PLUGIN.expand_sessions(&current), None);
+        for name in [
+            "session.jsonl.zstd",
+            "session.v3.jsonl.zstd",
+            "session-notes.jsonl",
+        ] {
+            assert_eq!(PLUGIN.expand_sessions(&dir.join(name)), Some(Vec::new()));
+        }
+        assert_eq!(generation(Path::new("session.v12.jsonl")), Some(12));
+        assert_eq!(generation(Path::new("session.v0.jsonl")), None);
+        assert_eq!(generation(Path::new("session.vx.jsonl.zstd")), None);
+    }
+
+    #[test]
+    fn clearing_caches_drops_a_decoded_log() {
+        let (_tmp, path) = write_log("session.v4.jsonl.zstd", &compressed());
+        assert_eq!(messages(&path).len(), 4);
+        // Same size and modification time, other content.
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let other = [frame(&[HEADER]), frame(TURN_2), frame(TURN_1)].concat();
+        assert_eq!(other.len(), compressed().len());
+        fs::write(&path, other).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        PLUGIN.clear_caches();
+        assert_eq!(messages(&path)[0].1, "and the lines?");
     }
 
     #[test]
