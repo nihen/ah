@@ -34,6 +34,7 @@ sha2 = "0.10"
 unicode-width = "0.2.2"
 clap_mangen = "0.2.33"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+ruzstd = "0.8.2"
 
 [profile.release]
 opt-level = 3

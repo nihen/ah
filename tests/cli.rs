@@ -884,7 +884,8 @@ fn ah_opencode(home: &Path) -> Command {
         .env("COPILOT_HOME", "/nonexistent")
         .env("CURSOR_DATA_DIR", "/nonexistent")
         .env("GROK_HOME", "/nonexistent")
-        .env("PI_CODING_AGENT_DIR", "/nonexistent");
+        .env("PI_CODING_AGENT_DIR", "/nonexistent")
+        .env("DSH_HOME", "/nonexistent");
     cmd
 }
 
@@ -2316,6 +2317,7 @@ fn memory_lists_each_agents_instruction_rule_and_memory_files() {
             "CURSOR_DATA_DIR",
             "GROK_HOME",
             "PI_CODING_AGENT_DIR",
+            "DSH_HOME",
             "PI_CODING_AGENT_SESSION_DIR",
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
@@ -2396,6 +2398,7 @@ fn memory_cmd(home: &Path, cwd: &Path) -> Command {
         "CURSOR_DATA_DIR",
         "GROK_HOME",
         "PI_CODING_AGENT_DIR",
+        "DSH_HOME",
         "PI_CODING_AGENT_SESSION_DIR",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
@@ -2988,5 +2991,96 @@ fn pi_sessions_are_listed_shown_and_resumed() {
         .stdout(format!(
             "cd '/srv/proj' && 'pi' '--session' '{}'\n",
             path.display()
+        ));
+}
+
+#[test]
+fn dsh_sessions_are_decoded_listed_and_shown() {
+    use ruzstd::encoding::{CompressionLevel, compress_to_vec};
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let dsh_home = home.join("dsh-home");
+    let frame = |lines: &[&str]| {
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        compress_to_vec(text.as_bytes(), CompressionLevel::Fastest)
+    };
+    let write = |id: &str, frames: Vec<Vec<u8>>| {
+        let dir = dsh_home.join("sessions/--srv-proj--").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("session.v4.jsonl.zstd"), frames.concat()).unwrap();
+    };
+    write(
+        "session-0192",
+        vec![
+            frame(&[
+                r#"{"type":"session","version":4,"id":"session-0192","createdAt":1795258135225,"cwd":"/srv/proj","isSeeded":false,"delegationDepth":0}"#,
+            ]),
+            frame(&[
+                r#"{"type":"user/message","seq":9,"time":1795258135280,"data":{"content":[{"type":"text","text":"fix the parser"}],"source":{"kind":"user"},"role":"user"}}"#,
+                r#"{"type":"session/title","seq":16,"time":1795258136283,"data":{"title":"Parser Fix"}}"#,
+                r#"{"type":"assistant/message","seq":17,"time":1795258136412,"data":{"message":{"role":"assistant","content":[{"type":"tool-call","id":"c1","name":"bash","arguments":"{\"command\":\"cargo test\"}"},{"type":"text","text":"fixed it"}],"source":{"kind":"model","model":"some-model"}}}}"#,
+            ]),
+        ],
+    );
+    write(
+        "0192-child",
+        vec![frame(&[
+            r#"{"type":"session","version":4,"id":"0192-child","createdAt":1795258444078,"cwd":"/srv/proj","parentSession":"session-0192","isSeeded":false,"origin":"subagent","delegationDepth":1}"#,
+            r#"{"type":"user/message","seq":9,"time":1795258444100,"data":{"content":[{"type":"text","text":"run the tests"}],"source":{"kind":"user"},"role":"user"}}"#,
+        ])],
+    );
+    let ah_dsh = || {
+        let mut cmd = ah_opencode(&home);
+        cmd.env("DSH_HOME", &dsh_home);
+        cmd
+    };
+
+    ah_dsh()
+        .args([
+            "log",
+            "-a",
+            "-o",
+            "agent,id,project,cwd,title,model,turns,prompt_times,resume_cmd",
+        ])
+        .assert()
+        .success()
+        .stdout("dsh\tsession-0192\tproj\t/srv/proj\tParser Fix\tsome-model\t1\t[1795258135]\t\n");
+    ah_dsh()
+        .args([
+            "log",
+            "-a",
+            "--subagents",
+            "-o",
+            "id,parent_id",
+            "-S",
+            "id",
+            "--asc",
+        ])
+        .assert()
+        .success()
+        .stdout("0192-child\tsession-0192\nsession-0192\t\n");
+    // Full-text and prompt-only search read the decoded log.
+    ah_dsh()
+        .args(["log", "-a", "-q", "cargo test", "-o", "id"])
+        .assert()
+        .success()
+        .stdout("session-0192\n");
+    ah_dsh()
+        .args(["log", "-a", "-p", "-q", "parser", "-o", "id"])
+        .assert()
+        .success()
+        .stdout("session-0192\n");
+    ah_dsh()
+        .args(["show", "session-0192"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fix the parser"))
+        .stdout(predicate::str::contains("fixed it"));
+    ah_dsh()
+        .args(["show", "--raw", "session-0192"])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with(
+            r#"{"type":"session","version":4"#,
         ));
 }

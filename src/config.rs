@@ -105,6 +105,10 @@ fn builtin_env_info(agent_id: &str) -> Option<BuiltinInfo> {
             env_var: "XDG_DATA_HOME",
             default_prefix: ".local/share",
         }),
+        "dsh" => Some(BuiltinInfo {
+            env_var: "DSH_HOME",
+            default_prefix: ".dsh",
+        }),
         "pi" => Some(BuiltinInfo {
             env_var: "PI_CODING_AGENT_DIR",
             default_prefix: ".pi/agent",
@@ -623,7 +627,7 @@ mod tests {
         // Without ~/.ahrc, should return built-in defaults
         let home = PathBuf::from("/nonexistent/home");
         let (agents, remotes) = load_config(&home);
-        assert_eq!(agents.len(), 9);
+        assert_eq!(agents.len(), 10);
         assert_eq!(agents[0].id, "claude");
         assert_eq!(agents[1].id, "codex");
         assert!(!agents[0].disabled);

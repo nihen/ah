@@ -4,6 +4,7 @@ mod codex;
 pub(crate) mod common;
 mod copilot;
 mod cursor;
+mod dsh;
 pub(crate) mod entries;
 mod gemini;
 mod grok;
@@ -425,7 +426,7 @@ impl AgentPlugin for UnknownPlugin {
 }
 
 static UNKNOWN_PLUGIN: UnknownPlugin = UnknownPlugin;
-static PLUGINS: [&'static dyn AgentPlugin; 9] = [
+static PLUGINS: [&'static dyn AgentPlugin; 10] = [
     &claude::PLUGIN,
     &codex::PLUGIN,
     &gemini::PLUGIN,
@@ -435,6 +436,7 @@ static PLUGINS: [&'static dyn AgentPlugin; 9] = [
     &grok::PLUGIN,
     &opencode::PLUGIN,
     &pi::PLUGIN,
+    &dsh::PLUGIN,
 ];
 
 pub fn all_plugins() -> &'static [&'static dyn AgentPlugin] {
@@ -483,6 +485,7 @@ mod tests {
         assert_eq!(find_plugin("grok").unwrap().id(), "grok");
         assert_eq!(find_plugin("opencode").unwrap().id(), "opencode");
         assert_eq!(find_plugin("pi").unwrap().id(), "pi");
+        assert_eq!(find_plugin("dsh").unwrap().id(), "dsh");
         assert!(find_plugin("foobar").is_none());
     }
 
@@ -549,6 +552,13 @@ mod tests {
             ))
             .id(),
             "pi"
+        );
+        assert_eq!(
+            find_plugin_for_path(Path::new(
+                "/home/user/.dsh/sessions/--home-user-proj--/session-0192/session.v4.jsonl.zstd"
+            ))
+            .id(),
+            "dsh"
         );
         assert_eq!(
             find_plugin_for_path(Path::new("/tmp/random.txt")).id(),
