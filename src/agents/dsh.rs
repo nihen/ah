@@ -30,19 +30,22 @@ fn is_compressed(path: &Path) -> bool {
 /// Largest log that is decoded. A log is a few megabytes; the limit keeps a
 /// damaged or hostile file from exhausting memory.
 const MAX_LOG_BYTES: u64 = 1 << 30;
+/// Largest header line that is decoded; a header is a few hundred bytes.
+const MAX_HEADER_BYTES: u64 = 1 << 20;
 
-/// Decode the Zstandard frames of `data`, at most `max_frames` of them.
-/// A frame that cannot be decoded ends the log, and the frames before it
-/// are returned: a write that was cut short, a checksum that does not
-/// match, or a frame that would take the log past `MAX_LOG_BYTES`.
-fn decode_frames(mut data: &[u8], max_frames: usize) -> Vec<u8> {
+/// Decode the Zstandard frames of `data`, at most `max_frames` of them and
+/// `max_bytes` of text. A frame that cannot be decoded ends the log, and
+/// the frames before it are returned: a write that was cut short, a
+/// checksum that does not match, or a frame that would take the text past
+/// `max_bytes`.
+fn decode_frames(mut data: &[u8], max_frames: usize, max_bytes: u64) -> Vec<u8> {
     let mut out = Vec::new();
     for _ in 0..max_frames {
         if data.is_empty() {
             break;
         }
         let complete = out.len();
-        let room = MAX_LOG_BYTES - complete as u64;
+        let room = max_bytes - complete as u64;
         let decoded = zstd::stream::read::Decoder::with_buffer(&mut data)
             .ok()
             .and_then(|frame| {
@@ -130,7 +133,7 @@ fn read_log(path: &Path) -> Option<Log> {
     if let Some(bytes) = cached {
         return Some(Log::Decoded(bytes));
     }
-    let bytes = Rc::new(decode_frames(&mmap_file(path)?, usize::MAX));
+    let bytes = Rc::new(decode_frames(&mmap_file(path)?, usize::MAX, MAX_LOG_BYTES));
     LAST_DECODED.with_borrow_mut(|last| *last = Some((source, Rc::clone(&bytes))));
     Some(Log::Decoded(bytes))
 }
@@ -140,7 +143,7 @@ fn read_header(path: &Path) -> Option<serde_json::Value> {
     let data = mmap_file(path)?;
     let decoded;
     let text: &[u8] = if is_compressed(path) {
-        decoded = decode_frames(&data, 1);
+        decoded = decode_frames(&data, 1, MAX_HEADER_BYTES);
         &decoded
     } else {
         &data
@@ -629,6 +632,23 @@ mod tests {
         bytes.extend_from_slice(&damaged);
         let (_tmp, path) = write_log("session.v4.jsonl.zstd", &bytes);
         assert_eq!(messages(&path).len(), 2);
+    }
+
+    #[test]
+    fn a_frame_past_the_size_limit_ends_the_log() {
+        let bytes = compressed();
+        let header_len = HEADER.len() as u64 + 1;
+        let turn_1_len: u64 = TURN_1.iter().map(|line| line.len() as u64 + 1).sum();
+        let lines = |limit| {
+            let text = decode_frames(&bytes, usize::MAX, limit);
+            text.split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+                .count()
+        };
+        assert_eq!(lines(header_len + turn_1_len), 1 + TURN_1.len());
+        // One byte short of the second frame: only the header is kept.
+        assert_eq!(lines(header_len + turn_1_len - 1), 1);
+        assert_eq!(lines(header_len - 1), 0);
     }
 
     #[test]
