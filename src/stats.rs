@@ -401,7 +401,7 @@ const ASCII: Glyphs = Glyphs {
 
 /// 256-color code of each built-in agent. An agent keeps its color on every
 /// user's screen, so shared screens can be compared at a glance.
-const AGENT_COLORS: [(&str, u8); 8] = [
+const AGENT_COLORS: [(&str, u8); 9] = [
     ("claude", 209),
     ("codex", 36),
     ("copilot", 99),
@@ -410,6 +410,7 @@ const AGENT_COLORS: [(&str, u8); 8] = [
     ("agy", 213),
     ("grok", 255),
     ("opencode", 220),
+    ("pi", 155),
 ];
 /// Colors for other agents (custom ones in `~/.ahrc`), handed out in the
 /// order of their share and reused when they run out.

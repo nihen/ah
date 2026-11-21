@@ -883,7 +883,8 @@ fn ah_opencode(home: &Path) -> Command {
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
         .env("CURSOR_DATA_DIR", "/nonexistent")
-        .env("GROK_HOME", "/nonexistent");
+        .env("GROK_HOME", "/nonexistent")
+        .env("PI_CODING_AGENT_DIR", "/nonexistent");
     cmd
 }
 
@@ -2314,6 +2315,8 @@ fn memory_lists_each_agents_instruction_rule_and_memory_files() {
             "COPILOT_HOME",
             "CURSOR_DATA_DIR",
             "GROK_HOME",
+            "PI_CODING_AGENT_DIR",
+            "PI_CODING_AGENT_SESSION_DIR",
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
         ] {
@@ -2392,6 +2395,8 @@ fn memory_cmd(home: &Path, cwd: &Path) -> Command {
         "COPILOT_HOME",
         "CURSOR_DATA_DIR",
         "GROK_HOME",
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
     ] {
@@ -2874,4 +2879,114 @@ fn occurrence_search_reads_opencode_virtual_sessions() {
         hits.iter()
             .all(|h| h["agent"] == "opencode" && h["id"] == "ses_oc1")
     );
+}
+
+#[test]
+fn pi_sessions_are_listed_shown_and_resumed() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let agent_dir = home.join("pi-agent");
+    let dir = agent_dir.join("sessions/--srv-proj--");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("2026-11-21T10-43-51-669Z_0192-pi.jsonl");
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"session","version":3,"id":"0192-pi","timestamp":"2026-11-21T10:43:51.669Z","cwd":"/srv/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-11-21T10:43:52.000Z","message":{"role":"user","content":[{"type":"text","text":"fix the parser"}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-11-21T10:43:53.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"cargo test"}},{"type":"text","text":"fixed it"}],"model":"some-model"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let ah_pi = || {
+        let mut cmd = ah_opencode(&home);
+        cmd.env("PI_CODING_AGENT_DIR", &agent_dir);
+        cmd
+    };
+
+    ah_pi()
+        .args([
+            "log",
+            "-a",
+            "-o",
+            "agent,id,project,cwd,title,model,turns,prompt_times",
+        ])
+        .assert()
+        .success()
+        .stdout("pi\t0192-pi\tproj\t/srv/proj\tfix the parser\tsome-model\t1\t[1795257832]\n");
+    // Tool calls are searched, and the session is found by id.
+    ah_pi()
+        .args(["log", "-a", "-q", "cargo test", "-o", "id"])
+        .assert()
+        .success()
+        .stdout("0192-pi\n");
+    ah_pi()
+        .args(["show", "0192-pi"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fix the parser"))
+        .stdout(predicate::str::contains("fixed it"));
+    // PI_CODING_AGENT_SESSION_DIR holds session files directly, under any name.
+    // The directory name is taken literally.
+    let session_dir = home.join("[pi]-sessions");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(
+        session_dir.join("my_session.jsonl"),
+        concat!(
+            r#"{"type":"session","version":3,"id":"0192-elsewhere","timestamp":"2026-11-21T11:00:00.000Z","cwd":"/srv/other"}"#,
+            "\n",
+            r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-11-21T11:00:01.000Z","message":{"role":"user","content":"kept elsewhere"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    ah_pi()
+        .env("PI_CODING_AGENT_SESSION_DIR", &session_dir)
+        .args(["log", "-a", "-o", "agent,id,title", "-S", "id", "--asc"])
+        .assert()
+        .success()
+        .stdout("pi\t0192-elsewhere\tkept elsewhere\npi\t0192-pi\tfix the parser\n");
+    ah_pi()
+        .env("PI_CODING_AGENT_SESSION_DIR", &session_dir)
+        .args(["show", "0192-elsewhere"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("kept elsewhere"));
+
+    // A relative value is resolved against the current directory, as Pi does.
+    ah_pi()
+        .current_dir(&home)
+        .env("PI_CODING_AGENT_SESSION_DIR", ".//[pi]-sessions/")
+        .args(["log", "-a", "-o", "id", "-S", "id", "--asc"])
+        .assert()
+        .success()
+        .stdout("0192-elsewhere\n0192-pi\n");
+    // Pointing it into another agent's directory does not claim that
+    // agent's sessions.
+    let claude_project = home.join(".claude/projects/-srv-proj");
+    fs::create_dir_all(&claude_project).unwrap();
+    fs::write(
+        claude_project.join("0192-claude.jsonl"),
+        "{\"type\":\"user\",\"cwd\":\"/srv/proj\",\"message\":{\"content\":\"hello claude\"}}\n",
+    )
+    .unwrap();
+    ah_pi()
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env("PI_CODING_AGENT_SESSION_DIR", &claude_project)
+        .args(["log", "-a", "-o", "agent,id", "-S", "id", "--asc"])
+        .assert()
+        .success()
+        .stdout("claude\t0192-claude\npi\t0192-pi\n");
+
+    ah_pi()
+        .args(["resume", "--print", "0192-pi"])
+        .assert()
+        .success()
+        .stdout(format!(
+            "cd '/srv/proj' && 'pi' '--session' '{}'\n",
+            path.display()
+        ));
 }
