@@ -8,6 +8,7 @@ pub(crate) mod entries;
 mod gemini;
 mod grok;
 mod opencode;
+mod pi;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -424,7 +425,7 @@ impl AgentPlugin for UnknownPlugin {
 }
 
 static UNKNOWN_PLUGIN: UnknownPlugin = UnknownPlugin;
-static PLUGINS: [&'static dyn AgentPlugin; 8] = [
+static PLUGINS: [&'static dyn AgentPlugin; 9] = [
     &claude::PLUGIN,
     &codex::PLUGIN,
     &gemini::PLUGIN,
@@ -433,6 +434,7 @@ static PLUGINS: [&'static dyn AgentPlugin; 8] = [
     &agy::PLUGIN,
     &grok::PLUGIN,
     &opencode::PLUGIN,
+    &pi::PLUGIN,
 ];
 
 pub fn all_plugins() -> &'static [&'static dyn AgentPlugin] {
@@ -480,6 +482,7 @@ mod tests {
         assert_eq!(find_plugin("agy").unwrap().id(), "agy");
         assert_eq!(find_plugin("grok").unwrap().id(), "grok");
         assert_eq!(find_plugin("opencode").unwrap().id(), "opencode");
+        assert_eq!(find_plugin("pi").unwrap().id(), "pi");
         assert!(find_plugin("foobar").is_none());
     }
 
@@ -540,6 +543,13 @@ mod tests {
             .unwrap()
             .join("opencode/opencode.db/ses_abc");
         assert_eq!(find_plugin_for_path(&opencode_db).id(), "opencode");
+        assert_eq!(
+            find_plugin_for_path(Path::new(
+                "/home/user/.pi/agent/sessions/--home-user-proj--/2026-11-21T10-43-51-669Z_0192-aaaa.jsonl"
+            ))
+            .id(),
+            "pi"
+        );
         assert_eq!(
             find_plugin_for_path(Path::new("/tmp/random.txt")).id(),
             "unknown"

@@ -6,7 +6,7 @@ expression: readme
 
 **A**gent **H**istory — search, inspect, and resume coding-agent sessions from a single CLI.
 
-`ah` discovers session files from [Claude Code](https://claude.ai/), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Cursor](https://cursor.com/), [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli), [Antigravity CLI](https://antigravity.google/) (`agy`), [Grok CLI](https://x.ai/) (`grok`), and [opencode](https://opencode.ai/) (`opencode`). It works with zero config, defaults to the current directory, and gives you one place to search, inspect, and resume past work.
+`ah` discovers session files from [Claude Code](https://claude.ai/), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Cursor](https://cursor.com/), [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli), [Antigravity CLI](https://antigravity.google/) (`agy`), [Grok CLI](https://x.ai/) (`grok`), [opencode](https://opencode.ai/) (`opencode`), and [Pi](https://github.com/earendil-works/pi) (`pi`). It works with zero config, defaults to the current directory, and gives you one place to search, inspect, and resume past work.
 
 Read-only by default. `ah` works directly on agent session files, lets you search and inspect them, and only executes when you explicitly run `resume`.
 
@@ -224,9 +224,10 @@ Files listed per agent (global paths honor each agent's env var; project paths a
 | Antigravity (agy) | `~/.gemini/config/rules/*.md` | `.agents/rules/*.md`, `.agent/rules/*.md` |
 | Grok | `~/.grok/AGENTS.md`, `rules/*.md`, `memory/MEMORY.md`, memory topics `memory-v2/{global,workspaces/*}/topics/*.md` | `.grok/rules/*.md` |
 | opencode | `~/.config/opencode/AGENTS.md`, `instructions` in `opencode.json(c)` | `instructions` in `opencode.json(c)` |
+| Pi | `~/.pi/agent/AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `SYSTEM.md`, `APPEND_SYSTEM.md` | `.pi/SYSTEM.md`, `.pi/APPEND_SYSTEM.md` |
 | shared | — | `AGENTS.md` |
 
-Types: `instruction` (always-loaded files), `rule`, `memory` (or the type in a memory file's frontmatter, such as `feedback`), and `skill`. Skills (`SKILL.md` under `skills/*/` of Claude, Codex, and agy, and `.agents/skills/*/`) are listed only with `-t skill`.
+Types: `instruction` (always-loaded files), `rule`, `memory` (or the type in a memory file's frontmatter, such as `feedback`), and `skill`. Skills (`SKILL.md` under `skills/*/` of Claude, Codex, and agy, anywhere under Pi's `skills/`, and `.agents/skills/*/`) are listed only with `-t skill`.
 
 Show session summary per agent:
 
@@ -296,6 +297,7 @@ A prompt counts on the local day it was sent, and a session counts when it has a
 | Antigravity (agy) | ✓ | ✓ | ✓ | ✓ | | ✓ | |
 | Grok | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | opencode | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
+| Pi | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
 
 Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.json` (checking `procStart` so a reused PID is not reported), Grok's `active_sessions.json`, Copilot's `session-state/<id>/inuse.<pid>.lock`, and Codex's `thread-writer-locks/<id>.lock`. ¹ Codex is detected on Linux only, from the kernel lock table (`/proc/locks`); its PID is the lock holder, which for the interactive TUI is the Codex app-server. Running detection needs a PID liveness check, which is not implemented on Windows.
 
@@ -875,7 +877,7 @@ ah_path = "/usr/local/bin/ah"      # path to ah binary on remote (optional, defa
 |-------|----------|-------------|
 | `disabled` | No | Set to `true` to hide this agent from all commands |
 | `extra_patterns` | No | Additional glob patterns to scan (built-in agents only) |
-| `plugin` | Yes* | Parser to use: `claude`, `codex`, `gemini`, `copilot`, `cursor`, `agy`, `grok`, `opencode` (*required for custom agents) |
+| `plugin` | Yes* | Parser to use: `claude`, `codex`, `gemini`, `copilot`, `cursor`, `agy`, `grok`, `opencode`, `pi` (*required for custom agents) |
 | `file_patterns` | Yes* | Glob patterns for session files (*required for custom agents) |
 
 All glob patterns must start with `~/` or `/` (absolute paths only). `~` is expanded to the home directory.
@@ -904,7 +906,7 @@ plugin = "claude"
 file_patterns = ["~/.mybot/sessions/*.jsonl"]
 ```
 
-The `plugin` field tells `ah` how to parse the session files. Available plugins: `claude`, `codex`, `gemini`, `copilot`, `cursor`, `agy`, `grok`, `opencode`.
+The `plugin` field tells `ah` how to parse the session files. Available plugins: `claude`, `codex`, `gemini`, `copilot`, `cursor`, `agy`, `grok`, `opencode`, `pi`.
 
 ### Remote hosts
 
@@ -946,6 +948,7 @@ Each built-in agent respects the environment variable its CLI uses to relocate s
 | Antigravity (agy) | `antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl` | — | `~/.gemini` |
 | Grok    | `sessions/*/*/chat_history.jsonl` | `GROK_HOME`        | `~/.grok`   |
 | opencode | `opencode/opencode*.db` (SQLite) | `XDG_DATA_HOME` | `~/.local/share` |
+| Pi | `sessions/*/*.jsonl` | `PI_CODING_AGENT_DIR` | `~/.pi/agent` |
 
 opencode stores all sessions in one SQLite database. `ah` reads it read-only and lists each session under the virtual path `<db>/<session-id>`, which works with `ah show`, `ah resume`, and `-o path` like a regular session file. `ah show --raw` prints one JSON line per message with its parts.
 

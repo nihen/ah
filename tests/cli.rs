@@ -883,7 +883,8 @@ fn ah_opencode(home: &Path) -> Command {
         .env("GEMINI_CLI_HOME", "/nonexistent")
         .env("COPILOT_HOME", "/nonexistent")
         .env("CURSOR_DATA_DIR", "/nonexistent")
-        .env("GROK_HOME", "/nonexistent");
+        .env("GROK_HOME", "/nonexistent")
+        .env("PI_CODING_AGENT_DIR", "/nonexistent");
     cmd
 }
 
@@ -2314,6 +2315,7 @@ fn memory_lists_each_agents_instruction_rule_and_memory_files() {
             "COPILOT_HOME",
             "CURSOR_DATA_DIR",
             "GROK_HOME",
+            "PI_CODING_AGENT_DIR",
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
         ] {
@@ -2392,6 +2394,7 @@ fn memory_cmd(home: &Path, cwd: &Path) -> Command {
         "COPILOT_HOME",
         "CURSOR_DATA_DIR",
         "GROK_HOME",
+        "PI_CODING_AGENT_DIR",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
     ] {
@@ -2874,4 +2877,62 @@ fn occurrence_search_reads_opencode_virtual_sessions() {
         hits.iter()
             .all(|h| h["agent"] == "opencode" && h["id"] == "ses_oc1")
     );
+}
+
+#[test]
+fn pi_sessions_are_listed_shown_and_resumed() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let agent_dir = home.join("pi-agent");
+    let dir = agent_dir.join("sessions/--srv-proj--");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("2026-11-21T10-43-51-669Z_0192-pi.jsonl");
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"session","version":3,"id":"0192-pi","timestamp":"2026-11-21T10:43:51.669Z","cwd":"/srv/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-11-21T10:43:52.000Z","message":{"role":"user","content":[{"type":"text","text":"fix the parser"}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-11-21T10:43:53.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"cargo test"}},{"type":"text","text":"fixed it"}],"model":"some-model"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let ah_pi = || {
+        let mut cmd = ah_opencode(&home);
+        cmd.env("PI_CODING_AGENT_DIR", &agent_dir);
+        cmd
+    };
+
+    ah_pi()
+        .args([
+            "log",
+            "-a",
+            "-o",
+            "agent,id,project,cwd,title,model,turns,prompt_times",
+        ])
+        .assert()
+        .success()
+        .stdout("pi\t0192-pi\tproj\t/srv/proj\tfix the parser\tsome-model\t1\t[1795257832]\n");
+    // Tool calls are searched, and the session is found by id.
+    ah_pi()
+        .args(["log", "-a", "-q", "cargo test", "-o", "id"])
+        .assert()
+        .success()
+        .stdout("0192-pi\n");
+    ah_pi()
+        .args(["show", "0192-pi"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fix the parser"))
+        .stdout(predicate::str::contains("fixed it"));
+    ah_pi()
+        .args(["resume", "--print", "0192-pi"])
+        .assert()
+        .success()
+        .stdout(format!(
+            "cd '/srv/proj' && 'pi' '--session' '{}'\n",
+            path.display()
+        ));
 }
