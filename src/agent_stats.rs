@@ -2,11 +2,13 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
+use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::agents::common::{canonical_home, format_mtime};
 use crate::cli::{self, Field};
 use crate::color::{self, BOLD, DIM, RESET};
+use crate::pipeline::{SessionCopy, unique_session_copies};
 use crate::{agents, collector, config, remote, resolver};
 
 /// Per-agent totals. `scope_*` count the sessions whose cwd equals the
@@ -24,7 +26,8 @@ pub struct AgentStat {
 
 /// Count local sessions per agent (sorted by agent id). `scope_dir` is the
 /// canonical directory whose sessions are counted separately; `None` skips
-/// that breakdown. Agents with no sessions are not listed.
+/// that breakdown. Agents with no sessions are not listed. Files that hold
+/// the same session count once, as in `ah log`.
 pub fn build_agent_stats(
     filter: &cli::FilterArgs,
     scope_dir: Option<&str>,
@@ -47,84 +50,119 @@ pub fn build_agent_stats(
         cwd_latest: Option<SystemTime>,
     }
 
-    let mut resolve_fields = Vec::new();
+    // Id and parent tell copies of one session apart from distinct sessions.
+    let mut resolve_fields = vec![Field::Id, Field::ParentId];
     if scope_dir.is_some() {
         resolve_fields.push(Field::Cwd);
     }
     if filter.project.is_some() {
         resolve_fields.push(Field::Project);
     }
-    let mut stats: BTreeMap<&str, AgentStats> = BTreeMap::new();
 
-    for (path, mtime) in &files {
-        if crate::cancel::checkpoint() {
-            break;
-        }
-        // Apply time filters
-        if let Some(ref since) = since {
-            if mtime < since {
-                continue;
+    struct Candidate<'a> {
+        path: &'a std::path::Path,
+        mtime: SystemTime,
+        agent: &'static str,
+        id: String,
+        parent_id: String,
+        in_cwd: bool,
+    }
+    let candidates: Vec<Candidate> = files
+        .par_iter()
+        .filter_map(|(path, mtime)| {
+            if crate::cancel::checkpoint() {
+                return None;
             }
-        }
-        if let Some(ref until) = until {
-            if mtime > until {
-                continue;
+            // Apply time filters
+            if since.is_some_and(|since| *mtime < since)
+                || until.is_some_and(|until| *mtime > until)
+            {
+                return None;
             }
-        }
 
-        let agent = config::find_agent_for_path(path);
-        let plugin = agent
-            .map(|a| a.plugin)
-            .unwrap_or_else(agents::unknown_plugin);
-        let id = agent.map(|a| a.id.as_str()).unwrap_or("unknown");
+            let agent = config::find_agent_for_path(path);
+            let plugin = agent
+                .map(|a| a.plugin)
+                .unwrap_or_else(agents::unknown_plugin);
+            let id = agent.map(|a| a.id.as_str()).unwrap_or("unknown");
 
-        // Apply --agent filter
-        if let Some(ref agent_filter) = filter.agent {
-            if id != agent_filter {
-                continue;
+            // Apply --agent filter
+            if filter.agent.as_ref().is_some_and(|f| id != f) {
+                return None;
             }
-        }
 
-        let fields = if resolve_fields.is_empty() {
-            BTreeMap::new()
-        } else {
-            resolver::resolve_fields(
+            let mut fields = resolver::resolve_fields(
                 path,
                 plugin,
                 *mtime,
                 &home,
                 &resolve_fields,
                 &Default::default(),
-            )
-        };
-        // Apply --project filter
-        if let Some(ref project_filter) = filter.project {
-            if fields
-                .get(&Field::Project)
-                .map(|v| v.as_str())
-                .unwrap_or("")
-                != project_filter
+            );
+            let field = |fields: &BTreeMap<Field, String>, f: Field| {
+                fields.get(&f).map(|v| v.as_str()).unwrap_or("").to_string()
+            };
+            // Apply --project filter
+            if filter
+                .project
+                .as_ref()
+                .is_some_and(|p| field(&fields, Field::Project) != *p)
             {
-                continue;
+                return None;
             }
-        }
-        let in_cwd =
-            scope_dir.is_some() && fields.get(&Field::Cwd).map(|v| v.as_str()).unwrap_or("") == cwd;
+            let in_cwd = scope_dir.is_some() && field(&fields, Field::Cwd) == cwd;
+            Some(Candidate {
+                path,
+                mtime: *mtime,
+                agent: id,
+                id: fields.remove(&Field::Id).unwrap_or_default(),
+                parent_id: fields.remove(&Field::ParentId).unwrap_or_default(),
+                in_cwd,
+            })
+        })
+        .collect();
+    // Like `ah log`, which filters by directory before collapsing copies:
+    // the directory's sessions are counted among the copies found there, so
+    // a copy elsewhere that ranks higher does not hide them.
+    let unique = |in_scope: bool| {
+        unique_session_copies(
+            candidates
+                .iter()
+                .filter(|c| !in_scope || c.in_cwd)
+                .map(|c| SessionCopy {
+                    path: c.path,
+                    mtime: c.mtime,
+                    id: &c.id,
+                    parent_id: &c.parent_id,
+                }),
+        )
+    };
+    let new_stats = || AgentStats {
+        total: 0,
+        latest: SystemTime::UNIX_EPOCH,
+        cwd_count: 0,
+        cwd_latest: None,
+    };
 
-        let entry = stats.entry(id).or_insert(AgentStats {
-            total: 0,
-            latest: SystemTime::UNIX_EPOCH,
-            cwd_count: 0,
-            cwd_latest: None,
-        });
+    let mut stats: BTreeMap<&str, AgentStats> = BTreeMap::new();
+    for (c, _) in candidates
+        .iter()
+        .zip(unique(false))
+        .filter(|(_, keep)| *keep)
+    {
+        let entry = stats.entry(c.agent).or_insert_with(new_stats);
         entry.total += 1;
-        if *mtime > entry.latest {
-            entry.latest = *mtime;
+        if c.mtime > entry.latest {
+            entry.latest = c.mtime;
         }
-        if in_cwd {
+    }
+    if scope_dir.is_some() {
+        let in_cwd = candidates.iter().filter(|c| c.in_cwd);
+        for (c, _) in in_cwd.zip(unique(true)).filter(|(_, keep)| *keep) {
+            let entry = stats.entry(c.agent).or_insert_with(new_stats);
             entry.cwd_count += 1;
-            if entry.cwd_latest.is_none_or(|t| *mtime > t) {
-                entry.cwd_latest = Some(*mtime);
+            if entry.cwd_latest.is_none_or(|t| c.mtime > t) {
+                entry.cwd_latest = Some(c.mtime);
             }
         }
     }

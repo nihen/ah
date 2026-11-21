@@ -2,9 +2,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use rayon::prelude::*;
+
 use crate::agents;
 use crate::cli::{Field, FieldFilter, SearchMode, SortOrder};
 use crate::collector;
+use crate::config;
 use crate::pipeline;
 use crate::resolver;
 
@@ -293,6 +296,17 @@ fn read_first_field(reader: &mut impl std::io::BufRead) -> std::io::Result<Stdin
 /// the raw value isn't a real file or session ID — that's the
 /// `ah ... -o path | ah show` round-trip path.
 pub fn resolve_session_ref(s: &str, home: &Path) -> Result<PathBuf, String> {
+    resolve_session_ref_of(s, home, None)
+}
+
+/// `resolve_session_ref`, with id lookups limited to sessions of `agent`
+/// (`--agent`): the way to pick one when agents share a session id. A path
+/// names its session whatever the agent.
+pub fn resolve_session_ref_of(
+    s: &str,
+    home: &Path,
+    agent: Option<&str>,
+) -> Result<PathBuf, String> {
     let s = strip_ltsv_prefix(s);
 
     // Try as file path
@@ -320,13 +334,13 @@ pub fn resolve_session_ref(s: &str, home: &Path) -> Result<PathBuf, String> {
         if session_exists(&pb) {
             return Ok(pb);
         }
-        if let Ok(p) = resolve_by_id(&unescaped, home) {
+        if let Ok(p) = resolve_by_id(&unescaped, home, agent) {
             return Ok(p);
         }
     }
 
     // Try as session ID (use unquoted value)
-    resolve_by_id(unquoted, home)
+    resolve_by_id(unquoted, home, agent)
 }
 
 /// A session reference exists as a file, or as a virtual session of a plugin
@@ -338,7 +352,7 @@ fn session_exists(path: &Path) -> bool {
             .is_some()
 }
 
-fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
+fn resolve_by_id(id: &str, home: &Path, agent: Option<&str>) -> Result<PathBuf, String> {
     // Several files can hold one session (e.g. a Gemini log migrated from
     // .json to .jsonl); pick the copy `ah log` lists. Explicit references
     // also reach archived sessions.
@@ -346,75 +360,105 @@ fn resolve_by_id(id: &str, home: &Path) -> Result<PathBuf, String> {
     let resolve_fields = [Field::Id];
     let opts = resolver::ResolveOpts::default();
 
-    // Preferred file per session: exact id matches, then id-prefix matches,
-    // each keyed by (id, parent id). One id under several parents (e.g.
-    // subagent transcripts of different sessions) is ambiguous.
-    let mut exact: HashMap<String, (PathBuf, SystemTime)> = HashMap::new();
-    let mut prefix_matches: HashMap<(String, String), (PathBuf, SystemTime)> = HashMap::new();
-    let better = |a: &PathBuf, a_mtime: SystemTime, b: &PathBuf, b_mtime: SystemTime| {
-        pipeline::copy_preference(a, a_mtime) > pipeline::copy_preference(b, b_mtime)
-    };
-
-    for (fpath, mtime) in &files {
-        if crate::cancel::checkpoint() {
-            return Err(format!("Cancelled while resolving session id: {}", id));
-        }
-        let plugin = agents::find_plugin_for_path(fpath);
-        let fields = resolver::resolve_fields(fpath, plugin, *mtime, home, &resolve_fields, &opts);
-        let Some(v) = fields.get(&Field::Id) else {
-            continue;
-        };
-        if !v.starts_with(id) {
-            continue;
-        }
-        let parent = plugin.parent_session_id(fpath).unwrap_or_default();
-        // Files come newest first (ties by path, like `copy_preference`), so
-        // the first dedicated file of a top-level session is the preferred
-        // copy. Only subagent ids, which may repeat under other parents, and
-        // secondary records keep looking.
-        if v == id && parent.is_empty() && !plugin.is_secondary_record(fpath) {
-            return Ok(fpath.clone());
-        }
-        let candidates = if v == id {
-            exact.entry(parent)
-        } else if v.starts_with(id) {
-            match prefix_matches.entry((v.clone(), parent)) {
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if better(fpath, *mtime, &e.get().0, e.get().1) {
-                        e.insert((fpath.clone(), *mtime));
-                    }
-                    continue;
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((fpath.clone(), *mtime));
-                    continue;
-                }
-            }
-        } else {
-            continue;
-        };
-        match candidates {
+    // Preferred file per session, as `ah log` tells sessions apart: by
+    // agent, id and parent id. Exact id matches win over id-prefix matches.
+    type Copy = (PathBuf, SystemTime);
+    let mut exact: HashMap<(&str, String), Copy> = HashMap::new();
+    let mut prefix_matches: HashMap<(String, &str, String), Copy> = HashMap::new();
+    fn keep_better<K: std::hash::Hash + Eq>(
+        map: &mut HashMap<K, Copy>,
+        key: K,
+        path: &Path,
+        mtime: SystemTime,
+    ) {
+        match map.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                if better(fpath, *mtime, &e.get().0, e.get().1) {
-                    e.insert((fpath.clone(), *mtime));
+                if pipeline::copy_preference(path, mtime)
+                    > pipeline::copy_preference(&e.get().0, e.get().1)
+                {
+                    e.insert((path.to_path_buf(), mtime));
                 }
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert((fpath.clone(), *mtime));
+                e.insert((path.to_path_buf(), mtime));
             }
         }
     }
 
-    let mut exact = exact.into_values();
-    match (exact.next(), exact.next()) {
-        (Some((path, _)), None) => return Ok(path),
-        (Some(_), Some(_)) => {
+    // Every file is checked (a newer session of another agent may share the
+    // id), so the id resolution runs in parallel.
+    let candidates: Vec<(&PathBuf, SystemTime, &str, String, String)> = files
+        .par_iter()
+        .filter_map(|(fpath, mtime)| {
+            if crate::cancel::checkpoint() {
+                return None;
+            }
+            let agent_def = config::find_agent_for_path(fpath);
+            let agent_id = agent_def.map(|a| a.id.as_str()).unwrap_or("");
+            if agent.is_some_and(|wanted| wanted != agent_id) {
+                return None;
+            }
+            let plugin = agent_def
+                .map(|a| a.plugin)
+                .unwrap_or_else(agents::unknown_plugin);
+            let mut fields =
+                resolver::resolve_fields(fpath, plugin, *mtime, home, &resolve_fields, &opts);
+            let v = fields.remove(&Field::Id).filter(|v| v.starts_with(id))?;
+            let parent = plugin.parent_session_id(fpath).unwrap_or_default();
+            Some((fpath, *mtime, agent_id, v, parent))
+        })
+        .collect();
+    if crate::cancel::checkpoint() {
+        return Err(format!("Cancelled while resolving session id: {}", id));
+    }
+    for (fpath, mtime, agent_id, v, parent) in candidates {
+        if v == id {
+            keep_better(&mut exact, (agent_id, parent), fpath, mtime);
+        } else {
+            keep_better(&mut prefix_matches, (v, agent_id, parent), fpath, mtime);
+        }
+    }
+
+    // A top-level session wins over subagent transcripts that repeat its
+    // id, unless only a secondary record of it is left.
+    let top_level: Vec<(&str, &Copy)> = exact
+        .iter()
+        .filter(|((_, parent), _)| parent.is_empty())
+        .map(|((agent, _), copy)| (*agent, copy))
+        .collect();
+    let ambiguous_agents = |agents: Vec<&str>| {
+        let mut agents: Vec<&str> = agents.into_iter().filter(|a| !a.is_empty()).collect();
+        agents.sort_unstable();
+        agents.dedup();
+        format!(
+            "Ambiguous session id: {} (sessions of {}; pass --agent or the path instead)",
+            id,
+            agents.join(", ")
+        )
+    };
+    match top_level.as_slice() {
+        [(_, (path, _))]
+            if exact.len() == 1
+                || !agents::find_plugin_for_path(path).is_secondary_record(path) =>
+        {
+            return Ok(path.clone());
+        }
+        [_, _, ..] => {
+            return Err(ambiguous_agents(
+                top_level.iter().map(|(a, _)| *a).collect(),
+            ));
+        }
+        _ => {}
+    }
+    match exact.len() {
+        0 => {}
+        1 => return Ok(exact.into_values().next().unwrap().0),
+        _ => {
             return Err(format!(
                 "Ambiguous session id: {} (several sessions; pass the path instead)",
                 id
             ));
         }
-        (None, _) => {}
     }
     let mut matches = prefix_matches.into_values();
     match (matches.next(), matches.next()) {

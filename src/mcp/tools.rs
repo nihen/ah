@@ -186,6 +186,7 @@ pub fn definitions() -> Vec<Value> {
             "description": "Read one session: the whole conversation as Markdown or JSON messages, or, with at, the source records around a search hit (tool input/output included).",
             "inputSchema": schema(&[], vec![
                 ("session", json!({"type": "string", "description": "Session id (or unique prefix) or session file path, as returned by log/search"})),
+                ("agent", json!({"type": "string", "description": "Agent of the session; needed only when sessions of several agents share the id"})),
                 ("format", json!({"type": "string", "enum": ["md", "json"], "description": "md (default): Markdown transcript; json: [{role, text}] messages"})),
                 ("head", json!({"type": "integer", "minimum": 0, "description": "Only the first N messages (0 = all)"})),
                 ("at", json!({"type": "string", "description": "A position from search; returns the records around it instead of the transcript"})),
@@ -572,8 +573,17 @@ const HEAD_ADVICE: &str = "use head or a larger max_chars";
 const AT_ADVICE: &str = "use a smaller context or a larger max_chars";
 
 fn tool_show(p: &Params<'_>) -> Result<ToolOutput, String> {
-    p.check_allowed(&["session", "format", "head", "at", "context", "max_chars"])?;
+    p.check_allowed(&[
+        "session",
+        "agent",
+        "format",
+        "head",
+        "at",
+        "context",
+        "max_chars",
+    ])?;
     let session = p.required_string("session")?;
+    let agent = p.string("agent")?.filter(|s| !s.is_empty());
     let format = p.string("format")?.unwrap_or_else(|| "md".into());
     if format != "md" && format != "json" {
         return Err(format!("'format' must be md or json, got '{}'", format));
@@ -596,7 +606,7 @@ fn tool_show(p: &Params<'_>) -> Result<ToolOutput, String> {
     // Explicit references reach archived and subagent sessions too.
     collector::init_exclude_archived(false);
     collector::init_include_subagents(true);
-    let path = subcmd::resolve_session_ref(&session, &home)?;
+    let path = subcmd::resolve_session_ref_of(&session, &home, agent.as_deref())?;
     let plugin = agents::find_plugin_for_path(&path);
     let mtime = plugin
         .session_mtime(&path)

@@ -467,6 +467,11 @@ pub fn exec_remote_show(
     if filter.raw_search {
         ah_args.push("--raw-search".to_string());
     }
+    // Picks one session when agents on the remote share the id.
+    if let Some(agent) = filter.agent.as_deref() {
+        ah_args.push("--agent".to_string());
+        ah_args.push(agent.to_string());
+    }
     if let Some(at) = &args.at {
         ah_args.push(format!("--at={at}"));
         if let Some(context) = args.context {
@@ -528,6 +533,11 @@ pub fn run_remote_show_meta(
     }
     if filter.raw_search {
         ah_args.push("--raw-search".to_string());
+    }
+    // Picks one session when agents on the remote share the id.
+    if let Some(agent) = filter.agent.as_deref() {
+        ah_args.push("--agent".to_string());
+        ah_args.push(agent.to_string());
     }
     ah_args.push("--no-color".to_string());
     ah_args.push("--no-pager".to_string());
@@ -667,6 +677,7 @@ pub fn exec_remote_resume(
     remote: &RemoteDef,
     remote_ref: &str,
     args: &crate::cli::ResumeArgs,
+    agent: Option<&str>,
 ) -> ! {
     // Forward the remote ref verbatim — see `exec_remote_show` for the
     // raw-first/decoded-fallback rationale (handled remote-side).
@@ -674,6 +685,11 @@ pub fn exec_remote_resume(
 
     if args.print {
         ah_args.push("--print".to_string());
+    }
+    // Picks one session when agents on the remote share the id.
+    if let Some(agent) = agent {
+        ah_args.push("--agent".to_string());
+        ah_args.push(agent.to_string());
     }
 
     ah_args.push(remote_ref.to_string());
@@ -692,6 +708,7 @@ pub fn format_remote_resume_command(
     remote: &RemoteDef,
     remote_ref: &str,
     extra_args: &[String],
+    agent: Option<&str>,
 ) -> String {
     let mut parts = vec![
         "ssh".to_string(),
@@ -700,8 +717,12 @@ pub fn format_remote_resume_command(
         shell_quote(&remote.host),
         shell_quote(&remote.ah_path),
         "resume".to_string(),
-        shell_quote(remote_ref),
     ];
+    if let Some(agent) = agent {
+        parts.push("--agent".to_string());
+        parts.push(shell_quote(agent));
+    }
+    parts.push(shell_quote(remote_ref));
     if !extra_args.is_empty() {
         parts.push("--".to_string());
         for a in extra_args {
