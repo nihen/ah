@@ -758,6 +758,20 @@ mod tests {
                 ],
             ),
         ));
+        cases.push((
+            "dsh",
+            write(
+                "session.v4.jsonl",
+                &[
+                    r#"{"type":"session","version":4,"id":"session-0192","createdAt":1795258135225,"cwd":"/srv/proj","isSeeded":false,"delegationDepth":0}"#,
+                    r#"{"type":"user/message","seq":9,"time":1795258135280,"data":{"content":[{"type":"text","text":"fix the auth \u4fee\u6b63"}],"source":{"kind":"user"},"role":"user"}}"#,
+                    r#"{"type":"user/message","seq":10,"time":1795258135281,"data":{"content":[{"type":"text","text":"injected-instructions"}],"source":{"kind":"runtime-context"},"role":"user"}}"#,
+                    r#"{"type":"assistant/message","seq":17,"time":1795258136412,"data":{"message":{"role":"assistant","content":[{"type":"tool-call","id":"call_id_d","name":"bash","arguments":"{\"command\":\"echo tool-arg-needle\"}"},{"type":"text","text":"the redis cache"}],"source":{"kind":"model","model":"m"}}}}"#,
+                    r#"{"type":"tool/result","seq":19,"time":1795258136420,"data":{"message":{"role":"tool","content":[{"type":"text","text":"tool-out-needle"}]}}}"#,
+                    r#"{"type":"assistant/message","seq":22,"time":1795258137568,"data":{"message":{"role":"assistant","content":[{"type":"text","text":"dark mode done"}],"source":{"kind":"model","model":"m"}}}}"#,
+                ],
+            ),
+        ));
         let agy = tmp.join("agy.jsonl");
         std::fs::write(
             &agy,

@@ -79,6 +79,7 @@ impl Home {
             .env("CURSOR_DATA_DIR", "/nonexistent")
             .env("GROK_HOME", "/nonexistent")
             .env("PI_CODING_AGENT_DIR", "/nonexistent")
+            .env("DSH_HOME", "/nonexistent")
             .env("XDG_DATA_HOME", "/nonexistent")
             .env_remove("AH_MCP_TEST_CHECKPOINT_DELAY_MS")
             .env_remove("AH_MCP_TEST_PANIC")
@@ -1049,7 +1050,7 @@ fn agent_and_list_agents_tools() {
             .contains(&json!("search"))
     );
     for id in [
-        "codex", "gemini", "copilot", "cursor", "agy", "grok", "opencode", "pi",
+        "codex", "gemini", "copilot", "cursor", "agy", "grok", "opencode", "pi", "dsh",
     ] {
         assert!(agents.iter().any(|a| a["id"] == json!(id)), "{id}");
     }
