@@ -112,6 +112,9 @@ pub enum Field {
     Model,
     Models,
     PromptTimes,
+    Origin,
+    Coverage,
+    Url,
 }
 
 impl Field {
@@ -143,6 +146,9 @@ impl Field {
             Field::Model => "model",
             Field::Models => "models",
             Field::PromptTimes => "prompt_times",
+            Field::Origin => "origin",
+            Field::Coverage => "coverage",
+            Field::Url => "url",
         }
     }
 
@@ -173,12 +179,15 @@ impl Field {
             Field::ParentId,
             Field::Model,
             Field::Models,
+            Field::Origin,
+            Field::Coverage,
+            Field::Url,
             Field::PromptTimes,
         ]
     }
 
     pub fn all_names() -> &'static str {
-        "agent, project, project_raw, modified_at, created_at, title, first_prompt, last_prompt, prompts, responses, messages, transcript, matched, path, cwd, id, resume_cmd, turns, size, running, pid, archived, parent_id, model, models, prompt_times"
+        "agent, project, project_raw, modified_at, created_at, title, first_prompt, last_prompt, prompts, responses, messages, transcript, matched, path, cwd, id, resume_cmd, turns, size, running, pid, archived, parent_id, model, models, prompt_times, origin, coverage, url"
     }
 
     pub fn description(&self) -> &'static str {
@@ -208,6 +217,9 @@ impl Field {
             Field::ParentId => "Id of the session that spawned this subagent session",
             Field::Model => "Model that answered last",
             Field::Models => "Models that answered, comma-separated in first-use order",
+            Field::Origin => "Session origin: local or cloud",
+            Field::Coverage => "Cloud transcript coverage (latest-turn for Codex Cloud)",
+            Field::Url => "Original URL of a Cloud session",
             Field::PromptTimes => {
                 "Times of the user prompts as JSON array (Unix seconds; null if not recorded)"
             }
@@ -244,6 +256,9 @@ impl Field {
             Field::Model => "claude-opus-5-5",
             Field::Models => "claude-sonnet-5-5,claude-opus-5-5",
             Field::PromptTimes => "[1774000000,1774000420]",
+            Field::Origin => "cloud",
+            Field::Coverage => "latest-turn",
+            Field::Url => "https://chatgpt.com/codex/tasks/task_e_...",
         }
     }
 
@@ -282,6 +297,9 @@ impl FromStr for Field {
             "parent_id" => Ok(Field::ParentId),
             "model" => Ok(Field::Model),
             "prompt_times" => Ok(Field::PromptTimes),
+            "origin" => Ok(Field::Origin),
+            "coverage" => Ok(Field::Coverage),
+            "url" => Ok(Field::Url),
             "models" => Ok(Field::Models),
             _ => Err(format!(
                 "unknown field '{}'. available: {}",
@@ -660,7 +678,7 @@ impl FilterArgs {
 }
 
 /// Common options shared by log and fuzzy.
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 pub struct CommonArgs {
     /// Select output fields (comma-separated, replaces defaults)
     #[arg(short = 'o', long = "fields")]
@@ -676,8 +694,15 @@ impl CommonArgs {
     }
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 pub struct SearchArgs {
+    /// Do not refresh experimental Codex Cloud history (opt-in: AH_CODEX_CLOUD=1)
+    #[arg(long)]
+    pub offline: bool,
+    /// Refresh the latest Codex Cloud page (requires AH_CODEX_CLOUD=1; up to 8 seconds)
+    #[arg(long, conflicts_with = "offline")]
+    pub refresh: bool,
+
     #[command(flatten)]
     pub common: CommonArgs,
 
@@ -757,6 +782,9 @@ pub enum ShowFormat {
 
 #[derive(Parser, Debug)]
 pub struct ShowArgs {
+    /// Do not refresh experimental Codex Cloud history (opt-in: AH_CODEX_CLOUD=1)
+    #[arg(long)]
+    pub offline: bool,
     /// Open a position returned by search (includes tool input/output)
     #[arg(long, conflicts_with_all = ["head", "follow", "raw", "tsv", "fields", "highlight"])]
     pub at: Option<String>,
@@ -812,6 +840,7 @@ impl ShowArgs {
         highlight: Option<String>,
     ) -> Self {
         ShowArgs {
+            offline: true,
             at: None,
             context: None,
             common: CommonArgs { fields: None },
@@ -2206,7 +2235,7 @@ mod tests {
 
     #[test]
     fn test_field_all_count() {
-        assert_eq!(Field::all().len(), 26);
+        assert_eq!(Field::all().len(), 29);
     }
 
     #[test]

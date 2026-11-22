@@ -535,6 +535,9 @@ pub fn active_agents() -> impl Iterator<Item = &'static AgentDef> {
 /// that disabling a specific agent (e.g. `agy` under `.gemini/antigravity-cli/`)
 /// does not make its files fall through to a less specific agent (`gemini`).
 pub fn find_agent_for_path(path: &Path) -> Option<&'static AgentDef> {
+    if crate::cloud::is_cache_path(path) {
+        return active_agents().find(|a| a.id == "codex");
+    }
     best_agent_for_path(agents(), path)
 }
 

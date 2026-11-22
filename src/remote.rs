@@ -142,28 +142,27 @@ fn fetch_one(
     fields: &[Field],
     filter: &FilterArgs,
 ) -> Result<Vec<Session>, String> {
-    let ah_args = build_remote_args(remote, fields, filter);
-    let stdout = match run_ssh_capture(&remote.name, &remote.host, &ah_args) {
-        // Remotes older than the model fields reject them; `model` is in the
-        // log defaults, so drop both rather than lose the whole remote.
-        Err(e)
-            if fields
-                .iter()
-                .any(|f| matches!(f, Field::Model | Field::Models))
-                && (e.contains("unknown field 'model'")
-                    || e.contains("unknown field 'models'")) =>
-        {
-            let fields: Vec<Field> = fields
-                .iter()
-                .copied()
-                .filter(|f| !matches!(f, Field::Model | Field::Models))
-                .collect();
-            let ah_args = build_remote_args(remote, &fields, filter);
-            run_ssh_capture(&remote.name, &remote.host, &ah_args)?
+    let mut requested = fields.to_vec();
+    loop {
+        let ah_args = build_remote_args(remote, &requested, filter);
+        match run_ssh_capture(&remote.name, &remote.host, &ah_args) {
+            Ok(stdout) => return parse_remote_sessions(&remote.name, &stdout),
+            Err(e) => {
+                let old_len = requested.len();
+                if e.contains("unknown field 'model'") || e.contains("unknown field 'models'") {
+                    requested.retain(|f| !matches!(f, Field::Model | Field::Models));
+                } else {
+                    requested.retain(|f| {
+                        !matches!(f, Field::Origin | Field::Coverage | Field::Url)
+                            || !e.contains(&format!("unknown field '{}'", f.name()))
+                    });
+                }
+                if old_len == requested.len() {
+                    return Err(e);
+                }
+            }
         }
-        result => result?,
-    };
-    parse_remote_sessions(&remote.name, &stdout)
+    }
 }
 
 /// Occurrence search runs on the data-owning host; never fetch full transcripts.
@@ -608,7 +607,7 @@ fn run_ssh_streaming<F: FnMut(&str)>(
     mut on_line: F,
 ) -> Result<(), String> {
     use std::io::{BufRead, BufReader, Read};
-    let remote_cmd = quote_remote_command(args);
+    let remote_cmd = format!("env AH_NO_CLOUD_SYNC=1 {}", quote_remote_command(args));
     let debug = color::is_debug();
     if debug {
         eprintln!(
@@ -1027,7 +1026,7 @@ fn run_ssh_capture_impl(
     args: &[String],
     allow_legacy_empty: bool,
 ) -> Result<String, String> {
-    let remote_cmd = quote_remote_command(args);
+    let remote_cmd = format!("env AH_NO_CLOUD_SYNC=1 {}", quote_remote_command(args));
     let debug = color::is_debug();
     if debug {
         eprintln!(
@@ -1115,6 +1114,11 @@ fn parse_json_records<F: std::str::FromStr + Ord>(
 fn exec_ssh(host: &str, args: &[String], want_tty: bool) -> ! {
     use std::os::unix::process::CommandExt;
     let remote_cmd = quote_remote_command(args);
+    let remote_cmd = if args.get(1).is_some_and(|subcommand| subcommand == "show") {
+        format!("env AH_NO_CLOUD_SYNC=1 {remote_cmd}")
+    } else {
+        remote_cmd
+    };
     let mut cmd = process::Command::new("ssh");
     if want_tty {
         cmd.arg("-t");

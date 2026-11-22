@@ -2,6 +2,7 @@ mod agent_stats;
 mod agents;
 mod cancel;
 mod cli;
+mod cloud;
 mod collector;
 mod color;
 mod config;
@@ -106,6 +107,17 @@ fn main() {
     if let Err(e) = ia.parse_display_fields(allow_matched_here) {
         eprintln!("{}", e);
         process::exit(1);
+    }
+
+    if let Commands::Log(args) = &cli.command {
+        if !args.field_list
+            && !args.offline
+            && (args.refresh || (filter.all && filter.project.is_none()))
+            && (args.refresh || cloud::enabled())
+            && Args::from_search_args(args.clone(), &filter).is_ok()
+        {
+            cloud::refresh_for_log(args.offline, args.refresh, filter.agent.as_deref());
+        }
     }
 
     // Set up pager before command dispatch (must be after color init).

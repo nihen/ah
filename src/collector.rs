@@ -84,7 +84,7 @@ fn collect(
     let t0 = if debug { Some(Instant::now()) } else { None };
 
     // (plugin, pattern, whether matches must be checked to map back to the plugin)
-    let patterns: Vec<(&'static dyn AgentPlugin, String, bool)> = config::active_agents()
+    let mut patterns: Vec<(&'static dyn AgentPlugin, String, bool)> = config::active_agents()
         .flat_map(|agent| {
             let subagent_patterns = if subagents == Subagents::Include {
                 agent.subagent_patterns.as_slice()
@@ -109,6 +109,18 @@ fn collect(
         })
         .collect();
 
+    if let Some(cache) = crate::cloud::cache_dir() {
+        if let Some(agent) = config::active_agents().find(|a| a.id == "codex") {
+            patterns.push((
+                agent.plugin,
+                format!(
+                    "{}/*.jsonl",
+                    glob::Pattern::escape(&cache.to_string_lossy())
+                ),
+                true,
+            ));
+        }
+    }
     let per_pattern: Vec<Vec<PathBuf>> = patterns
         .par_iter()
         .map(|(_, pattern, _)| {

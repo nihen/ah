@@ -1085,6 +1085,7 @@ pub fn run_memory(
 /// Returns `None` if the user cancelled (exit 0 behavior).
 fn run_selector(selector: &str, args: &[String], input: &str) -> Result<Option<String>, String> {
     let mut child = Command::new(selector)
+        .env("AH_NO_CLOUD_SYNC", "1")
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

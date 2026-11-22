@@ -697,6 +697,17 @@ pub fn resolve_fields_with_mmap(
             Field::Agent => crate::config::find_agent_for_path(path)
                 .map(|a| a.id.clone())
                 .unwrap_or_else(|| plugin.id().to_string()),
+            Field::Origin => if crate::cloud::is_cache_path(path) {
+                "cloud"
+            } else {
+                "local"
+            }
+            .into(),
+            Field::Coverage if crate::cloud::is_cache_path(path) => "latest-turn".into(),
+            Field::Url => crate::cloud::url_for_path(path),
+            Field::Project | Field::ProjectRaw if crate::cloud::is_cache_path(path) => {
+                String::new()
+            }
             Field::Project => match cwd {
                 Some(ref cwd_str) => project_name(cwd_str),
                 None => resolve_project_fallback(path, plugin, home),

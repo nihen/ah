@@ -42,7 +42,12 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
         crate::location::Location::parse(at)?;
     }
     let home = canonical_home();
-    let explicit_session = subcmd::read_session_ref(args.session.as_deref())?;
+    let cloud_ref = args
+        .session
+        .as_deref()
+        .filter(|_| crate::cloud::enabled())
+        .and_then(crate::cloud::url_id);
+    let explicit_session = subcmd::read_session_ref(cloud_ref.or(args.session.as_deref()))?;
 
     if let Some(session) = explicit_session.as_deref() {
         let unquoted = strip_quotes(session);
@@ -74,7 +79,18 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
 
     let filters = filter.to_filters();
     let path = if let Some(session) = explicit_session.as_deref() {
-        subcmd::resolve_session_ref_of(session, &home, filter.agent.as_deref())?
+        match subcmd::resolve_session_ref_of(session, &home, filter.agent.as_deref()) {
+            Ok(path) => path,
+            Err(e)
+                if args.session.as_deref().is_some_and(|s| s != "-")
+                    && filter.remote.is_empty()
+                    && e.starts_with("No session found for id: ") =>
+            {
+                crate::cloud::fetch_missing(session, args.offline, filter.agent.as_deref())?
+                    .ok_or(e)?
+            }
+            Err(e) => return Err(e),
+        }
     } else {
         subcmd::resolve_session(
             None,

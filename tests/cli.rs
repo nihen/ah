@@ -5,7 +5,9 @@ use std::path::Path;
 use tempfile::TempDir;
 
 fn ah() -> Command {
-    Command::cargo_bin("ah").unwrap()
+    let mut cmd = Command::cargo_bin("ah").unwrap();
+    cmd.env_remove("AH_CODEX_CLOUD");
+    cmd
 }
 
 fn fixture_path(name: &str) -> String {
