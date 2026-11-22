@@ -696,10 +696,10 @@ impl CommonArgs {
 
 #[derive(Parser, Debug, Clone)]
 pub struct SearchArgs {
-    /// Do not refresh experimental Codex Cloud history (opt-in: AH_CODEX_CLOUD=1)
+    /// Do not refresh experimental Codex Cloud history (opt-in: [cloud.codex] enabled = true in ~/.ahrc)
     #[arg(long)]
     pub offline: bool,
-    /// Refresh the latest Codex Cloud page (requires AH_CODEX_CLOUD=1; up to 8 seconds)
+    /// Refresh the latest Codex Cloud page (opt-in in ~/.ahrc; up to 8 seconds)
     #[arg(long, conflicts_with = "offline")]
     pub refresh: bool,
 
@@ -782,7 +782,7 @@ pub enum ShowFormat {
 
 #[derive(Parser, Debug)]
 pub struct ShowArgs {
-    /// Do not refresh experimental Codex Cloud history (opt-in: AH_CODEX_CLOUD=1)
+    /// Do not refresh experimental Codex Cloud history (opt-in: [cloud.codex] enabled = true in ~/.ahrc)
     #[arg(long)]
     pub offline: bool,
     /// Open a position returned by search (includes tool input/output)

@@ -39,7 +39,7 @@ struct Tokens {
 }
 
 pub fn enabled() -> bool {
-    std::env::var_os("AH_CODEX_CLOUD").is_some_and(|v| v == "1")
+    crate::config::codex_cloud_enabled()
 }
 
 fn can_fetch() -> bool {
@@ -503,7 +503,7 @@ pub fn refresh_for_log(offline: bool, force: bool, agent: Option<&str>) {
     if !allowed {
         if force {
             eprintln!(
-                "Warning: Codex Cloud refresh requires AH_CODEX_CLOUD=1, Codex enabled, and no other agent filter"
+                "Warning: Codex Cloud refresh requires [cloud.codex] enabled = true in ~/.ahrc, Codex enabled, and no other agent filter"
             );
         }
         return;

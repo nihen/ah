@@ -51,11 +51,18 @@ fn cached_cloud_sessions_use_normal_log_search_and_show_but_cannot_resume() {
     )
     .unwrap();
 
+    let enable_cloud = |enabled| {
+        std::fs::write(
+            home.path().join(".ahrc"),
+            format!("[cloud.codex]\nenabled = {enabled}\n"),
+        )
+        .unwrap()
+    };
     let call = |args: &[&str], enabled: bool| {
+        enable_cloud(enabled);
         Command::new(env!("CARGO_BIN_EXE_ah"))
             .env("HOME", home.path())
             .env("CODEX_HOME", &codex)
-            .env("AH_CODEX_CLOUD", if enabled { "1" } else { "0" })
             .env_remove("AH_NO_CLOUD_SYNC")
             .current_dir(home.path())
             .args(args)
@@ -97,7 +104,6 @@ fn cached_cloud_sessions_use_normal_log_search_and_show_but_cannot_resume() {
     let basename = Command::new(env!("CARGO_BIN_EXE_ah"))
         .env("HOME", home.path())
         .env("CODEX_HOME", &codex)
-        .env("AH_CODEX_CLOUD", "1")
         .current_dir(&cache)
         .args([
             "show",
@@ -112,10 +118,10 @@ fn cached_cloud_sessions_use_normal_log_search_and_show_but_cannot_resume() {
     assert!(!call(&["resume", "--print", ID], true).status.success());
     assert!(!call(&["show", "--offline", ID], false).status.success());
 
+    enable_cloud(true);
     let mut mcp = Command::new(env!("CARGO_BIN_EXE_ah"))
         .env("HOME", home.path())
         .env("CODEX_HOME", &codex)
-        .env("AH_CODEX_CLOUD", "1")
         .env_remove("AH_NO_CLOUD_SYNC")
         .args(["mcp", "-a", "--agent", "codex"])
         .stdin(Stdio::piped())
@@ -148,11 +154,11 @@ fn cached_cloud_sessions_use_normal_log_search_and_show_but_cannot_resume() {
 #[test]
 fn offline_log_does_not_attempt_cloud_authentication() {
     let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".ahrc");
     let run = |offline| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ah"));
         cmd.env("HOME", home.path())
             .env("CODEX_HOME", home.path().join("no-login"))
-            .env("AH_CODEX_CLOUD", "1")
             .env_remove("AH_NO_CLOUD_SYNC")
             .args(["log", "-a", "--json"]);
         if offline {
@@ -160,6 +166,10 @@ fn offline_log_does_not_attempt_cloud_authentication() {
         }
         String::from_utf8(cmd.output().unwrap().stderr).unwrap()
     };
+    assert!(!run(false).contains("cannot read Codex file login"));
+    std::fs::write(&config, "[cloud.codex]\nenabled = false\n").unwrap();
+    assert!(!run(false).contains("cannot read Codex file login"));
+    std::fs::write(&config, "[cloud.codex]\nenabled = true\n").unwrap();
     assert!(run(false).contains("cannot read Codex file login"));
     assert!(!run(true).contains("cannot read Codex file login"));
 }

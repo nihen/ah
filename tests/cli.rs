@@ -6,7 +6,7 @@ use tempfile::TempDir;
 
 fn ah() -> Command {
     let mut cmd = Command::cargo_bin("ah").unwrap();
-    cmd.env_remove("AH_CODEX_CLOUD");
+    cmd.env("AH_NO_CLOUD_SYNC", "1");
     cmd
 }
 

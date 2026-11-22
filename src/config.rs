@@ -8,6 +8,7 @@ use crate::agents::{self, AgentPlugin};
 
 static AGENT_REGISTRY: OnceLock<Vec<AgentDef>> = OnceLock::new();
 static REMOTE_REGISTRY: OnceLock<Vec<RemoteDef>> = OnceLock::new();
+static CODEX_CLOUD_ENABLED: OnceLock<bool> = OnceLock::new();
 
 /// Runtime agent definition (built-in + config merged).
 pub struct AgentDef {
@@ -47,6 +48,20 @@ struct AhrcConfig {
     agents: HashMap<String, AgentEntry>,
     #[serde(default)]
     remotes: HashMap<String, RemoteEntry>,
+    #[serde(default)]
+    cloud: CloudConfig,
+}
+
+#[derive(Deserialize, Default)]
+struct CloudConfig {
+    #[serde(default)]
+    codex: CloudEntry,
+}
+
+#[derive(Deserialize, Default)]
+struct CloudEntry {
+    #[serde(default)]
+    enabled: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -283,7 +298,7 @@ fn add_pi_session_dir(agents: &mut [AgentDef], home: &Path) {
 }
 
 /// Load config and build agent + remote registries.
-fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
+fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>, bool) {
     // 1. Build defaults from built-in plugins
     let mut agents: Vec<AgentDef> = agents::all_plugins()
         .iter()
@@ -353,7 +368,7 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
             }
         }
     } else {
-        return (agents, Vec::new());
+        return (agents, Vec::new(), false);
     };
 
     // Built-in locations, for rejecting extra-pattern markers that overlap them.
@@ -453,7 +468,7 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
     }
 
     let remotes = load_remotes(&config);
-    (agents, remotes)
+    (agents, remotes, config.cloud.codex.enabled)
 }
 
 /// Load remote definitions from parsed config.
@@ -500,9 +515,15 @@ pub fn init(home: &Path) {
     if AGENT_REGISTRY.get().is_some() && REMOTE_REGISTRY.get().is_some() {
         return;
     }
-    let (agents, remotes) = load_config(home);
+    let (agents, remotes, codex_cloud) = load_config(home);
+    CODEX_CLOUD_ENABLED.get_or_init(|| codex_cloud);
     AGENT_REGISTRY.get_or_init(|| agents);
     REMOTE_REGISTRY.get_or_init(|| remotes);
+}
+
+/// Whether the user enabled Codex Cloud in ~/.ahrc.
+pub fn codex_cloud_enabled() -> bool {
+    CODEX_CLOUD_ENABLED.get().copied().unwrap_or_default()
 }
 
 /// Get all agents (including disabled).
@@ -629,7 +650,7 @@ mod tests {
     fn test_load_config_no_ahrc() {
         // Without ~/.ahrc, should return built-in defaults
         let home = PathBuf::from("/nonexistent/home");
-        let (agents, remotes) = load_config(&home);
+        let (agents, remotes, _) = load_config(&home);
         assert_eq!(agents.len(), 10);
         assert_eq!(agents[0].id, "claude");
         assert_eq!(agents[1].id, "codex");
@@ -642,7 +663,7 @@ mod tests {
         // agy (marker /.gemini/antigravity-cli/) disabled must NOT make its files
         // match gemini (marker /.gemini/).
         let home = test_home();
-        let (mut agents, _) = load_config(&home);
+        let (mut agents, _, _) = load_config(&home);
         agents.iter_mut().find(|a| a.id == "agy").unwrap().disabled = true;
         let agy_path = Path::new(
             "/Users/test/.gemini/antigravity-cli/brain/uuid/.system_generated/logs/transcript.jsonl",
@@ -697,7 +718,7 @@ extra_patterns = ["~/backup/sessions.db", "~/*.db"]
 "#,
         )
         .unwrap();
-        let (agents, _) = load_config(home);
+        let (agents, _, _) = load_config(home);
         let opencode = agents.iter().find(|a| a.id == "opencode").unwrap();
         let backup = home.join("backup/sessions.db");
         assert!(opencode.matches_path(&backup.join("ses_x")));
