@@ -9,6 +9,17 @@ use sha2::{Digest, Sha256};
 
 const ID: &str = "task_e_00000000000000000000000000000042";
 
+fn pipe_ref(cmd: &mut Command, value: &str) -> std::process::Output {
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{value}").unwrap();
+    child.wait_with_output().unwrap()
+}
+
 #[test]
 fn cached_cloud_sessions_use_normal_log_search_and_show_but_cannot_resume() {
     let home = tempfile::tempdir().unwrap();
@@ -97,6 +108,19 @@ fn cached_cloud_sessions_use_normal_log_search_and_show_but_cannot_resume() {
     assert!(out.status.success(), "{:?}", out.stderr);
     let show = String::from_utf8(out.stdout).unwrap();
     assert!(show.contains("# Cloud example prompt") && show.contains("Cloud response"));
+    for dash in [false, true] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ah"));
+        cmd.env("HOME", home.path())
+            .env("CODEX_HOME", &codex)
+            .current_dir(home.path())
+            .args(["show", "--offline", "--json"]);
+        if dash {
+            cmd.arg("-");
+        }
+        let out = pipe_ref(&mut cmd, &url);
+        assert!(out.status.success(), "{:?}", out.stderr);
+        assert_eq!(out.stdout, show.as_bytes());
+    }
     let relative = entry.strip_prefix(home.path()).unwrap().to_str().unwrap();
     let out = call(&["show", "--offline", "--json", relative], true);
     assert!(out.status.success());
@@ -284,7 +308,26 @@ esac
     let info = call(&["-a", "log", "--offline", "--json", "-o", "path"]);
     let row: Value = serde_json::from_slice(&info.stdout).unwrap();
     let cloud_path = std::path::Path::new(row["path"].as_str().unwrap());
-    let relative = cloud_path.strip_prefix(home).unwrap().to_str().unwrap();
+    let canonical_home = home.canonicalize().unwrap();
+    let relative = cloud_path
+        .strip_prefix(&canonical_home)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ah"));
+    cmd.env("HOME", home)
+        .env("CODEX_HOME", &codex)
+        .current_dir(home)
+        .args(["show", "--json", "-"]);
+    let piped = pipe_ref(&mut cmd, &url);
+    assert!(piped.status.success(), "{:?}", piped.stderr);
+    assert_eq!(shown.stdout, piped.stdout);
+    let unknown = pipe_ref(
+        &mut cmd,
+        "https://chatgpt.com/local/22222222-2222-2222-2222-222222222222",
+    );
+    assert!(!unknown.status.success());
+    assert_eq!(std::fs::read_to_string(&trace).unwrap(), calls);
     let showed_relative = call(&["show", "--offline", "--json", relative]);
     assert!(showed_relative.status.success());
     assert!(String::from_utf8_lossy(&showed_relative.stdout).contains("second answer"));
@@ -356,7 +399,10 @@ case "$req" in
     printf '{{"identity":["%s","fixture-org"]}}' "$MOCK_CLAUDE_ACCOUNT"
     ;;
   *'"account":["first","fixture-org"]'*'"id":"{ID}"'*)
-    printf '%s' '{{"id":"{ID}","messages":[{{"role":"user","text":"first Claude question"}},{{"role":"assistant","text":"first response"}},{{"role":"user","text":"Claude follow-up fixture"}}]}}'
+    if test -f fail-export; then exit 1; fi
+    extra=
+    if test -f new-turn; then extra=',{{"role":"assistant","text":"a new turn"}}'; fi
+    printf '%s%s%s' '{{"id":"{ID}","messages":[{{"role":"user","text":"first Claude question"}},{{"role":"assistant","text":"first response"}},{{"role":"user","text":"Claude follow-up fixture"}}' "$extra" ']}}'
     ;;
   *) exit 1;;
 esac
@@ -408,6 +454,21 @@ esac
     let detail_search = call("first", &["search", "follow-up fixture", "--json"]);
     assert!(detail_search.status.success(), "{:?}", detail_search.stderr);
     assert!(String::from_utf8_lossy(&detail_search.stdout).contains(ID));
+    let hits = |text, flags: &[&str]| {
+        let mut args = vec!["search", text, "--json"];
+        args.extend_from_slice(flags);
+        let out = call("first", &args);
+        assert!(out.status.success(), "{:?}", out.stderr);
+        out.stdout
+    };
+    let prompt = hits("follow-up fixture", &["-p"]);
+    let found: Value = serde_json::from_slice(&prompt).unwrap();
+    assert_eq!(found["kind"], "user");
+    let reply = hits("first response", &["--kind", "user,assistant"]);
+    let found: Value = serde_json::from_slice(&reply).unwrap();
+    assert_eq!(found["kind"], "assistant");
+    assert!(hits("first response", &["-p"]).is_empty());
+
     assert!(
         call("second", &["search", "follow-up fixture", "--json"])
             .stdout
@@ -419,4 +480,27 @@ esac
     let resume = call("first", &["resume", "--print", ID]);
     assert!(resume.status.success(), "{:?}", resume.stderr);
     assert!(String::from_utf8_lossy(&resume.stdout).contains(&url));
+
+    let out = call("first", &["log", "--json", "-o", "path"]);
+    let row: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let snapshot = std::path::Path::new(row["path"].as_str().unwrap());
+    let expire = || {
+        let mut data: Value = serde_json::from_slice(&std::fs::read(snapshot).unwrap()).unwrap();
+        data["fetched"] = json!(1);
+        std::fs::write(snapshot, data.to_string()).unwrap();
+    };
+    std::fs::write(home.join("new-turn"), "").unwrap();
+    let fresh = call("first", &["show", "--json", &url]);
+    assert_eq!(shown.stdout, fresh.stdout);
+    expire();
+    let refreshed = call("first", &["show", "--json", &url]);
+    assert!(refreshed.status.success(), "{:?}", refreshed.stderr);
+    assert!(String::from_utf8_lossy(&refreshed.stdout).contains("a new turn"));
+    assert!(!hits("a new turn", &["--kind", "assistant"]).is_empty());
+    std::fs::write(home.join("fail-export"), "").unwrap();
+    expire();
+    let fallback = call("first", &["show", "--json", &url]);
+    assert!(fallback.status.success(), "{:?}", fallback.stderr);
+    assert_eq!(refreshed.stdout, fallback.stdout);
+    assert!(String::from_utf8_lossy(&fallback.stderr).contains("not refreshed"));
 }

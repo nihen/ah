@@ -42,23 +42,25 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
         crate::location::Location::parse(at)?;
     }
     let home = canonical_home();
-    let cloud_ref = args
-        .session
-        .as_deref()
-        .filter(|_| crate::cloud::enabled())
-        .and_then(crate::cloud::url_id);
-    let explicit_session = subcmd::read_session_ref(cloud_ref.or(args.session.as_deref()))?;
-
-    let provider_url = explicit_session
-        .as_deref()
-        .filter(|_| args.session.as_deref().is_some_and(|v| v != "-") && filter.remote.is_empty())
-        .is_some_and(|v| {
+    let explicit_arg = args.session.as_deref().is_some_and(|s| s != "-");
+    let explicit_session = subcmd::read_session_ref(args.session.as_deref())?.map(|session| {
+        if filter.remote.is_empty()
+            && filter.agent.as_deref().is_none_or(|agent| agent == "codex")
+            && crate::cloud::enabled()
+        {
+            if let Some(id) = crate::cloud::url_id(strip_quotes(&session)) {
+                return id.to_owned();
+            }
+        }
+        session
+    });
+    let provider_url = filter.remote.is_empty()
+        && explicit_session.as_deref().is_some_and(|v| {
             crate::cloud::providers::is_url_ref(strip_quotes(v), filter.agent.as_deref())
         });
     if let Some(session) = explicit_session.as_deref().filter(|_| !provider_url) {
         let unquoted = strip_quotes(session);
         if filter.remote.is_empty()
-            && args.session.as_deref().is_some_and(|v| v != "-")
             && crate::cloud::providers::configured_claude_url(unquoted, filter.agent.as_deref())
         {
             return Err(if args.offline {
@@ -98,15 +100,14 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
         if provider_url {
             crate::cloud::providers::fetch(
                 strip_quotes(session),
-                args.offline,
+                args.offline || !explicit_arg,
                 filter.agent.as_deref(),
             )?
             .ok_or_else(|| "Cloud session not in cache".to_owned())?
         } else {
             match subcmd::resolve_session_ref_of(session, &home, filter.agent.as_deref()) {
                 Ok(path) => {
-                    if args.session.as_deref().is_some_and(|s| s != "-") && filter.remote.is_empty()
-                    {
+                    if explicit_arg && filter.remote.is_empty() {
                         if let Err(err) = crate::cloud::providers::hydrate(&path, args.offline) {
                             eprintln!("Cloud history not refreshed: {err}");
                         }
@@ -114,7 +115,7 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
                     path
                 }
                 Err(e)
-                    if args.session.as_deref().is_some_and(|s| s != "-")
+                    if explicit_arg
                         && filter.remote.is_empty()
                         && e.starts_with("No session found for id: ") =>
                 {

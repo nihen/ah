@@ -1,5 +1,6 @@
 //! Read-only providers using the common normalized session cache.
 use super::{FOREGROUND_BUDGET, INTERVAL, MAX_BODY, RETRY_INTERVAL, may_contact_cloud};
+use crate::agents::entries::{RecordVisitor, SearchKind};
 use crate::agents::{AgentPlugin, Message};
 use crate::config;
 use base64::{
@@ -1192,22 +1193,37 @@ pub(crate) fn fetch(
     let Some((source, id)) = routed(value, agent) else {
         return Ok(None);
     };
-    fetch_source(source, &id, offline)
+    fetch_source(
+        source,
+        &id,
+        offline,
+        source.kind == Kind::Claude && value.contains("://"),
+    )
 }
 
 pub(crate) fn hydrate(path: &Path, offline: bool) -> Result<(), String> {
     if let Some(source) = source_for_path(path) {
         if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
-            fetch_source(source, id, offline)?;
+            fetch_source(source, id, offline, false)?;
         }
     }
     Ok(())
 }
 
-fn fetch_source(source: &Source, id: &str, offline: bool) -> Result<Option<PathBuf>, String> {
+fn fetch_source(
+    source: &Source,
+    id: &str,
+    offline: bool,
+    revalidate_claude: bool,
+) -> Result<Option<PathBuf>, String> {
     let path = source.path(id);
-    let cached = read(&path).filter(|_| source_for_path(&path).is_some());
-    if cached.as_ref().is_some_and(|s| s.fetched != 0) || offline || !may_contact_cloud() {
+    let read_cached = || read(&path).filter(|_| source_for_path(&path).is_some());
+    let fresh = |s: &Snapshot| {
+        s.fetched != 0
+            && (!revalidate_claude || unix_now().saturating_sub(s.fetched) < INTERVAL.as_secs())
+    };
+    let cached = read_cached();
+    if cached.as_ref().is_some_and(fresh) || offline || !may_contact_cloud() {
         return Ok(cached.map(|_| path));
     }
     let work = || {
@@ -1218,21 +1234,35 @@ fn fetch_source(source: &Source, id: &str, offline: bool) -> Result<Option<PathB
                 FOREGROUND_BUDGET
             };
         let Some(_lock) = super::lock_dirs(&source.root, &source.cache)? else {
-            return Err("cache is busy");
+            return if cached.is_some() {
+                Ok(Some(path.clone()))
+            } else {
+                Err("cache is busy")
+            };
         };
+        let cached = read_cached();
+        if cached.as_ref().is_some_and(fresh) {
+            return Ok(Some(path.clone()));
+        }
         let http = source.http();
-        let hint = cached.filter(|_| source.kind == Kind::Codex).map(|s| Row {
-            id: id.to_owned(),
-            title: s.title,
-            created: s.created,
-            modified: s.modified,
-            revision: s.revision,
-        });
-        match source.detail(&http, id, hint, deadline) {
-            Ok(snapshot) => source.store(id, snapshot).map(Some),
-            Err(err) if path.is_file() && source_for_path(&path).is_some() => {
+        let hint = cached
+            .as_ref()
+            .filter(|_| source.kind == Kind::Codex)
+            .map(|s| Row {
+                id: id.to_owned(),
+                title: s.title.clone(),
+                created: s.created,
+                modified: s.modified,
+                revision: s.revision.clone(),
+            });
+        match source
+            .detail(&http, id, hint, deadline)
+            .and_then(|snapshot| source.store(id, snapshot))
+        {
+            Ok(published) => Ok(Some(published)),
+            Err(err) if cached.is_some() && source_for_path(&path).is_some() => {
                 eprintln!("Cloud history not refreshed: {}: {err}", source.name());
-                Ok(Some(path))
+                Ok(Some(path.clone()))
             }
             Err(err) => Err(err),
         }
@@ -1347,6 +1377,11 @@ impl AgentPlugin for SnapshotPlugin {
         if let Some(data) = read(path) {
             messages(data, visit);
         }
+    }
+    fn iter_search_records(&self, path: &Path, visit: &mut RecordVisitor<'_>) {
+        self.iter_messages(path, &mut |message| {
+            visit.record(|emit| emit(SearchKind::from_role(message.role), &message.text))
+        });
     }
     fn iter_messages_from_bytes(
         &self,
