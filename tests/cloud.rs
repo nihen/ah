@@ -484,11 +484,34 @@ esac
     let out = call("first", &["log", "--json", "-o", "path"]);
     let row: Value = serde_json::from_slice(&out.stdout).unwrap();
     let snapshot = std::path::Path::new(row["path"].as_str().unwrap());
+    let read_snapshot =
+        || serde_json::from_slice::<Value>(&std::fs::read(snapshot).unwrap()).unwrap();
+    let modified = read_snapshot()["modified"].as_u64().unwrap();
+    let recent = call("first", &["log", "--since", "1h", "--json", "-o", "id"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&recent.stdout).unwrap()["id"],
+        ID
+    );
+    let recent_hits = call(
+        "first",
+        &["search", "follow-up fixture", "--since", "1h", "--json"],
+    );
+    assert!(String::from_utf8_lossy(&recent_hits.stdout).contains(ID));
+
     let expire = || {
         let mut data: Value = serde_json::from_slice(&std::fs::read(snapshot).unwrap()).unwrap();
         data["fetched"] = json!(1);
         std::fs::write(snapshot, data.to_string()).unwrap();
     };
+    let old_change = modified - 120;
+    let mut data = read_snapshot();
+    data["modified"] = json!(old_change);
+    data["fetched"] = json!(1);
+    std::fs::write(snapshot, data.to_string()).unwrap();
+    let same = call("first", &["show", "--json", &url]);
+    assert_eq!(shown.stdout, same.stdout);
+    assert_eq!(read_snapshot()["modified"], old_change);
+
     std::fs::write(home.join("new-turn"), "").unwrap();
     let fresh = call("first", &["show", "--json", &url]);
     assert_eq!(shown.stdout, fresh.stdout);
@@ -496,6 +519,7 @@ esac
     let refreshed = call("first", &["show", "--json", &url]);
     assert!(refreshed.status.success(), "{:?}", refreshed.stderr);
     assert!(String::from_utf8_lossy(&refreshed.stdout).contains("a new turn"));
+    assert!(read_snapshot()["modified"].as_u64().unwrap() > old_change);
     assert!(!hits("a new turn", &["--kind", "assistant"]).is_empty());
     std::fs::write(home.join("fail-export"), "").unwrap();
     expire();

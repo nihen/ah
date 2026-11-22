@@ -326,7 +326,7 @@ The `prompt_times` field (`-o prompt_times`) is a JSON array with the time of ea
 Enable only the providers you use in `~/.ahrc`. Use `ah -a log -o agent,origin,coverage,id,url,title` to distinguish Cloud snapshots from local logs. `ah -a log` refreshes supported sources automatically; `--refresh` requests an immediate update. `--offline` uses only saved data and does not show Claude Cloud snapshots because the current Claude account cannot be verified in that mode.
 
 - `[cloud.codex]`: set `enabled = true` for legacy tasks. `[cloud.codex_conversations]`: also set `helper` to the absolute path produced by `tools/build-codex-cloud-bridge`.
-- `[cloud.claude]`: set `enabled = true`, `helper` to the absolute path of `tools/claude-cloud-export`, and `repo` to a trusted checkout of the Cloud session's repository. Use the session's exact URL with `ah show` to fetch or revalidate it.
+- `[cloud.claude]`: set `enabled = true`, `helper` to the absolute path of `tools/claude-cloud-export`, and `repo` to a trusted checkout of the Cloud session's repository. Use the session's exact URL with `ah show` to fetch or revalidate it. The export does not include a reliable modification time, so date filters use when `ah` first observed the current text.
 - `[cloud.cursor]`, `[cloud.copilot]`, `[cloud.opencode]`: set `enabled = true` and provide `CURSOR_API_KEY`, `GH_TOKEN`, or `OPENCODE_PASSWORD`, respectively. OpenCode additionally requires the server `endpoint` and accepts an optional `username`.
 - `[cloud.dsh]`: set `enabled = true` and `helper` to the absolute path of `tools/dsh-sdk-resume`.
 

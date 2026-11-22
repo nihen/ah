@@ -44,7 +44,7 @@ struct Row {
     revision: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, PartialEq, Eq, Serialize)]
 struct Line {
     role: String,
     text: String,
@@ -886,8 +886,18 @@ impl Source {
         )
     }
 
-    fn store(&self, id: &str, snapshot: Snapshot) -> Result<PathBuf, &'static str> {
+    fn store(&self, id: &str, mut snapshot: Snapshot) -> Result<PathBuf, &'static str> {
         let path = self.path(id);
+        if self.kind == Kind::Claude && snapshot.modified.is_none() {
+            // The terminal export has no trustworthy upstream timestamp.
+            // Keep the last observed change time if revalidation finds the same text.
+            snapshot.modified = Some(
+                read(&path)
+                    .filter(|saved| saved.messages == snapshot.messages)
+                    .and_then(|saved| saved.modified)
+                    .unwrap_or(snapshot.fetched),
+            );
+        }
         if snapshot.messages.is_empty() && read(&path).is_some_and(|s| !s.messages.is_empty()) {
             return Err("empty response; previous history preserved");
         }
