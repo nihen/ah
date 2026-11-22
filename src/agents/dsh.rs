@@ -198,11 +198,12 @@ fn header_of(log: &[u8]) -> Option<serde_json::Value> {
 
 /// Event types that are read. Lines of other types are skipped unparsed,
 /// which matters for the token-by-token `assistant/attempt` streams.
-const READ_TYPES: [&str; 4] = [
+const READ_TYPES: [&str; 5] = [
     "user/message",
     "assistant/message",
     "tool/result",
     "session/title",
+    "model/selection",
 ];
 
 /// Whether a line may be an event of one of `READ_TYPES`. Events are
@@ -507,6 +508,57 @@ impl AgentPlugin for DshPlugin {
             .and_then(|header| header_str(&header, "id"))
             .or_else(|| Some(path.parent()?.file_name()?.to_str()?.to_string()))
             .filter(|id| is_safe_cli_id(id))
+    }
+
+    fn can_resume(&self) -> bool {
+        crate::config::cloud_entries()
+            .and_then(|v| v.get("dsh"))
+            .is_some_and(|e| e.enabled && e.helper.as_ref().is_some_and(|p| p.is_absolute()))
+    }
+
+    fn resume_args(&self, path: &Path, home: &Path) -> Option<Vec<String>> {
+        let config = crate::config::cloud_entries()?.get("dsh")?;
+        let helper = config
+            .helper
+            .as_ref()
+            .filter(|p| p.is_absolute() && config.enabled)?;
+        let id = self.session_id(path, home)?;
+        if self.is_subagent(path) {
+            return None;
+        }
+        let mut model = None;
+        let mut has_selection = false;
+        for_each_event(&read_log(path)?, |kind, v| {
+            let route = match kind {
+                "model/selection" => v.get("data"),
+                "assistant/message" => v
+                    .pointer("/data/message/source")
+                    .filter(|s| s["kind"] == "model"),
+                _ => None,
+            };
+            if let Some(route) = route.filter(|_| kind == "model/selection" || !has_selection) {
+                has_selection |= kind == "model/selection";
+                let candidate = route["provider"]
+                    .as_str()
+                    .zip(route["model"].as_str())
+                    .filter(|(provider, model)| is_safe_cli_id(provider) && is_safe_cli_id(model));
+                // A newer selection with an unsupported identity must not
+                // silently fall back to an older provider.
+                if candidate.is_some() || kind == "model/selection" {
+                    model = candidate.map(|(p, m)| (p.to_owned(), m.to_owned()));
+                }
+            }
+            true
+        });
+        let (provider, model) = model?;
+        Some(vec![
+            helper.to_str()?.into(),
+            id,
+            "--provider".into(),
+            provider,
+            "--model".into(),
+            model,
+        ])
     }
 
     /// A subagent's header names the session that started it.

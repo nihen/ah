@@ -8,7 +8,7 @@ use crate::agents::{self, AgentPlugin};
 
 static AGENT_REGISTRY: OnceLock<Vec<AgentDef>> = OnceLock::new();
 static REMOTE_REGISTRY: OnceLock<Vec<RemoteDef>> = OnceLock::new();
-static CODEX_CLOUD_ENABLED: OnceLock<bool> = OnceLock::new();
+static CLOUD_CONFIG: OnceLock<CloudConfig> = OnceLock::new();
 
 /// Runtime agent definition (built-in + config merged).
 pub struct AgentDef {
@@ -53,15 +53,47 @@ struct AhrcConfig {
 }
 
 #[derive(Deserialize, Default)]
-struct CloudConfig {
+pub(crate) struct CloudConfig {
     #[serde(default)]
     codex: CloudEntry,
+    #[serde(flatten, deserialize_with = "parse_cloud_providers")]
+    pub(crate) providers: HashMap<String, CloudEntry>,
+}
+
+fn parse_cloud_providers<'de, D>(deserializer: D) -> Result<HashMap<String, CloudEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let entries = HashMap::<String, toml::Value>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|(name, value)| {
+            if !matches!(
+                name.as_str(),
+                "claude" | "codex_conversations" | "copilot" | "cursor" | "dsh" | "opencode"
+            ) {
+                return None;
+            }
+            match value.try_into() {
+                Ok(entry) => Some((name, entry)),
+                Err(_) => {
+                    eprintln!("Warning: ignoring invalid [cloud.{name}] configuration.");
+                    None
+                }
+            }
+        })
+        .collect())
 }
 
 #[derive(Deserialize, Default)]
-struct CloudEntry {
+pub(crate) struct CloudEntry {
     #[serde(default)]
-    enabled: bool,
+    pub(crate) enabled: bool,
+    pub(crate) endpoint: Option<String>,
+    pub(crate) credential_env: Option<String>,
+    pub(crate) username: Option<String>,
+    pub(crate) helper: Option<PathBuf>,
+    pub(crate) repo: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Default)]
@@ -298,7 +330,7 @@ fn add_pi_session_dir(agents: &mut [AgentDef], home: &Path) {
 }
 
 /// Load config and build agent + remote registries.
-fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>, bool) {
+fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>, CloudConfig) {
     // 1. Build defaults from built-in plugins
     let mut agents: Vec<AgentDef> = agents::all_plugins()
         .iter()
@@ -368,7 +400,7 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>, bool) {
             }
         }
     } else {
-        return (agents, Vec::new(), false);
+        return (agents, Vec::new(), CloudConfig::default());
     };
 
     // Built-in locations, for rejecting extra-pattern markers that overlap them.
@@ -468,7 +500,7 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>, bool) {
     }
 
     let remotes = load_remotes(&config);
-    (agents, remotes, config.cloud.codex.enabled)
+    (agents, remotes, config.cloud)
 }
 
 /// Load remote definitions from parsed config.
@@ -515,15 +547,19 @@ pub fn init(home: &Path) {
     if AGENT_REGISTRY.get().is_some() && REMOTE_REGISTRY.get().is_some() {
         return;
     }
-    let (agents, remotes, codex_cloud) = load_config(home);
-    CODEX_CLOUD_ENABLED.get_or_init(|| codex_cloud);
+    let (agents, remotes, cloud) = load_config(home);
+    CLOUD_CONFIG.get_or_init(|| cloud);
     AGENT_REGISTRY.get_or_init(|| agents);
     REMOTE_REGISTRY.get_or_init(|| remotes);
 }
 
 /// Whether the user enabled Codex Cloud in ~/.ahrc.
 pub fn codex_cloud_enabled() -> bool {
-    CODEX_CLOUD_ENABLED.get().copied().unwrap_or_default()
+    CLOUD_CONFIG.get().is_some_and(|c| c.codex.enabled)
+}
+
+pub(crate) fn cloud_entries() -> Option<&'static HashMap<String, CloudEntry>> {
+    CLOUD_CONFIG.get().map(|c| &c.providers)
 }
 
 /// Get all agents (including disabled).
@@ -559,6 +595,9 @@ pub fn find_agent_for_path(path: &Path) -> Option<&'static AgentDef> {
     if crate::cloud::is_cache_path(path) {
         return active_agents().find(|a| a.id == "codex");
     }
+    if let Some(source) = crate::cloud::providers::source_for_path(path) {
+        return active_agents().find(|a| a.id == source.agent());
+    }
     best_agent_for_path(agents(), path)
 }
 
@@ -584,6 +623,11 @@ fn best_agent_for_path<'a>(candidates: &'a [AgentDef], path: &Path) -> Option<&'
 
 /// Find an active agent's plugin by path.
 pub fn find_plugin_for_path(path: &Path) -> &'static dyn AgentPlugin {
+    if crate::cloud::providers::source_for_path(path)
+        .is_some_and(|s| active_agents().any(|a| a.id == s.agent()))
+    {
+        return &crate::cloud::providers::PLUGIN;
+    }
     find_agent_for_path(path)
         .map(|a| a.plugin)
         .unwrap_or_else(agents::unknown_plugin)

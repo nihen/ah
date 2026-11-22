@@ -218,7 +218,9 @@ impl Field {
             Field::Model => "Model that answered last",
             Field::Models => "Models that answered, comma-separated in first-use order",
             Field::Origin => "Session origin: local or cloud",
-            Field::Coverage => "Cloud transcript coverage (latest-turn for Codex Cloud)",
+            Field::Coverage => {
+                "Cloud transcript coverage (messages, latest-turn, prompt-only, or metadata)"
+            }
             Field::Url => "Original URL of a Cloud session",
             Field::PromptTimes => {
                 "Times of the user prompts as JSON array (Unix seconds; null if not recorded)"
@@ -696,10 +698,10 @@ impl CommonArgs {
 
 #[derive(Parser, Debug, Clone)]
 pub struct SearchArgs {
-    /// Do not refresh experimental Codex Cloud history (opt-in: [cloud.codex] enabled = true in ~/.ahrc)
+    /// Do not contact cloud history providers configured in ~/.ahrc
     #[arg(long)]
     pub offline: bool,
-    /// Refresh the latest Codex Cloud page (opt-in in ~/.ahrc; up to 8 seconds)
+    /// Refresh enabled cloud history providers (up to 8 seconds total)
     #[arg(long, conflicts_with = "offline")]
     pub refresh: bool,
 
@@ -782,7 +784,7 @@ pub enum ShowFormat {
 
 #[derive(Parser, Debug)]
 pub struct ShowArgs {
-    /// Do not refresh experimental Codex Cloud history (opt-in: [cloud.codex] enabled = true in ~/.ahrc)
+    /// Do not contact cloud history providers configured in ~/.ahrc
     #[arg(long)]
     pub offline: bool,
     /// Open a position returned by search (includes tool input/output)

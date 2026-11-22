@@ -415,6 +415,13 @@ pub struct SessionCopy<'a> {
     pub parent_id: &'a str,
 }
 
+/// Cloud and local copies of a public ID are not interchangeable.
+pub(crate) fn cloud_namespace(path: &Path) -> Option<&Path> {
+    (crate::cloud::providers::source_for_path(path).is_some() || crate::cloud::is_cache_path(path))
+        .then(|| path.parent())
+        .flatten()
+}
+
 /// Which of `copies` to keep, in input order: one per agent, id and parent,
 /// the copy `copy_preference` ranks highest. The parent keeps subagents of
 /// different sessions that share an id distinct, and the agent keeps
@@ -422,7 +429,7 @@ pub struct SessionCopy<'a> {
 /// id are distinct and all kept.
 pub fn unique_session_copies<'a>(copies: impl Iterator<Item = SessionCopy<'a>>) -> Vec<bool> {
     let copies: Vec<SessionCopy<'a>> = copies.collect();
-    let mut best: std::collections::HashMap<(&str, &str, &str), usize> =
+    let mut best: std::collections::HashMap<(&str, &str, &str, Option<&Path>), usize> =
         std::collections::HashMap::new();
     for (i, copy) in copies.iter().enumerate() {
         if copy.id.is_empty() {
@@ -431,7 +438,7 @@ pub fn unique_session_copies<'a>(copies: impl Iterator<Item = SessionCopy<'a>>) 
         let agent = config::find_agent_for_path(copy.path)
             .map(|a| a.id.as_str())
             .unwrap_or("");
-        best.entry((agent, copy.id, copy.parent_id))
+        best.entry((agent, copy.id, copy.parent_id, cloud_namespace(copy.path)))
             .and_modify(|j| {
                 let other = &copies[*j];
                 if copy_preference(copy.path, copy.mtime) > copy_preference(other.path, other.mtime)

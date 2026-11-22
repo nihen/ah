@@ -363,8 +363,8 @@ fn resolve_by_id(id: &str, home: &Path, agent: Option<&str>) -> Result<PathBuf, 
     // Preferred file per session, as `ah log` tells sessions apart: by
     // agent, id and parent id. Exact id matches win over id-prefix matches.
     type Copy = (PathBuf, SystemTime);
-    let mut exact: HashMap<(&str, String), Copy> = HashMap::new();
-    let mut prefix_matches: HashMap<(String, &str, String), Copy> = HashMap::new();
+    let mut exact: HashMap<(&str, String, Option<PathBuf>), Copy> = HashMap::new();
+    let mut prefix_matches: HashMap<(String, &str, String, Option<PathBuf>), Copy> = HashMap::new();
     fn keep_better<K: std::hash::Hash + Eq>(
         map: &mut HashMap<K, Copy>,
         key: K,
@@ -398,9 +398,7 @@ fn resolve_by_id(id: &str, home: &Path, agent: Option<&str>) -> Result<PathBuf, 
             if agent.is_some_and(|wanted| wanted != agent_id) {
                 return None;
             }
-            let plugin = agent_def
-                .map(|a| a.plugin)
-                .unwrap_or_else(agents::unknown_plugin);
+            let plugin = agents::find_plugin_for_path(fpath);
             let mut fields =
                 resolver::resolve_fields(fpath, plugin, *mtime, home, &resolve_fields, &opts);
             let v = fields.remove(&Field::Id).filter(|v| v.starts_with(id))?;
@@ -412,10 +410,16 @@ fn resolve_by_id(id: &str, home: &Path, agent: Option<&str>) -> Result<PathBuf, 
         return Err(format!("Cancelled while resolving session id: {}", id));
     }
     for (fpath, mtime, agent_id, v, parent) in candidates {
+        let namespace = pipeline::cloud_namespace(fpath).map(Path::to_owned);
         if v == id {
-            keep_better(&mut exact, (agent_id, parent), fpath, mtime);
+            keep_better(&mut exact, (agent_id, parent, namespace), fpath, mtime);
         } else {
-            keep_better(&mut prefix_matches, (v, agent_id, parent), fpath, mtime);
+            keep_better(
+                &mut prefix_matches,
+                (v, agent_id, parent, namespace),
+                fpath,
+                mtime,
+            );
         }
     }
 
@@ -423,17 +427,23 @@ fn resolve_by_id(id: &str, home: &Path, agent: Option<&str>) -> Result<PathBuf, 
     // id, unless only a secondary record of it is left.
     let top_level: Vec<(&str, &Copy)> = exact
         .iter()
-        .filter(|((_, parent), _)| parent.is_empty())
-        .map(|((agent, _), copy)| (*agent, copy))
+        .filter(|((_, parent, _), _)| parent.is_empty())
+        .map(|((agent, _, _), copy)| (*agent, copy))
         .collect();
     let ambiguous_agents = |agents: Vec<&str>| {
         let mut agents: Vec<&str> = agents.into_iter().filter(|a| !a.is_empty()).collect();
         agents.sort_unstable();
         agents.dedup();
+        let hint = if agents.len() > 1 {
+            "pass --agent or the path instead"
+        } else {
+            "pass the exact Cloud URL or a session path"
+        };
         format!(
-            "Ambiguous session id: {} (sessions of {}; pass --agent or the path instead)",
+            "Ambiguous session id: {} (sessions of {}; {})",
             id,
-            agents.join(", ")
+            agents.join(", "),
+            hint
         )
     };
     match top_level.as_slice() {

@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Interactive attachment to an existing DeepSeek Harness SDK session."""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("session_id")
+parser.add_argument("--provider", required=True)
+parser.add_argument("--model", required=True)
+args = parser.parse_args()
+session_id = args.session_id
+if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", session_id):
+    parser.error("invalid dsh session ID")
+if not sys.stdin.isatty() or not sys.stdout.isatty():
+    parser.error("a terminal is required; use ah show to read history")
+
+p = subprocess.Popen(["dsh", "sdk"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+seq = 0
+
+
+def write(payload):
+    p.stdin.write(json.dumps({"jsonrpc": "2.0", **payload}).encode() + b"\n")
+    p.stdin.flush()
+
+
+def sanitized(text):
+    return "".join(
+        char for char in text if char in "\n\t" or not (
+            ord(char) < 32 or 127 <= ord(char) <= 159
+        )
+    )
+
+
+def rpc(method, params=None):
+    global seq
+    seq += 1
+    request = {"id": seq, "method": method}
+    if params is not None:
+        request["params"] = params
+    write(request)
+    while True:
+        line = p.stdout.readline(8 * 1024 * 1024 + 1)
+        if not line or len(line) > 8 * 1024 * 1024:
+            raise RuntimeError("dsh SDK closed or sent an oversized response")
+        frame = json.loads(line)
+        if frame.get("id") == seq and "method" not in frame:
+            if "error" in frame:
+                raise RuntimeError(sanitized(frame["error"].get("message", "dsh error")))
+            return frame.get("result")
+        if "id" in frame and "method" in frame:
+            # Do not grant SDK tool approvals from this minimal client.
+            if frame["method"] == "approval/request":
+                write({"id": frame["id"], "result": {"outcome": "cancelled"}})
+            else:
+                write({"id": frame["id"], "error": {"code": -32601, "message": "Unsupported"}})
+            continue
+        params = frame.get("params", {})
+        if frame.get("method") == "session.event" and params.get("sessionId") == session_id:
+            event = params.get("event", {})
+            if event.get("type") == "assistant/message":
+                for part in event.get("data", {}).get("message", {}).get("content", []):
+                    if part.get("type") == "text" and isinstance(part.get("text"), str):
+                        print(sanitized(part["text"]), flush=True)
+
+
+exit_code = 0
+try:
+    rpc("initialize", {"cwd": os.getcwd(), "provider": args.provider, "model": args.model,
+                       "approvalRequests": True})
+    rpc("session/resume", {"sessionId": session_id})
+    print(f"Attached to dsh session {session_id}. Use Ctrl-D to detach.", flush=True)
+    while True:
+        try:
+            text = input("dsh> ")
+        except EOFError:
+            break
+        if text.strip():
+            rpc("session/prompt", {"sessionId": session_id,
+                                    "contentBlocks": [{"type": "text", "text": text}]})
+            rpc("session/wait", {"sessionId": session_id})
+except KeyboardInterrupt:
+    exit_code = 130
+except (RuntimeError, OSError, ValueError) as error:
+    print(f"dsh resume: {sanitized(str(error))}", file=sys.stderr)
+    exit_code = 1
+finally:
+    if p.poll() is None:
+        p.stdin.close()
+        try:
+            p.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            p.terminate()
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+sys.exit(exit_code)

@@ -121,6 +121,13 @@ fn collect(
             ));
         }
     }
+    patterns.extend(crate::cloud::providers::cache_patterns().map(|pattern| {
+        (
+            &crate::cloud::providers::PLUGIN as &dyn AgentPlugin,
+            pattern,
+            true,
+        )
+    }));
     let per_pattern: Vec<Vec<PathBuf>> = patterns
         .par_iter()
         .map(|(_, pattern, _)| {

@@ -109,11 +109,37 @@ fn main() {
         process::exit(1);
     }
 
+    if !ia.interactive {
+        let claude_ref = |session: &str| {
+            session.contains(".ah-provider-cloud/")
+                || session.starts_with("session_")
+                || session.starts_with("cse_")
+                || session.starts_with("https://claude.ai/code/")
+        };
+        let claude_cache_allowed = match &cli.command {
+            Commands::Log(args) => {
+                !args.field_list && !args.offline && (filter.all || args.refresh)
+            }
+            Commands::Search(_) => filter.all,
+            Commands::Show(args) => {
+                !args.offline && args.session.as_deref().map_or(filter.all, claude_ref)
+            }
+            Commands::Resume(args) => args
+                .session
+                .as_deref()
+                .is_some_and(|s| !s.contains("://") && claude_ref(s)),
+            _ => false,
+        };
+        if claude_cache_allowed && filter.remote.is_empty() {
+            cloud::providers::pin_claude_account(filter.agent.as_deref());
+        }
+    }
     if let Commands::Log(args) = &cli.command {
         if !args.field_list
             && !args.offline
+            && !ia.interactive
             && (args.refresh || (filter.all && filter.project.is_none()))
-            && (args.refresh || cloud::enabled())
+            && (args.refresh || cloud::any_enabled())
             && Args::from_search_args(args.clone(), &filter).is_ok()
         {
             cloud::refresh_for_log(args.offline, args.refresh, filter.agent.as_deref());

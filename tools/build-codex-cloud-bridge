@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Build only tracked files of the pinned upstream Codex release.
+set -euo pipefail
+if [ "$#" -ne 1 ]; then
+  printf '%s\n' 'Usage: build-codex-cloud-bridge /path/to/openai/codex-release-checkout' >&2
+  exit 2
+fi
+revision=ccf9be8cc458bd6b8336fe84d68d8893f2691a5e
+here=$(cd -- "$(dirname -- "$0")" && pwd -P)
+upstream=$(cd -- "$1" && pwd -P)
+test "$(git -C "$upstream" rev-parse --show-toplevel)" = "$upstream" &&
+  test "$(git -C "$upstream" rev-parse HEAD)" = "$revision" || {
+  printf '%s\n' 'Expected the root of the upstream Codex rust-v0.171.0 checkout.' >&2
+  exit 1
+}
+# Cargo searches the ancestors of its working directory for config files.
+# Never start a build below a shared writable path such as /tmp.
+build_parent=$(python3 - <<'PYTHON'
+from pathlib import Path
+import os, stat
+home = Path.home().resolve(strict=True)
+uid = os.geteuid()
+if home.stat().st_uid != uid:
+    raise SystemExit("Build HOME must be owned by the current user.")
+for p in (home, *home.parents):
+    st = p.stat()
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid not in (0, uid) or st.st_mode & 0o022:
+        raise SystemExit("Build HOME and its ancestors must not be writable by other users.")
+print(home)
+PYTHON
+)
+stage=$(mktemp -d "$build_parent/.ah-codex-bridge.XXXXXXXX")
+trap 'python3 -c "import shutil,sys;shutil.rmtree(sys.argv[1])" "$stage"' EXIT
+git -C "$upstream" archive "$revision" | tar -x -C "$stage"
+source_dir="$stage/codex-rs/app-server-client/examples"
+mkdir -p "$source_dir"
+cp "$here/ah_codex_cloud_bridge.rs" "$source_dir/"
+(
+  cd "$stage/codex-rs"
+  CARGO_TARGET_DIR="$stage/target" cargo build -p codex-app-server-client --example ah_codex_cloud_bridge
+)
+out="${XDG_CACHE_HOME:-$HOME/.cache}/ah/codex-cloud-bridge/$revision"
+mkdir -p "$out"
+out=$(cd "$out" && pwd -P)
+install -m 700 "$stage/target/debug/examples/ah_codex_cloud_bridge" "$out/ah_codex_cloud_bridge"
+printf 'Configure [cloud.codex_conversations] with enabled = true and helper = "%s/ah_codex_cloud_bridge".\n' "$out"

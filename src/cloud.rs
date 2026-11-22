@@ -1,4 +1,6 @@
 //! Experimental read-only Codex Cloud snapshot cache.
+pub(crate) mod providers;
+
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +23,7 @@ const PAGE_SIZE: usize = 20;
 struct Source {
     access_token: String,
     account: String,
+    owner: String,
     root: PathBuf,
     cache: PathBuf,
 }
@@ -42,8 +45,12 @@ pub fn enabled() -> bool {
     crate::config::codex_cloud_enabled()
 }
 
+fn may_contact_cloud() -> bool {
+    std::env::var_os("AH_NO_CLOUD_SYNC").is_none_or(|v| v != "1")
+}
+
 fn can_fetch() -> bool {
-    enabled() && std::env::var_os("AH_NO_CLOUD_SYNC").is_none_or(|v| v != "1")
+    enabled() && may_contact_cloud()
 }
 
 fn safe_header(value: &str) -> bool {
@@ -85,6 +92,7 @@ fn read_source() -> Result<Source, &'static str> {
     Ok(Source {
         access_token: t.access_token,
         account: t.account_id,
+        owner: t.login_owner_id,
         root,
         cache,
     })
@@ -194,10 +202,10 @@ fn private_dir(_: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn lock(s: &Source) -> Result<Option<File>, &'static str> {
+fn lock_dirs(root: &Path, cache: &Path) -> Result<Option<File>, &'static str> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    for p in [&s.root, &s.cache] {
+    for p in [root, cache] {
         match fs::DirBuilder::new().mode(0o700).create(p) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -213,7 +221,7 @@ fn lock(s: &Source) -> Result<Option<File>, &'static str> {
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(s.cache.join(".lock"))
+        .open(cache.join(".lock"))
         .map_err(|_| "cannot open Cloud cache lock")?;
     if !f.metadata().is_ok_and(|m| m.is_file()) {
         return Err("invalid Cloud cache lock");
@@ -229,8 +237,12 @@ fn lock(s: &Source) -> Result<Option<File>, &'static str> {
 }
 
 #[cfg(not(unix))]
-fn lock(_: &Source) -> Result<Option<File>, &'static str> {
+fn lock_dirs(_: &Path, _: &Path) -> Result<Option<File>, &'static str> {
     Ok(None)
+}
+
+fn lock(s: &Source) -> Result<Option<File>, &'static str> {
+    lock_dirs(&s.root, &s.cache)
 }
 
 #[derive(Deserialize)]
@@ -433,8 +445,7 @@ fn write_stamp(cache: &Path, name: &str) -> Result<(), &'static str> {
         .map_err(|_| "cannot write Cloud refresh stamp")
 }
 
-fn refresh(force: bool) -> Result<(), &'static str> {
-    let deadline = Instant::now() + if force { FOREGROUND_BUDGET } else { BUDGET };
+fn refresh(force: bool, deadline: Instant) -> Result<(), &'static str> {
     let s = source()?;
     let Some(_lock) = lock(s)? else {
         return if force {
@@ -494,23 +505,55 @@ fn refresh_page(
 }
 
 pub fn refresh_for_log(offline: bool, force: bool, agent: Option<&str>) {
-    if offline {
+    if offline || !may_contact_cloud() {
         return;
     }
-    let allowed = can_fetch()
+    let legacy = can_fetch()
         && agent.is_none_or(|a| a == "codex")
         && crate::config::active_agents().any(|a| a.id == "codex");
-    if !allowed {
+    let configured = providers::active(agent);
+    let sources: Vec<_> = configured
+        .iter()
+        .copied()
+        .filter(|s| s.due(force))
+        .collect();
+    if !legacy && configured.is_empty() {
         if force {
-            eprintln!(
-                "Warning: Codex Cloud refresh requires [cloud.codex] enabled = true in ~/.ahrc, Codex enabled, and no other agent filter"
-            );
+            eprintln!("Warning: no enabled cloud source matches this agent");
         }
         return;
     }
-    if let Err(e) = refresh(force) {
-        eprintln!("Warning: Codex Cloud: {e} (using saved history)");
-    }
+    let budget = if force {
+        FOREGROUND_BUDGET
+    } else if sources.is_empty() {
+        BUDGET
+    } else {
+        Duration::from_secs(3)
+    };
+    let end = Instant::now() + budget;
+    std::thread::scope(|scope| {
+        if legacy {
+            scope.spawn(move || {
+                if let Err(e) = refresh(
+                    force,
+                    (Instant::now() + if force { budget } else { BUDGET }).min(end),
+                ) {
+                    eprintln!("Warning: Codex Cloud (tasks): {e} (using saved history)");
+                }
+            });
+        }
+        for source in sources {
+            scope.spawn(move || {
+                if let Err(e) = source.refresh(force, end) {
+                    eprintln!("Warning: {}: {e} (using saved history)", source.name());
+                }
+            });
+        }
+    });
+}
+
+pub fn any_enabled() -> bool {
+    enabled() || !providers::active(None).is_empty()
 }
 
 pub fn fetch_missing(
@@ -568,6 +611,7 @@ mod tests {
         Source {
             access_token: "example".into(),
             account: "example".into(),
+            owner: "owner".into(),
             cache: root.join("example"),
             root,
         }
