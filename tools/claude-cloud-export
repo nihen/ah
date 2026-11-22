@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Read one previously authorized Claude Code Cloud transcript."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import pty
+import re
+import select
+import signal
+import struct
+import stat
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import uuid
+
+LIMIT = 8 * 1024 * 1024
+CONTROL = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def profile():
+    result = subprocess.run(["claude", "auth", "status", "--json"],
+                            env=native_env(), capture_output=True, timeout=2, check=True)
+    data = json.loads(result.stdout)
+    email, org = data.get("email"), data.get("orgId")
+    if (data.get("loggedIn") is not True or data.get("storedClaudeAiLogin") is not True
+            or data.get("authMethod") != "claude.ai"
+            or not isinstance(email, str) or not isinstance(org, str) or not email or not org):
+        raise ValueError("an authenticated Claude.ai account is required")
+    projects = data.get("projectsDirectory")
+    if not isinstance(projects, str) or not Path(projects).is_absolute():
+        raise ValueError("invalid Claude projects directory")
+    return [email, org], Path(projects)
+
+
+def native_env():
+    keys = {"HOME", "PATH", "USER", "LOGNAME", "LANG", "SHELL", "TMPDIR",
+            "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"}
+    return {k: v for k, v in os.environ.items() if k in keys or k.startswith("LC_")}
+
+
+def git_env(repo):
+    env = native_env()
+    env.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+               GIT_ALLOW_PROTOCOL="", GIT_TERMINAL_PROMPT="0")
+    overrides = {"core.hooksPath": "/dev/null", "submodule.recurse": "false"}
+    filters = subprocess.run(
+        ["git", "-C", str(repo), "config", "--null", "--name-only", "--get-regexp",
+         r"^filter\..*\.(clean|smudge|process|required)$"],
+        capture_output=True, env=env, timeout=4,
+    )
+    if filters.returncode not in (0, 1) or len(filters.stdout) > 8192:
+        raise ValueError("cannot inspect Git filters")
+    for key in filters.stdout.decode("utf-8").strip("\0").split("\0"):
+        if not key:
+            continue
+        if not re.fullmatch(r"filter\.[A-Za-z0-9._-]+\.(clean|smudge|process|required)", key):
+            raise ValueError("unsupported Git filter name")
+        overrides[key] = "false" if key.endswith(".required") else ""
+    env["GIT_CONFIG_COUNT"] = str(len(overrides))
+    for i, (key, value) in enumerate(overrides.items()):
+        env[f"GIT_CONFIG_KEY_{i}"] = key
+        env[f"GIT_CONFIG_VALUE_{i}"] = value
+    return env
+
+
+def git(repo, env, *args):
+    return subprocess.run(["git", "-C", str(repo), *args], env=env, timeout=4,
+                          stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, check=True).stdout
+
+
+def stop(proc):
+    if proc.poll() is None:
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=0.35)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+
+
+def export(worktree, env, sid, local_id, output):
+    env = dict(env, TERM="xterm-256color")
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 125, 0, 0))
+    try:
+        proc = subprocess.Popen(
+            ["claude", "--teleport", sid, "--safe-mode", "--strict-mcp-config",
+             "--setting-sources", "", "--permission-mode", "dontAsk", "--tools", "",
+             "--session-id", local_id,
+             "--settings", '{"disableAllHooks":true}'],
+            cwd=worktree, env=env, stdin=slave, stdout=slave, stderr=slave,
+            start_new_session=True,
+        )
+    except BaseException:
+        os.close(master)
+        raise
+    finally:
+        os.close(slave)
+    deadline = time.monotonic() + 12
+    buf = b""
+    sent = False
+    try:
+        while proc.poll() is None and time.monotonic() < deadline:
+            if select.select([master], [], [], 0.1)[0]:
+                try:
+                    buf += os.read(master, 16384)
+                except OSError:
+                    break
+            if len(buf) > LIMIT:
+                raise ValueError("terminal output limit exceeded")
+            if not sent:
+                msg = CONTROL.sub(b"", buf).lower()
+                # Fail closed on the trust/login flows. Only continue after
+                # the ready message for a copy resumed without Git checkout.
+                if b"sessionresumedwithoutbranch" in msg or b"session resumed without branch" in msg:
+                    os.write(master, f"/export {output}".encode())
+                    time.sleep(0.4)
+                    os.write(master, b"\r")
+                    sent = True
+            elif output.is_file() and b"export" in CONTROL.sub(b"", buf).lower():
+                # The file is written by the built-in command. Wait for a
+                # stable size before stopping the CLI, without sending a prompt.
+                size = output.stat().st_size
+                if 0 < size <= LIMIT:
+                    time.sleep(0.2)
+                    if output.stat().st_size == size:
+                        stop(proc)
+                        fd = os.open(output, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                        with os.fdopen(fd, "rb") as transcript:
+                            if not stat.S_ISREG(os.fstat(transcript.fileno()).st_mode):
+                                raise ValueError("export is not a regular file")
+                            data = transcript.read(LIMIT + 1)
+                        if len(data) > LIMIT:
+                            raise ValueError("oversized exported transcript")
+                        return parse(data.decode("utf-8"))
+        raise ValueError("teleport or export did not finish automatically")
+    finally:
+        stop(proc)
+        os.close(master)
+
+
+def parse(text):
+    blocks = []
+    for line in text.splitlines():
+        if line.startswith(("❯ ", "● ")):
+            blocks.append(("user" if line[0] == "❯" else "assistant", [line[2:]]))
+        elif blocks:
+            # The renderer pads continuation lines by two spaces. Strip
+            # that prefix only; code and Markdown may have further indent.
+            blocks[-1][1].append(line.removeprefix("  "))
+    messages = [{"role": role, "text": "\n".join(lines).strip("\n")}
+                for role, lines in blocks if any(line.strip() for line in lines)]
+    if not any(m["role"] == "user" for m in messages):
+        raise ValueError("unsupported Claude export")
+    return messages
+
+
+def remove_temporary_transcript(projects, local_id, worktree):
+    # Teleport writes a native local copy. Delete only the never-reused UUID
+    # reserved by this helper, and only after checking the record's own cwd.
+    name = local_id + ".jsonl"
+    if not projects.is_dir():
+        return
+    for project in projects.iterdir():
+        if project.is_symlink() or not project.is_dir():
+            continue
+        fd = os.open(project, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            try:
+                log = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+            except FileNotFoundError:
+                continue
+            with os.fdopen(log, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                    raise ValueError("unexpected local export owner or type")
+                verified = False
+                for _ in range(20):
+                    line = stream.readline(1024 * 1024 + 1)
+                    if not line or len(line) > 1024 * 1024:
+                        break
+                    record = json.loads(line)
+                    if record.get("cwd") == str(worktree) and record.get("sessionId") == local_id:
+                        verified = True
+                        break
+                current = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if (not verified or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)):
+                    raise ValueError("cannot verify temporary local copy")
+            os.unlink(name, dir_fd=fd)
+        finally:
+            os.close(fd)
+        try:
+            project.rmdir()
+        except OSError:
+            pass
+        return
+
+
+def main():
+    request = json.loads(sys.stdin.buffer.read(2049))
+    account, projects = profile()
+    if request.get("identity") is True:
+        print(json.dumps({"identity": account}))
+        return
+    sid, repo = request.get("id"), request.get("repo")
+    if (request.get("account") != account or not isinstance(sid, str)
+            or not re.fullmatch(r"(?:session_|cse_)[A-Za-z0-9]{1,128}", sid)
+            or not isinstance(repo, str) or not Path(repo).is_absolute()):
+        raise ValueError("invalid session, repository or login")
+    env = git_env(repo)
+    main_repo = Path(os.fsdecode(git(repo, env, "worktree", "list", "--porcelain", "-z")
+                                 .split(b"\0")[0].removeprefix(b"worktree ")))
+    if not main_repo.is_dir() or "\n" in str(main_repo):
+        raise ValueError("cannot locate main worktree")
+    local_id = str(uuid.uuid4())
+    worktree = main_repo.with_name(
+        f"wt-{main_repo.name}-{time.strftime('%Y%m%d%H%M%S')}-ah-claude-{local_id[:8]}")
+
+    if worktree.exists():
+        raise ValueError("temporary worktree name is occupied")
+    git(repo, env, "worktree", "add", "--quiet", "--detach", str(worktree), "HEAD")
+    try:
+        # A path without shell/TUI delimiters is needed for the built-in command.
+        with tempfile.TemporaryDirectory(prefix="ah-claude-", dir="/tmp") as temp:
+            messages = export(worktree, env, sid, local_id, Path(temp) / "transcript.txt")
+    finally:
+        try:
+            remove_temporary_transcript(projects, local_id, worktree)
+        finally:
+            if git(worktree, env, "status", "--porcelain", "--ignored"):
+                raise ValueError("temporary worktree unexpectedly contains changes")
+            git(repo, env, "worktree", "remove", str(worktree))
+    if profile() != (account, projects):
+        raise ValueError("Claude login changed during export")
+    print(json.dumps({"id": sid, "messages": messages}, ensure_ascii=False))
+
+
+def interrupt(_signal, _frame):
+    raise InterruptedError("export interrupted")
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, interrupt)
+    try:
+        main()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        print("Could not read the Claude Cloud session or verify its account.", file=sys.stderr)
+        sys.exit(1)

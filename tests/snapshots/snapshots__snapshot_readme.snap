@@ -298,13 +298,37 @@ A prompt counts on the local day it was sent, and a session counts when it has a
 | Grok | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | opencode | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
 | Pi | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
-| DeepSeek Harness (dsh) | ✓ | ✓ | ✓ | | | | ✓ |
+| DeepSeek Harness (dsh) | ✓ | ✓ | ✓ | ✓² | | | ✓ |
 
 Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.json` (checking `procStart` so a reused PID is not reported), Grok's `active_sessions.json`, Copilot's `session-state/<id>/inuse.<pid>.lock`, and Codex's `thread-writer-locks/<id>.lock`. ¹ Codex is detected on Linux only, from the kernel lock table (`/proc/locks`); its PID is the lock holder, which for the interactive TUI is the Codex app-server. Running detection needs a PID liveness check, which is not implemented on Windows.
 
 The `model` field is the model that answered last in a session, and `models` (`-o models`) lists every model that answered, comma-separated in first-use order. For Copilot these are the models that actually answered, not the `auto` selection; for older Copilot logs whose replies name no model, `model` falls back to the last model in the session's usage metrics. Both are empty when the session records no model (e.g. older Codex and Grok logs, or a session with no reply). `model` is a default column, and on a TTY `ah log` shows it as a `Model:` line, omitted when empty.
 
 The `prompt_times` field (`-o prompt_times`) is a JSON array with the time of each user prompt in Unix seconds, read from the session's own records rather than from file times. An entry is `null` when the agent records no time for that prompt (Cursor, and Grok prompts that `updates.jsonl` does not log).
+
+² DeepSeek Harness resume requires the optional `[cloud.dsh]` SDK helper and a recorded provider/model.
+
+### Cloud and self-hosted sessions (opt-in)
+
+| Provider | Discover (`log`) | Search | Show | Resume |
+|---|---|---|---|---|
+| Codex Cloud conversations | ✓ Incremental | ✓ Conversation | ✓ Conversation | ✓ Browser |
+| Codex Cloud tasks (legacy) | △ Latest page | △ Latest turn | △ Latest turn | — |
+| Claude Code Cloud | △ Previously fetched sessions | △ Exported text | △ Exact URL; export may omit compacted history | ✓ Browser |
+| Cursor Cloud | ✓ Incremental | ✓ Conversation | ✓ Conversation | ✓ Browser |
+| GitHub Copilot Cloud tasks | △ Latest page | △ User prompts | △ User prompts | — |
+| OpenCode self-hosted server | ✓ Server list | ✓ Conversation | ✓ Session export | ✓ Server Web UI |
+| DeepSeek Harness (dsh) | — | — | — | — |
+| Grok Build / Antigravity managed / Pi cloud sync | — | — | — | — |
+
+✓ Supported for the listed source · △ Limited to the stated scope · — No Cloud integration. DeepSeek Harness supports local/SSH history and optional same-ID SDK resume, not managed Cloud history. Cursor's Cloud adapter was verified against API fixtures, not a live Cursor account.
+
+Enable only the providers you use in `~/.ahrc`. Use `ah -a log -o agent,origin,coverage,id,url,title` to distinguish Cloud snapshots from local logs. `ah -a log` refreshes supported sources automatically; `--refresh` requests an immediate update. `--offline` uses only saved data and does not show Claude Cloud snapshots because the current Claude account cannot be verified in that mode. A Cloud URL piped to `ah show` only uses the cache; it never imports a missing conversation. Claude still verifies the active account before displaying a saved transcript, even when referenced by a file path.
+
+- `[cloud.codex]`: set `enabled = true` for legacy tasks. `[cloud.codex_conversations]`: also set `helper` to the absolute path produced by `tools/build-codex-cloud-bridge`.
+- `[cloud.claude]`: set `enabled = true`, `helper` to the absolute path of `tools/claude-cloud-export`, and `repo` to a trusted checkout of the Cloud session's repository. Use the session's exact URL with `ah show` to fetch or revalidate it. The export does not include a reliable modification time, so date filters use when `ah` first observed the current text.
+- `[cloud.cursor]`, `[cloud.copilot]`, `[cloud.opencode]`: set `enabled = true` and provide `CURSOR_API_KEY`, `GH_TOKEN`, or `OPENCODE_PASSWORD`, respectively. OpenCode additionally requires the server `endpoint` and accepts an optional `username`.
+- `[cloud.dsh]`: set `enabled = true` and `helper` to the absolute path of `tools/dsh-sdk-resume`.
 
 ## Features
 

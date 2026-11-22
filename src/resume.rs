@@ -11,6 +11,14 @@ use crate::subcmd;
 
 pub fn run(args: ResumeArgs, filter: &FilterArgs) -> Result<(), String> {
     let explicit_session = subcmd::read_session_ref(args.session.as_deref())?;
+    if filter.remote.is_empty()
+        && explicit_session.as_deref().is_some_and(|reference| {
+            !strip_quotes(reference).contains("://")
+                && crate::cloud::providers::looks_like_claude_ref(reference, &canonical_home())
+        })
+    {
+        crate::cloud::providers::pin_claude_account(filter.agent.as_deref());
+    }
     run_with_session(explicit_session, args, filter)
 }
 
@@ -23,6 +31,25 @@ fn run_with_session(
 
     if let Some(session) = explicit_session.as_deref() {
         let unquoted = strip_quotes(session);
+        if filter.remote.is_empty() && args.session.as_deref().is_some_and(|s| s != "-") {
+            if let Some(argv) =
+                crate::cloud::providers::explicit_resume(unquoted, filter.agent.as_deref())
+            {
+                if !args.extra_args.is_empty() {
+                    return Err("Cloud browser resume does not accept extra arguments.".into());
+                }
+                let cmd = argv
+                    .iter()
+                    .map(|a| shell_quote(a))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if args.print {
+                    println!("{cmd}");
+                    return Ok(());
+                }
+                exec_resume(&cmd);
+            }
+        }
         if let Some((remote_def, remote_ref)) = remote::parse_remote_path(unquoted) {
             if args.print {
                 println!(
@@ -128,6 +155,9 @@ fn build_resume_command_for_path(
         return Err("No resume command available for this session.".to_string());
     }
 
+    if crate::cloud::providers::source_for_path(path).is_some() && !args.extra_args.is_empty() {
+        return Err("Cloud resume does not accept extra arguments.".into());
+    }
     let full_cmd = if args.extra_args.is_empty() {
         cmd.to_string()
     } else {

@@ -5,7 +5,9 @@ use std::path::Path;
 use tempfile::TempDir;
 
 fn ah() -> Command {
-    Command::cargo_bin("ah").unwrap()
+    let mut cmd = Command::cargo_bin("ah").unwrap();
+    cmd.env("AH_NO_CLOUD_SYNC", "1");
+    cmd
 }
 
 fn fixture_path(name: &str) -> String {

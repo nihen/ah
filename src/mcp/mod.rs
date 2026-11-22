@@ -398,6 +398,7 @@ fn worker_loop(shared: &Shared, base: &FilterArgs) {
             if std::env::var_os(TEST_PANIC_ENV).is_some() && job.arguments.contains_key("panic") {
                 panic!("test panic");
             }
+            crate::cloud::pin_mcp_cache();
             tools::call(&job.name, &job.arguments, base)
         }));
         let cancelled = {

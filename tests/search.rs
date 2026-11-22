@@ -905,6 +905,9 @@ fn remote_kind_filter_and_navigation_use_the_same_source_position() {
         r#"#!/usr/bin/env python3
 import os, shlex, sys
 args = shlex.split(sys.argv[-1])
+assert args[:2] == ["env", "AH_NO_CLOUD_SYNC=1"]
+os.environ["AH_NO_CLOUD_SYNC"] = "1"
+args = args[2:]
 os.environ['HOME'] = os.environ['TEST_REMOTE_HOME']
 os.chdir(os.environ['HOME'])
 os.execv(args[0], args)

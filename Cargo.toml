@@ -31,10 +31,14 @@ memmap2 = "0.9"
 dirs = "6"
 libc = "0.2"
 sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.23"
 unicode-width = "0.2.2"
 clap_mangen = "0.2.33"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 zstd = { version = "0.14.4", default-features = false }
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+tempfile = "3"
 
 [profile.release]
 opt-level = 3
@@ -45,4 +49,3 @@ strip = true
 assert_cmd = "2.2.0"
 predicates = "3.1.4"
 insta = "1"
-tempfile = "3"

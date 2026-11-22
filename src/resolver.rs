@@ -546,6 +546,8 @@ pub fn resolve_fields_with_mmap(
     preloaded_mmap: Option<&[u8]>,
 ) -> BTreeMap<Field, String> {
     let mut map = BTreeMap::new();
+    let other_cloud = plugin.id() == crate::cloud::providers::PLUGIN.id();
+    let cloud = other_cloud || crate::cloud::is_cache_path(path);
 
     // Resolve cwd once (needed by Project, Cwd, ResumeCmd)
     let needs_cwd = fields.iter().any(|f| {
@@ -697,6 +699,14 @@ pub fn resolve_fields_with_mmap(
             Field::Agent => crate::config::find_agent_for_path(path)
                 .map(|a| a.id.clone())
                 .unwrap_or_else(|| plugin.id().to_string()),
+            Field::Origin => if cloud { "cloud" } else { "local" }.into(),
+            Field::Coverage if other_cloud => crate::cloud::providers::coverage(path),
+            Field::Coverage if cloud => "latest-turn".into(),
+            Field::Url if other_cloud => {
+                crate::cloud::providers::url_for_path(path).unwrap_or_default()
+            }
+            Field::Url => crate::cloud::url_for_path(path),
+            Field::Project | Field::ProjectRaw if cloud => String::new(),
             Field::Project => match cwd {
                 Some(ref cwd_str) => project_name(cwd_str),
                 None => resolve_project_fallback(path, plugin, home),

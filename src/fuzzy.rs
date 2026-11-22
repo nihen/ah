@@ -666,7 +666,7 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
     let mut show_args = ShowArgs::with_session(args.head, Some(path_str), args.highlight.clone());
     show_args.at = args.at.clone();
     show_args.context = args.context;
-    crate::show::run(show_args, filter)
+    crate::show::run_selected(show_args, filter)
 }
 
 // ── Resume (interactive) ──
@@ -1085,6 +1085,7 @@ pub fn run_memory(
 /// Returns `None` if the user cancelled (exit 0 behavior).
 fn run_selector(selector: &str, args: &[String], input: &str) -> Result<Option<String>, String> {
     let mut child = Command::new(selector)
+        .env("AH_NO_CLOUD_SYNC", "1")
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1188,7 +1189,7 @@ pub fn run_search_hits(
     } else {
         crate::pager::setup(false)
     };
-    crate::show::run(args, filter)
+    crate::show::run_selected(args, filter)
 }
 
 #[cfg(test)]

@@ -38,14 +38,57 @@ fn highlight_text(text: &str, re: &regex::Regex) -> String {
 }
 
 pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
+    run_inner(args, filter, true)
+}
+
+pub fn run_selected(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
+    run_inner(args, filter, false)
+}
+
+fn run_inner(args: ShowArgs, filter: &FilterArgs, check_account: bool) -> Result<(), String> {
     if let Some(at) = &args.at {
         crate::location::Location::parse(at)?;
     }
     let home = canonical_home();
-    let explicit_session = subcmd::read_session_ref(args.session.as_deref())?;
+    let explicit_arg = args.session.as_deref().is_some_and(|s| s != "-");
+    let explicit_session = subcmd::read_session_ref(args.session.as_deref())?.map(|session| {
+        if filter.remote.is_empty()
+            && filter.agent.as_deref().is_none_or(|agent| agent == "codex")
+            && crate::cloud::enabled()
+        {
+            if let Some(id) = crate::cloud::url_id(strip_quotes(&session)) {
+                return id.to_owned();
+            }
+        }
+        session
+    });
+    if check_account
+        && !args.offline
+        && filter.remote.is_empty()
+        && explicit_session.as_deref().map_or(filter.all, |reference| {
+            crate::cloud::providers::looks_like_claude_ref(reference, &home)
+        })
+    {
+        // Resolve the actual SESSION, including stdin, before initializing
+        // the provider registry. Account checks do not import conversations.
+        crate::cloud::providers::pin_claude_account(filter.agent.as_deref());
+    }
 
-    if let Some(session) = explicit_session.as_deref() {
+    let provider_url = filter.remote.is_empty()
+        && explicit_session.as_deref().is_some_and(|v| {
+            crate::cloud::providers::is_url_ref(strip_quotes(v), filter.agent.as_deref())
+        });
+    if let Some(session) = explicit_session.as_deref().filter(|_| !provider_url) {
         let unquoted = strip_quotes(session);
+        if filter.remote.is_empty()
+            && crate::cloud::providers::configured_claude_url(unquoted, filter.agent.as_deref())
+        {
+            return Err(if args.offline {
+                "Claude Code Cloud account cannot be validated with --offline."
+            } else {
+                "Could not verify the Claude Code Cloud account. Check the CLI login and helper/repo settings."
+            }.to_owned());
+        }
         if let Some((remote_def, remote_path)) = remote::parse_remote_path(unquoted) {
             remote::exec_remote_show(remote_def, remote_path, &args, filter);
         }
@@ -74,7 +117,46 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
 
     let filters = filter.to_filters();
     let path = if let Some(session) = explicit_session.as_deref() {
-        subcmd::resolve_session_ref_of(session, &home, filter.agent.as_deref())?
+        if provider_url {
+            crate::cloud::providers::fetch(
+                strip_quotes(session),
+                args.offline || !explicit_arg || !check_account,
+                filter.agent.as_deref(),
+            )?
+            .ok_or_else(|| "Cloud session not in cache".to_owned())?
+        } else {
+            match subcmd::resolve_session_ref_of(session, &home, filter.agent.as_deref()) {
+                Ok(path) => {
+                    if explicit_arg && check_account && filter.remote.is_empty() {
+                        if let Err(err) = crate::cloud::providers::hydrate(&path, args.offline) {
+                            eprintln!("Cloud history not refreshed: {err}");
+                        }
+                    }
+                    path
+                }
+                Err(e)
+                    if explicit_arg
+                        && check_account
+                        && filter.remote.is_empty()
+                        && e.starts_with("No session found for id: ") =>
+                {
+                    match crate::cloud::fetch_missing(
+                        session,
+                        args.offline,
+                        filter.agent.as_deref(),
+                    )? {
+                        Some(path) => path,
+                        None => crate::cloud::providers::fetch(
+                            strip_quotes(session),
+                            args.offline,
+                            filter.agent.as_deref(),
+                        )?
+                        .ok_or(e)?,
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     } else {
         subcmd::resolve_session(
             None,
@@ -87,6 +169,7 @@ pub fn run(args: ShowArgs, filter: &FilterArgs) -> Result<(), String> {
         )?
     };
 
+    let path = crate::cloud::validate_cache_ref(path, &home)?;
     if let Some(fields) = meta_fields {
         let query = filter.query.clone().unwrap_or_default();
         // Validate -q early so a malformed regex doesn't silently turn into
@@ -177,6 +260,8 @@ pub(crate) fn emit_session_meta_tsv(
     query: &str,
     search_mode: crate::cli::SearchMode,
 ) -> Result<(), String> {
+    let checked = crate::cloud::validate_cache_ref(path.to_path_buf(), home)?;
+    let path = checked.as_path();
     let plugin = agents::find_plugin_for_path(path);
     // Fail fast if the file is unreadable so scripts get a non-zero exit
     // instead of plausible-but-empty TSV values.

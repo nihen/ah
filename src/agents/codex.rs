@@ -168,6 +168,10 @@ fn for_each_search_text(data: &[u8], visit: &mut dyn FnMut(&str) -> bool) {
 /// `timestamp`, `type`, then `payload` with its `type` and `role` first);
 /// when the head does not identify the line, it is kept.
 fn may_hold_search_text(line: &[u8]) -> bool {
+    // Normalized Cloud records need not have the key order of Codex rollouts.
+    if memchr::memmem::find(&line[..line.len().min(128)], b"\"ah_cloud_text\"").is_some() {
+        return true;
+    }
     use regex::bytes::Regex as BytesRegex;
     // JSON allows whitespace around `:`; `\s` also covers it inside the
     // `{` of `payload`.
@@ -260,8 +264,11 @@ fn visit_message_value(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -
                 );
                 if is_user_text {
                     if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        if !text.starts_with('<')
-                            && !text.starts_with("# ")
+                        if (val
+                            .pointer("/payload/ah_cloud_text")
+                            .and_then(|v| v.as_bool())
+                            == Some(true)
+                            || (!text.starts_with('<') && !text.starts_with("# ")))
                             && !visit(Message::user(text.to_string()).at(val.get("timestamp")))
                         {
                             return false;
@@ -297,6 +304,8 @@ struct SessionMeta {
     subagent: bool,
     /// The spawning thread, when the source records it.
     parent_id: Option<String>,
+    cloud_title: Option<String>,
+    cloud_created_at: Option<f64>,
 }
 
 /// Size and mtime of the cached file, and its metadata (`None` when the
@@ -344,6 +353,10 @@ fn read_session_meta(path: &Path) -> Option<SessionMeta> {
     let subagent = val.pointer("/payload/source/subagent").is_some();
     Some(SessionMeta {
         id: field("/payload/id"),
+        cloud_title: field("/payload/cloud_title"),
+        cloud_created_at: val
+            .pointer("/payload/cloud_created_at")
+            .and_then(|v| v.as_f64()),
         cwd: field("/payload/cwd"),
         subagent,
         parent_id: field("/payload/source/subagent/thread_spawn/parent_thread_id")
@@ -475,6 +488,9 @@ impl AgentPlugin for CodexPlugin {
     }
 
     fn resolve_project(&self, path: &Path, home: &Path) -> Option<String> {
+        if crate::cloud::is_cache_path(path) {
+            return None;
+        }
         if let Some(cwd) = self.resolve_cwd(path, home) {
             Some(strip_home(&cwd, home))
         } else {
@@ -496,7 +512,20 @@ impl AgentPlugin for CodexPlugin {
         session_meta(path)?.cwd.filter(|s| !s.is_empty())
     }
 
+    fn session_created(&self, path: &Path) -> Option<SystemTime> {
+        if crate::cloud::is_cache_path(path) {
+            return crate::cloud::epoch(session_meta(path)?.cloud_created_at?);
+        }
+        path.metadata().ok()?.created().ok()
+    }
+
     fn resolve_title(&self, path: &Path, _home: &Path) -> Option<String> {
+        if crate::cloud::is_cache_path(path) {
+            return Some(format!(
+                "[Cloud: latest turn] {}",
+                session_meta(path)?.cloud_title.unwrap_or_default()
+            ));
+        }
         let session_id = session_meta(path)?.id?;
         latest_thread_name(path, &session_id)
     }
@@ -549,7 +578,17 @@ impl AgentPlugin for CodexPlugin {
     }
 
     // `codex resume <id>` also finds archived sessions, so they keep their id.
+    fn session_id(&self, path: &Path, home: &Path) -> Option<String> {
+        if crate::cloud::is_cache_path(path) {
+            return path.file_stem()?.to_str().map(str::to_owned);
+        }
+        self.resolve_resume_id(path, home)
+    }
+
     fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
+        if crate::cloud::is_cache_path(path) {
+            return None;
+        }
         // A first line that is not JSON (empty or partly written file) has
         // no resumable id; only a readable line without one falls back to
         // the file name.

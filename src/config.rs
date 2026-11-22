@@ -8,6 +8,7 @@ use crate::agents::{self, AgentPlugin};
 
 static AGENT_REGISTRY: OnceLock<Vec<AgentDef>> = OnceLock::new();
 static REMOTE_REGISTRY: OnceLock<Vec<RemoteDef>> = OnceLock::new();
+static CLOUD_CONFIG: OnceLock<CloudConfig> = OnceLock::new();
 
 /// Runtime agent definition (built-in + config merged).
 pub struct AgentDef {
@@ -47,6 +48,52 @@ struct AhrcConfig {
     agents: HashMap<String, AgentEntry>,
     #[serde(default)]
     remotes: HashMap<String, RemoteEntry>,
+    #[serde(default)]
+    cloud: CloudConfig,
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct CloudConfig {
+    #[serde(default)]
+    codex: CloudEntry,
+    #[serde(flatten, deserialize_with = "parse_cloud_providers")]
+    pub(crate) providers: HashMap<String, CloudEntry>,
+}
+
+fn parse_cloud_providers<'de, D>(deserializer: D) -> Result<HashMap<String, CloudEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let entries = HashMap::<String, toml::Value>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|(name, value)| {
+            if !matches!(
+                name.as_str(),
+                "claude" | "codex_conversations" | "copilot" | "cursor" | "dsh" | "opencode"
+            ) {
+                return None;
+            }
+            match value.try_into() {
+                Ok(entry) => Some((name, entry)),
+                Err(_) => {
+                    eprintln!("Warning: ignoring invalid [cloud.{name}] configuration.");
+                    None
+                }
+            }
+        })
+        .collect())
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct CloudEntry {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    pub(crate) endpoint: Option<String>,
+    pub(crate) credential_env: Option<String>,
+    pub(crate) username: Option<String>,
+    pub(crate) helper: Option<PathBuf>,
+    pub(crate) repo: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Default)]
@@ -283,7 +330,7 @@ fn add_pi_session_dir(agents: &mut [AgentDef], home: &Path) {
 }
 
 /// Load config and build agent + remote registries.
-fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
+fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>, CloudConfig) {
     // 1. Build defaults from built-in plugins
     let mut agents: Vec<AgentDef> = agents::all_plugins()
         .iter()
@@ -353,7 +400,7 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
             }
         }
     } else {
-        return (agents, Vec::new());
+        return (agents, Vec::new(), CloudConfig::default());
     };
 
     // Built-in locations, for rejecting extra-pattern markers that overlap them.
@@ -453,7 +500,7 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>) {
     }
 
     let remotes = load_remotes(&config);
-    (agents, remotes)
+    (agents, remotes, config.cloud)
 }
 
 /// Load remote definitions from parsed config.
@@ -500,9 +547,19 @@ pub fn init(home: &Path) {
     if AGENT_REGISTRY.get().is_some() && REMOTE_REGISTRY.get().is_some() {
         return;
     }
-    let (agents, remotes) = load_config(home);
+    let (agents, remotes, cloud) = load_config(home);
+    CLOUD_CONFIG.get_or_init(|| cloud);
     AGENT_REGISTRY.get_or_init(|| agents);
     REMOTE_REGISTRY.get_or_init(|| remotes);
+}
+
+/// Whether the user enabled Codex Cloud in ~/.ahrc.
+pub fn codex_cloud_enabled() -> bool {
+    CLOUD_CONFIG.get().is_some_and(|c| c.codex.enabled)
+}
+
+pub(crate) fn cloud_entries() -> Option<&'static HashMap<String, CloudEntry>> {
+    CLOUD_CONFIG.get().map(|c| &c.providers)
 }
 
 /// Get all agents (including disabled).
@@ -535,6 +592,12 @@ pub fn active_agents() -> impl Iterator<Item = &'static AgentDef> {
 /// that disabling a specific agent (e.g. `agy` under `.gemini/antigravity-cli/`)
 /// does not make its files fall through to a less specific agent (`gemini`).
 pub fn find_agent_for_path(path: &Path) -> Option<&'static AgentDef> {
+    if crate::cloud::is_cache_path(path) {
+        return active_agents().find(|a| a.id == "codex");
+    }
+    if let Some(source) = crate::cloud::providers::source_for_path(path) {
+        return active_agents().find(|a| a.id == source.agent());
+    }
     best_agent_for_path(agents(), path)
 }
 
@@ -560,6 +623,11 @@ fn best_agent_for_path<'a>(candidates: &'a [AgentDef], path: &Path) -> Option<&'
 
 /// Find an active agent's plugin by path.
 pub fn find_plugin_for_path(path: &Path) -> &'static dyn AgentPlugin {
+    if crate::cloud::providers::source_for_path(path)
+        .is_some_and(|s| active_agents().any(|a| a.id == s.agent()))
+    {
+        return &crate::cloud::providers::PLUGIN;
+    }
     find_agent_for_path(path)
         .map(|a| a.plugin)
         .unwrap_or_else(agents::unknown_plugin)
@@ -626,7 +694,7 @@ mod tests {
     fn test_load_config_no_ahrc() {
         // Without ~/.ahrc, should return built-in defaults
         let home = PathBuf::from("/nonexistent/home");
-        let (agents, remotes) = load_config(&home);
+        let (agents, remotes, _) = load_config(&home);
         assert_eq!(agents.len(), 10);
         assert_eq!(agents[0].id, "claude");
         assert_eq!(agents[1].id, "codex");
@@ -639,7 +707,7 @@ mod tests {
         // agy (marker /.gemini/antigravity-cli/) disabled must NOT make its files
         // match gemini (marker /.gemini/).
         let home = test_home();
-        let (mut agents, _) = load_config(&home);
+        let (mut agents, _, _) = load_config(&home);
         agents.iter_mut().find(|a| a.id == "agy").unwrap().disabled = true;
         let agy_path = Path::new(
             "/Users/test/.gemini/antigravity-cli/brain/uuid/.system_generated/logs/transcript.jsonl",
@@ -694,7 +762,7 @@ extra_patterns = ["~/backup/sessions.db", "~/*.db"]
 "#,
         )
         .unwrap();
-        let (agents, _) = load_config(home);
+        let (agents, _, _) = load_config(home);
         let opencode = agents.iter().find(|a| a.id == "opencode").unwrap();
         let backup = home.join("backup/sessions.db");
         assert!(opencode.matches_path(&backup.join("ses_x")));
