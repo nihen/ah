@@ -30,6 +30,16 @@ class HelperSafety(unittest.TestCase):
             self.assertFalse(path.exists())
             self.assertEqual(other.read_text(), "other transcript")
 
+    def test_export_parser_preserves_indentation_beyond_display_prefix(self):
+        messages = helper["parse"](
+            "header\n❯ prompt\n  next line\n    nested\n\n"
+            "● ```python\n  def answer():\n      return 42\n  ```\n  \tTabbed\n"
+        )
+        self.assertEqual(messages[0]["text"], "prompt\nnext line\n  nested")
+        self.assertEqual(
+            messages[1]["text"], "```python\ndef answer():\n    return 42\n```\n\tTabbed",
+        )
+
     def test_checkout_config_disables_repo_filters(self):
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp) / "repo"

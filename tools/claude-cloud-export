@@ -150,8 +150,10 @@ def parse(text):
         if line.startswith(("❯ ", "● ")):
             blocks.append(("user" if line[0] == "❯" else "assistant", [line[2:]]))
         elif blocks:
-            blocks[-1][1].append(line.lstrip())
-    messages = [{"role": role, "text": "\n".join(lines).strip()}
+            # The renderer pads continuation lines by two spaces. Strip
+            # that prefix only; code and Markdown may have further indent.
+            blocks[-1][1].append(line.removeprefix("  "))
+    messages = [{"role": role, "text": "\n".join(lines).strip("\n")}
                 for role, lines in blocks if any(line.strip() for line in lines)]
     if not any(m["role"] == "user" for m in messages):
         raise ValueError("unsupported Claude export")

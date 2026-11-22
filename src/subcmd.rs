@@ -312,7 +312,7 @@ pub fn resolve_session_ref_of(
     // Try as file path
     let pb = PathBuf::from(s);
     if session_exists(&pb) {
-        return Ok(pb);
+        return crate::cloud::validate_cache_ref(pb, home);
     }
 
     // Strip surrounding quotes (e.g. from fzf preview passing shell-quoted paths)
@@ -320,7 +320,7 @@ pub fn resolve_session_ref_of(
     if unquoted != s {
         let pb = PathBuf::from(unquoted);
         if session_exists(&pb) {
-            return Ok(pb);
+            return crate::cloud::validate_cache_ref(pb, home);
         }
     }
 
@@ -332,7 +332,7 @@ pub fn resolve_session_ref_of(
     if unescaped != unquoted {
         let pb = PathBuf::from(&unescaped);
         if session_exists(&pb) {
-            return Ok(pb);
+            return crate::cloud::validate_cache_ref(pb, home);
         }
         if let Ok(p) = resolve_by_id(&unescaped, home, agent) {
             return Ok(p);

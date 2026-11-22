@@ -11,6 +11,14 @@ use crate::subcmd;
 
 pub fn run(args: ResumeArgs, filter: &FilterArgs) -> Result<(), String> {
     let explicit_session = subcmd::read_session_ref(args.session.as_deref())?;
+    if filter.remote.is_empty()
+        && explicit_session.as_deref().is_some_and(|reference| {
+            !strip_quotes(reference).contains("://")
+                && crate::cloud::providers::looks_like_claude_ref(reference, &canonical_home())
+        })
+    {
+        crate::cloud::providers::pin_claude_account(filter.agent.as_deref());
+    }
     run_with_session(explicit_session, args, filter)
 }
 

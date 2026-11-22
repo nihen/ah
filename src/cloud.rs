@@ -170,6 +170,73 @@ pub fn is_cache_path(path: &Path) -> bool {
         && fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheRoot {
+    Legacy,
+    Provider,
+}
+
+fn cache_root_of(path: &Path, home: &Path) -> Option<CacheRoot> {
+    let relative = path.strip_prefix(home).ok()?;
+    match relative.components().next()?.as_os_str().to_str()? {
+        ".ah-codex-cloud" => Some(CacheRoot::Legacy),
+        ".ah-provider-cloud" => Some(CacheRoot::Provider),
+        _ => None,
+    }
+}
+
+/// Do not allow unavailable Cloud snapshots to fall through to the generic
+/// file parser. Canonicalizing detects aliases that hide the cache prefix.
+pub(crate) fn validate_cache_ref(path: PathBuf, home: &Path) -> Result<PathBuf, String> {
+    let lexical = if path.is_absolute() {
+        cache_root_of(&path, home)
+    } else {
+        std::env::current_dir()
+            .ok()
+            .and_then(|cwd| cache_root_of(&cwd.join(&path), home))
+    };
+    let canonical = fs::canonicalize(&path).ok();
+    let physical = canonical.as_deref().and_then(|p| cache_root_of(p, home));
+    let direct_symlink = || fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink());
+    let inside_cache = lexical.or_else(|| {
+        if physical.is_none() && !direct_symlink() {
+            return None;
+        }
+        let parent = path.parent()?;
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let resolved = fs::canonicalize(parent).ok()?;
+        cache_root_of(&resolved, home)
+    });
+    if inside_cache.is_none() && physical.is_none() {
+        return Ok(path);
+    }
+    let valid = canonical.filter(|p| {
+        // An in-cache symlink is never a valid snapshot, even if it points
+        // at another file in the same cache. Outside aliases can name a
+        // validated canonical snapshot without bypassing its parser.
+        if inside_cache.is_some()
+            && (inside_cache != physical
+                || fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink()))
+        {
+            return false;
+        }
+        match physical {
+            Some(CacheRoot::Legacy) => {
+                is_cache_path(p) && crate::config::active_agents().any(|a| a.id == "codex")
+            }
+            Some(CacheRoot::Provider) => providers::source_for_path(p).is_some_and(|source| {
+                crate::config::active_agents().any(|a| a.id == source.agent())
+            }),
+            None => false,
+        }
+    });
+    valid.ok_or_else(|| "Cloud snapshot is not available for the active account or mode.".into())
+}
+
 fn valid_id(id: &str) -> bool {
     id.strip_prefix("task_e_")
         .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))

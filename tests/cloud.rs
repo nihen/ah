@@ -141,6 +141,15 @@ fn cached_cloud_sessions_use_normal_log_search_and_show_but_cannot_resume() {
     assert_eq!(basename.stdout, show.as_bytes());
     assert!(!call(&["resume", "--print", ID], true).status.success());
     assert!(!call(&["show", "--offline", ID], false).status.success());
+    let outside_alias = home.path().join("legacy-cache-alias.jsonl");
+    symlink(&entry, &outside_alias).unwrap();
+    auth("another-owner");
+    for path in [&entry, &outside_alias] {
+        let denied = call(&["show", "--raw", path.to_str().unwrap()], true);
+        assert!(!denied.status.success(), "{:?}", denied);
+        assert!(denied.stdout.is_empty());
+    }
+    auth("owner");
 
     enable_cloud(true);
     let mut mcp = Command::new(env!("CARGO_BIN_EXE_ah"))
@@ -484,6 +493,64 @@ esac
     let out = call("first", &["log", "--json", "-o", "path"]);
     let row: Value = serde_json::from_slice(&out.stdout).unwrap();
     let snapshot = std::path::Path::new(row["path"].as_str().unwrap());
+    let cached_path = format!("path:{}", snapshot.display());
+    let path_resume = call("first", &["resume", "--print", &cached_path]);
+    assert!(path_resume.status.success(), "{:?}", path_resume.stderr);
+    assert_eq!(resume.stdout, path_resume.stdout);
+    let alias = home.join("outside-cache-alias.json");
+    symlink(snapshot, &alias).unwrap();
+    let canonical_home = home.canonicalize().unwrap();
+    let relative = snapshot.strip_prefix(&canonical_home).unwrap();
+    for path in [snapshot, &alias, relative] {
+        for format in [
+            vec!["--raw"],
+            vec![],
+            vec!["--json"],
+            vec!["-o", "transcript"],
+        ] {
+            let mut args = vec!["show"];
+            args.extend_from_slice(&format);
+            args.push(path.to_str().unwrap());
+            let other = call("second", &args);
+            assert!(!other.status.success(), "{:?}", other);
+            assert!(other.stdout.is_empty());
+            args.insert(1, "--offline");
+            let offline = call("first", &args);
+            assert!(!offline.status.success(), "{:?}", offline);
+            assert!(offline.stdout.is_empty());
+        }
+    }
+    let stdin = |reference, dash| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ah"));
+        cmd.env("HOME", home)
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("MOCK_CLAUDE_ACCOUNT", "first")
+            .env_remove("AH_NO_CLOUD_SYNC")
+            .current_dir(home)
+            .args(["show", "--json"]);
+        if dash {
+            cmd.arg("-");
+        }
+        pipe_ref(&mut cmd, reference)
+    };
+    for reference in [&url[..], alias.to_str().unwrap()] {
+        for dash in [false, true] {
+            let piped = stdin(reference, dash);
+            assert!(piped.status.success(), "{:?}", piped.stderr);
+            assert_eq!(shown.stdout, piped.stdout);
+        }
+    }
+    let missing = stdin("https://claude.ai/code/session_unknown", true);
+    assert!(!missing.status.success());
+    let trace = std::fs::read_to_string(&requests).unwrap();
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.contains("\"id\":"))
+            .count(),
+        1
+    );
+
     let read_snapshot =
         || serde_json::from_slice::<Value>(&std::fs::read(snapshot).unwrap()).unwrap();
     let modified = read_snapshot()["modified"].as_u64().unwrap();

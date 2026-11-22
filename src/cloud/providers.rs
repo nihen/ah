@@ -1312,6 +1312,24 @@ fn claude_cloud_id(id: &str) -> bool {
         })
 }
 
+pub(crate) fn looks_like_claude_ref(value: &str, home: &Path) -> bool {
+    let value = crate::output::strip_quotes(value);
+    if claude_cloud_id(value) || value.starts_with("https://claude.ai/code/") {
+        return true;
+    }
+    // Resolve the raw path first, including a symlink or relative alias.
+    // Fall back to an escaped TSV path only if the raw value cannot resolve.
+    fs::canonicalize(value)
+        .or_else(|_| fs::canonicalize(Path::new(&*crate::output::unescape_tsv(value))))
+        .is_ok_and(|path| {
+            path.strip_prefix(home.join(".ah-provider-cloud"))
+                .ok()
+                .and_then(|p| p.components().next())
+                .and_then(|part| part.as_os_str().to_str())
+                .is_some_and(|name| name.starts_with("claude-"))
+        })
+}
+
 pub(crate) fn configured_claude_url(value: &str, agent: Option<&str>) -> bool {
     agent.is_none_or(|a| a == "claude")
         && config::active_agents().any(|a| a.id == "claude")

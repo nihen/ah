@@ -666,7 +666,7 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
     let mut show_args = ShowArgs::with_session(args.head, Some(path_str), args.highlight.clone());
     show_args.at = args.at.clone();
     show_args.context = args.context;
-    crate::show::run(show_args, filter)
+    crate::show::run_selected(show_args, filter)
 }
 
 // ── Resume (interactive) ──
@@ -1189,7 +1189,7 @@ pub fn run_search_hits(
     } else {
         crate::pager::setup(false)
     };
-    crate::show::run(args, filter)
+    crate::show::run_selected(args, filter)
 }
 
 #[cfg(test)]
