@@ -308,12 +308,13 @@ impl AgentPlugin for CopilotPlugin {
         let reply = memchr::memmem::Finder::new(b"assistant.message");
         let run = memchr::memmem::Finder::new(b"\"session.");
         let mut models = super::common::ModelList::default();
-        for line in data.split(|&b| b == b'\n') {
+        for line in super::common::jsonl_lines(&data) {
             if finder.find(line).is_none() && reply.find(line).is_none() && run.find(line).is_none()
             {
                 continue;
             }
-            let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) else {
+            const PATHS: &[&[&str]] = &[&["type"], &["data", "model"], &["data", "modelMetrics"]];
+            let Some(val) = super::common::parse_json_paths(line, PATHS) else {
                 continue;
             };
             let kind = val.get("type").and_then(|v| v.as_str());

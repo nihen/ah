@@ -551,12 +551,18 @@ impl AgentPlugin for CodexPlugin {
         let item = memchr::memmem::Finder::new(b"\"response_item\"");
         let mut models = super::common::ModelList::default();
         let mut pending: Option<String> = None;
-        for line in data.split(|&b| b == b'\n') {
+        for line in super::common::jsonl_lines(&data) {
             let is_turn = turn.find(line).is_some();
             if !is_turn && (pending.is_none() || item.find(line).is_none()) {
                 continue;
             }
-            let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) else {
+            const PATHS: &[&[&str]] = &[
+                &["type"],
+                &["payload", "model"],
+                &["payload", "type"],
+                &["payload", "role"],
+            ];
+            let Some(val) = super::common::parse_json_paths(line, PATHS) else {
                 continue;
             };
             match val.get("type").and_then(|v| v.as_str()) {

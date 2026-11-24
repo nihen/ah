@@ -257,7 +257,9 @@ impl AgentPlugin for GrokPlugin {
     }
 
     fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
-        super::common::jsonl_models(path, b"\"model_id\"", |val| val.get("model_id")?.as_str())
+        super::common::jsonl_models(path, b"\"model_id\"", &[&["model_id"]], |val| {
+            val.get("model_id")?.as_str()
+        })
     }
 
     fn resolve_title(&self, path: &Path, _home: &Path) -> Option<String> {

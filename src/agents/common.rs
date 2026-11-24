@@ -215,21 +215,178 @@ impl ModelList {
     }
 }
 
+/// Parse a JSON object keeping only the values at `paths` (each a list of
+/// object keys from the root); every other value is validated like
+/// `serde_json::Value` would, but not built, so the same lines parse. A
+/// value that is not an object where a path continues reads as `null`:
+/// `Value::pointer` along `paths` sees what it would in the full value.
+pub fn parse_json_paths(line: &[u8], paths: &[&[&str]]) -> Option<serde_json::Value> {
+    use serde::de::DeserializeSeed;
+    let mut de = serde_json::Deserializer::from_slice(line);
+    let val = JsonPaths(paths.to_vec()).deserialize(&mut de).ok()?;
+    de.end().ok()?;
+    Some(val)
+}
+
+/// Remainders of the paths that pass through the value being parsed.
+struct JsonPaths<'p>(Vec<&'p [&'p str]>);
+
+impl<'de> serde::de::DeserializeSeed<'de> for JsonPaths<'_> {
+    type Value = serde_json::Value;
+    fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<Self::Value, D::Error> {
+        if self.0.iter().any(|path| path.is_empty()) {
+            return serde::Deserialize::deserialize(de);
+        }
+        de.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for JsonPaths<'_> {
+    type Value = serde_json::Value;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut kept = serde_json::Map::new();
+        while let Some(rest) = map.next_key_seed(PathsUnderKey(&self.0))? {
+            match rest.first() {
+                Some((key, _)) => {
+                    let rest = rest.iter().map(|(_, rest)| *rest).collect();
+                    kept.insert(key.to_string(), map.next_value_seed(JsonPaths(rest))?);
+                }
+                None => {
+                    map.next_value::<Skipped>()?;
+                }
+            }
+        }
+        Ok(serde_json::Value::Object(kept))
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        while seq.next_element::<Skipped>()?.is_some() {}
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+}
+
+/// Reads an object key as the paths that start with it: the key and the
+/// rest of each. Empty for a key no path goes through.
+struct PathsUnderKey<'a, 'p>(&'a [&'p [&'p str]]);
+
+impl<'de, 'p> serde::de::DeserializeSeed<'de> for PathsUnderKey<'_, 'p> {
+    type Value = Vec<(&'p str, &'p [&'p str])>;
+    fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<Self::Value, D::Error> {
+        de.deserialize_str(self)
+    }
+}
+
+impl<'p> serde::de::Visitor<'_> for PathsUnderKey<'_, 'p> {
+    type Value = Vec<(&'p str, &'p [&'p str])>;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("an object key")
+    }
+    fn visit_str<E>(self, key: &str) -> Result<Self::Value, E> {
+        Ok(self
+            .0
+            .iter()
+            .filter(|path| path[0] == key)
+            .map(|path| (path[0], &path[1..]))
+            .collect())
+    }
+}
+
+/// A JSON value that is read and dropped. Unlike `serde::de::IgnoredAny`,
+/// which `serde_json` skips without decoding, strings and numbers are
+/// decoded and the nesting limit applies, as for `serde_json::Value`.
+struct Skipped;
+
+impl<'de> serde::Deserialize<'de> for Skipped {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        de.deserialize_any(Skipped)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Skipped {
+    type Value = Skipped;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        while map.next_entry::<Skipped, Skipped>()?.is_some() {}
+        Ok(Skipped)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        while seq.next_element::<Skipped>()?.is_some() {}
+        Ok(Skipped)
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(Skipped)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(Skipped)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(Skipped)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(Skipped)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(Skipped)
+    }
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(Skipped)
+    }
+}
+
+/// The lines of `data`, as `data.split(|&b| b == b'\n')` yields them, found
+/// with SIMD search rather than a byte at a time.
+pub fn jsonl_lines(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut rest = Some(data);
+    std::iter::from_fn(move || {
+        let data = rest?;
+        let (line, after) = match memchr::memchr(b'\n', data) {
+            Some(end) => (&data[..end], Some(&data[end + 1..])),
+            None => (data, None),
+        };
+        rest = after;
+        Some(line)
+    })
+}
+
 /// Models from the JSONL lines that contain `needle`; other lines are
-/// skipped without parsing.
+/// skipped without parsing. `model_of` sees only the values at `paths`
+/// (see `parse_json_paths`).
 pub fn jsonl_models(
     path: &Path,
     needle: &[u8],
+    paths: &[&[&str]],
     model_of: impl for<'a> Fn(&'a serde_json::Value) -> Option<&'a str>,
 ) -> Option<ModelList> {
     let data = mmap_file(path)?;
     let finder = memchr::memmem::Finder::new(needle);
     let mut models = ModelList::default();
-    for line in data.split(|&b| b == b'\n') {
+    for line in jsonl_lines(&data) {
         if finder.find(line).is_none() {
             continue;
         }
-        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) {
+        if let Some(val) = parse_json_paths(line, paths) {
             if let Some(model) = model_of(&val) {
                 models.push(model);
             }
@@ -628,6 +785,103 @@ mod tests {
         assert_eq!((list.joined().as_str(), list.last()), ("A,B", "A"));
     }
     use super::*;
+
+    #[test]
+    fn parse_json_paths_keeps_only_the_paths() {
+        let line = br#"{"a":{"b":"x","c":[1,{"d":2}]},"t":"k","big":"skipped","n":{"m":1}}"#;
+        let val = parse_json_paths(line, &[&["t"], &["a", "b"], &["n"]]).unwrap();
+        assert_eq!(val, serde_json::json!({"a":{"b":"x"},"t":"k","n":{"m":1}}));
+    }
+
+    #[test]
+    fn parse_json_paths_reads_like_the_full_value() {
+        let paths: &[&[&str]] = &[&["a", "b"]];
+        // Not an object where the path continues: present, without `b`.
+        for line in [
+            r#"{"a":"s"}"#,
+            r#"{"a":[{"b":1}]}"#,
+            r#"{"a":null}"#,
+            r#"{"a":1.5}"#,
+        ] {
+            let val = parse_json_paths(line.as_bytes(), paths).unwrap();
+            assert!(val.get("a").is_some(), "{line}");
+            assert!(val.pointer("/a/b").is_none(), "{line}");
+        }
+        // The last of duplicate keys wins.
+        let val = parse_json_paths(br#"{"a":{"b":1},"a":{"b":2}}"#, paths).unwrap();
+        assert_eq!(val.pointer("/a/b"), Some(&serde_json::json!(2)));
+    }
+
+    /// Whatever sits outside the paths, a line parses exactly when it
+    /// parses as a full `Value`.
+    #[test]
+    fn parse_json_paths_accepts_the_lines_value_accepts() {
+        let paths: &[&[&str]] = &[&["a", "b"]];
+        let nested = |depth: usize| {
+            format!(
+                r#"{{"a":{{"b":1}},"x":{}0{}}}"#,
+                "[".repeat(depth),
+                "]".repeat(depth)
+            )
+        };
+        let nested_objects = |depth: usize| {
+            format!(
+                r#"{{"a":{{"b":1}},"x":{}0{}}}"#,
+                r#"{"k":"#.repeat(depth),
+                "}".repeat(depth)
+            )
+        };
+        let lines: Vec<Vec<u8>> = [
+            r#"{"a":{"b":1}}"#,
+            r#"{"a":{"b":1}"#,
+            r#"{"a":{"b":1}} x"#,
+            r#"{"a":{"b":1}}  "#,
+            r#"{"x":[1,}"#,
+            "",
+            "[]",
+            r#"{"a":{"b":1},"x":"\ud800"}"#,
+            r#"{"a":{"b":1},"x":"\ud83d\ude00"}"#,
+            r#"{"a":{"b":1},"\ud800":1}"#,
+            r#"{"a":{"b":1},"x":1e999}"#,
+            r#"{"a":{"b":1},"x":[1e999]}"#,
+            r#"{"a":{"b":1},"x":123456789012345678901234567890}"#,
+            r#"{"a":{"b":1},"x":01}"#,
+            r#"{"a":{"b":1},"x":"\q"}"#,
+            "{\"a\":{\"b\":1},\"x\":\"\t\"}",
+            r#"{"a":{"b":1},"x":{"y":tru}}"#,
+            r#"{"a":{"b":1},"x":{1:2}}"#,
+            r#"{"a":[[1e999]]}"#,
+        ]
+        .iter()
+        .map(|line| line.as_bytes().to_vec())
+        .chain([b"{\"a\":{\"b\":1},\"x\":\"\xff\"}".to_vec()])
+        .chain([b"{\"a\":{\"b\":1},\"\xff\":1}".to_vec()])
+        .chain((120..135).map(|depth| nested(depth).into_bytes()))
+        .chain((120..135).map(|depth| nested_objects(depth).into_bytes()))
+        .collect();
+        let mut accepted = 0;
+        for line in &lines {
+            let full = serde_json::from_slice::<serde_json::Value>(line).ok();
+            let kept = parse_json_paths(line, paths);
+            let shown = String::from_utf8_lossy(line);
+            assert_eq!(kept.is_some(), full.is_some(), "{shown}");
+            if let (Some(kept), Some(full)) = (kept, full) {
+                assert_eq!(kept.pointer("/a/b"), full.pointer("/a/b"), "{shown}");
+                accepted += 1;
+            }
+        }
+        // Both outcomes are covered.
+        assert!(accepted > 10 && accepted < lines.len() - 10);
+    }
+
+    #[test]
+    fn jsonl_lines_matches_split() {
+        for data in ["", "\n", "a", "a\n", "a\n\nb", "\na\nb\n"] {
+            let data = data.as_bytes();
+            let expected: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
+            assert_eq!(jsonl_lines(data).collect::<Vec<_>>(), expected);
+        }
+    }
 
     #[test]
     fn strip_home_is_path_boundary_aware() {
