@@ -271,7 +271,8 @@ impl AgentPlugin for ClaudePlugin {
 
     /// `<synthetic>` marks messages Claude Code wrote itself (e.g. API errors).
     fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
-        super::common::jsonl_models(path, b"\"model\"", |val| {
+        const PATHS: &[&[&str]] = &[&["type"], &["message", "model"]];
+        super::common::jsonl_models(path, b"\"model\"", PATHS, |val| {
             if val.get("type")?.as_str()? != "assistant" {
                 return None;
             }

@@ -261,7 +261,13 @@ impl AgentPlugin for PiPlugin {
     /// The model each assistant message names. A message without content
     /// (a request that failed) did not answer.
     fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
-        super::common::jsonl_models(path, b"\"model\"", |val| {
+        const PATHS: &[&[&str]] = &[
+            &["type"],
+            &["message", "role"],
+            &["message", "model"],
+            &["message", "content"],
+        ];
+        super::common::jsonl_models(path, b"\"model\"", PATHS, |val| {
             let (role, message) = entry_message(val)?;
             let answered = message
                 .get("content")
