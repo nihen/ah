@@ -150,11 +150,44 @@ fn strip_jsonc(src: &str) -> String {
 /// is exposed as the virtual path `<db>/<session-id>`, which never exists on
 /// disk. Child (subagent) sessions are listed only with `--subagents`.
 ///
-/// The searchable/raw form of a session is JSONL with one line per message:
-/// `{"id":"msg_…","info":<message.data>,"parts":[<part.data>,…]}`.
+/// The searchable/raw form of a session is JSONL with one line per message.
+/// It follows the tables the database keeps its sessions in (`Schema`):
+/// `{"id":"msg_…","info":<message.data>,"parts":[<part.data>,…]}` for
+/// opencode 1.x, `{"id":"msg_…","type":"user","data":<session_message.data>}`
+/// for opencode 2.
 pub struct OpencodePlugin;
 
-/// Session metadata from the `session` table.
+/// The tables a database keeps its sessions in.
+#[derive(Clone, Copy, PartialEq)]
+enum Schema {
+    /// opencode 1.x: `session`, `message` and `part`.
+    V1,
+    /// opencode 2: `session_v2` and `session_message`. Upgrading copies
+    /// every 1.x session and its messages here, and opencode writes nowhere
+    /// else afterwards, so the 1.x tables are not read.
+    V2,
+}
+
+impl Schema {
+    fn of(conn: &Connection) -> rusqlite::Result<Self> {
+        let tables: i64 = conn
+            .prepare_cached(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name IN ('session_v2', 'session_message')",
+            )?
+            .query_row([], |row| row.get(0))?;
+        Ok(if tables == 2 { Self::V2 } else { Self::V1 })
+    }
+
+    fn session_table(self) -> &'static str {
+        match self {
+            Self::V1 => "session",
+            Self::V2 => "session_v2",
+        }
+    }
+}
+
+/// Session metadata from the session table.
 #[derive(Clone)]
 struct SessionRow {
     parent_id: Option<String>,
@@ -306,7 +339,8 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
         parent_id: row.get("parent_id")?,
         directory: row.get("directory")?,
-        title: row.get("title")?,
+        // opencode 2 leaves the title NULL until it has generated one.
+        title: row.get::<_, Option<String>>("title")?.unwrap_or_default(),
         time_created: row.get("time_created")?,
         time_updated: row.get("time_updated")?,
     })
@@ -322,12 +356,12 @@ fn session_row(path: &Path) -> Option<SessionRow> {
     }
     let (db, id) = split_virtual_path(path)?;
     let row = match with_connection(db, |conn| {
-        conn.query_row(
+        let table = Schema::of(conn)?.session_table();
+        conn.prepare_cached(&format!(
             "SELECT parent_id, directory, title, time_created, time_updated \
-             FROM session WHERE id = ?1",
-            [id],
-            row_to_session,
-        )
+             FROM {table} WHERE id = ?1"
+        ))?
+        .query_row([id], row_to_session)
         .optional()
     }) {
         Ok(row) => row,
@@ -348,6 +382,28 @@ fn session_row(path: &Path) -> Option<SessionRow> {
 fn export_session(db: &Path, id: &str) -> Result<Vec<u8>, String> {
     with_connection(db, |conn| {
         let tx = conn.unchecked_transaction()?;
+        if Schema::of(&tx)? == Schema::V2 {
+            let mut out = Vec::new();
+            {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT id, type, data FROM session_message \
+                     WHERE session_id = ?1 ORDER BY seq, id",
+                )?;
+                let mut rows = stmt.query([id])?;
+                while let Some(row) = rows.next()? {
+                    for (key, idx) in [("{\"id\":", 0), (",\"type\":", 1)] {
+                        let text = serde_json::Value::String(row.get(idx)?).to_string();
+                        out.extend_from_slice(key.as_bytes());
+                        out.extend_from_slice(text.as_bytes());
+                    }
+                    out.extend_from_slice(b",\"data\":");
+                    out.extend_from_slice(&column_bytes(row, 2)?);
+                    out.extend_from_slice(b"}\n");
+                }
+            }
+            tx.finish()?;
+            return Ok(out);
+        }
         let mut parts: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         {
             let mut stmt = tx.prepare_cached(
@@ -392,11 +448,23 @@ fn export_session(db: &Path, id: &str) -> Result<Vec<u8>, String> {
     })
 }
 
-/// Byte length of `export_session` output, computed in SQL. Each line adds
-/// 29 bytes of framing (`{"id":""`, `,"info":`, `,"parts":[`, `]}\n`) plus
-/// one comma between parts. Message ids are ASCII, so need no escaping.
+/// Byte length of `export_session` output, computed in SQL. Each 1.x line
+/// adds 29 bytes of framing (`{"id":""`, `,"info":`, `,"parts":[`, `]}\n`)
+/// plus one comma between parts; each opencode 2 line adds 28 (`{"id":""`,
+/// `,"type":""`, `,"data":`, `}\n`). Message ids and types are ASCII, so
+/// need no escaping.
 fn export_size(db: &Path, id: &str) -> Result<u64, String> {
     with_connection(db, |conn| {
+        if Schema::of(conn)? == Schema::V2 {
+            return conn
+                .prepare_cached(
+                    "SELECT coalesce(sum(28 + length(CAST(id AS BLOB)) \
+                       + length(CAST(type AS BLOB)) + length(CAST(data AS BLOB))), 0) \
+                     FROM session_message WHERE session_id = ?1",
+                )?
+                .query_row([id], |row| row.get::<_, i64>(0))
+                .map(|size| size.max(0) as u64);
+        }
         conn.query_row(
             "SELECT \
                (SELECT coalesce(sum(29 + length(CAST(id AS BLOB)) + length(CAST(data AS BLOB))), 0) \
@@ -419,6 +487,11 @@ fn export_size(db: &Path, id: &str) -> Result<u64, String> {
 fn text_messages(db: &Path, id: &str) -> Result<Vec<Message>, String> {
     with_connection(db, |conn| {
         let tx = conn.unchecked_transaction()?;
+        if Schema::of(&tx)? == Schema::V2 {
+            let messages = text_messages_v2(&tx, id)?;
+            tx.finish()?;
+            return Ok(messages);
+        }
         // One pass over the session's parts (a per-message join would rescan
         // them for every message via the session index).
         let mut parts: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
@@ -460,24 +533,106 @@ fn text_messages(db: &Path, id: &str) -> Result<Vec<Message>, String> {
     })
 }
 
-/// Models of the session's assistant messages (`modelID`), in time order.
-/// Compaction summaries and responses interrupted before any text,
-/// reasoning or tool part are not answers.
+/// Messages of an opencode 2 session: the `text` of a `user` row and the
+/// text items of an `assistant` row's `content`, picked in SQL so that tool
+/// output, which is inline in the same JSON, is not copied out. Rows of any
+/// other type (`system`, `synthetic`, `compaction`, `idle`, …) are not part
+/// of the conversation.
+///
+/// A JSON function fails the whole query on text that is not JSON, and
+/// `json_extract` returns objects and arrays as text too, so every value is
+/// checked first, inside `CASE` (which evaluates only the branch it takes).
+fn text_messages_v2(conn: &Connection, id: &str) -> rusqlite::Result<Vec<Message>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT m.id, m.type, json_extract(m.data, '$.time.created'), \
+                CASE WHEN m.type = 'user' THEN \
+                       CASE WHEN json_type(m.data, '$.text') = 'text' \
+                            THEN json_extract(m.data, '$.text') END \
+                     WHEN json_type(c.value, '$.text') = 'text' \
+                       THEN json_extract(c.value, '$.text') END \
+         FROM session_message m \
+         LEFT JOIN json_each(CASE WHEN m.type = 'assistant' THEN \
+                               CASE WHEN json_valid(m.data) THEN \
+                                 CASE WHEN json_type(m.data, '$.content') = 'array' \
+                                      THEN m.data END END END, '$.content') c \
+           ON CASE WHEN c.type = 'object' THEN json_extract(c.value, '$.type') END = 'text' \
+         WHERE m.session_id = ?1 AND m.type IN ('user', 'assistant') \
+           AND CASE WHEN json_valid(m.data) THEN json_type(m.data) END = 'object' \
+         ORDER BY m.seq, m.id, c.key",
+    )?;
+    let mut rows = stmt.query([id])?;
+    // One row per text; the texts of a message are joined like 1.x parts.
+    let mut messages: Vec<(String, Message)> = Vec::new();
+    while let Some(row) = rows.next()? {
+        let ValueRef::Text(text) = row.get_ref(3)? else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(text);
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let message_id: String = row.get(0)?;
+        if let Some((last_id, last)) = messages.last_mut() {
+            if *last_id == message_id {
+                last.text.push_str("\n\n");
+                last.text.push_str(text);
+                continue;
+            }
+        }
+        let time = match row.get_ref(2)? {
+            ValueRef::Integer(ms) => Some(ms.into()),
+            ValueRef::Real(ms) => Some(ms.into()),
+            _ => None,
+        };
+        let message = match row.get_ref(1)? {
+            ValueRef::Text(b"user") => Message::user(text.to_string()),
+            _ => Message::assistant(text.to_string()),
+        };
+        messages.push((message_id, message.at(time.as_ref())));
+    }
+    Ok(messages.into_iter().map(|(_, message)| message).collect())
+}
+
+/// Models of the session's assistant messages (`modelID`; `model.id` in
+/// opencode 2), in order. Compaction summaries and responses interrupted
+/// before any text, reasoning or tool part are not answers.
 fn session_models(db: &Path, id: &str) -> Result<Option<super::common::ModelList>, String> {
     with_connection(db, |conn| {
-        let mut stmt = conn.prepare_cached(
-            "SELECT json_extract(data, '$.modelID') FROM message \
-             WHERE session_id = ?1 AND json_valid(data) \
-               AND json_extract(data, '$.role') = 'assistant' \
-               AND json_type(data, '$.modelID') = 'text' \
-               AND coalesce(json_extract(data, '$.summary'), 0) != 1 \
-               AND id IN (SELECT part.message_id FROM part WHERE part.session_id = ?1 \
-                 AND json_valid(part.data) \
-                 AND (json_extract(part.data, '$.type') = 'tool' \
-                   OR (json_extract(part.data, '$.type') IN ('text', 'reasoning') \
-                     AND trim(coalesce(json_extract(part.data, '$.text'), '')) != ''))) \
-             ORDER BY time_created, id",
-        )?;
+        let mut stmt = conn.prepare_cached(match Schema::of(conn)? {
+            Schema::V1 => {
+                "SELECT json_extract(data, '$.modelID') FROM message \
+                 WHERE session_id = ?1 AND json_valid(data) \
+                   AND json_extract(data, '$.role') = 'assistant' \
+                   AND json_type(data, '$.modelID') = 'text' \
+                   AND coalesce(json_extract(data, '$.summary'), 0) != 1 \
+                   AND id IN (SELECT part.message_id FROM part WHERE part.session_id = ?1 \
+                     AND json_valid(part.data) \
+                     AND (json_extract(part.data, '$.type') = 'tool' \
+                       OR (json_extract(part.data, '$.type') IN ('text', 'reasoning') \
+                         AND trim(coalesce(json_extract(part.data, '$.text'), '')) != ''))) \
+                 ORDER BY time_created, id"
+            }
+            Schema::V2 => {
+                // Guarded like `text_messages_v2`.
+                "SELECT json_extract(m.data, '$.model.id') FROM session_message m \
+                 WHERE m.session_id = ?1 AND m.type = 'assistant' \
+                   AND CASE WHEN json_valid(m.data) THEN \
+                         json_type(m.data, '$.model.id') END = 'text' \
+                   AND EXISTS (SELECT 1 FROM json_each( \
+                       CASE WHEN json_valid(m.data) THEN \
+                         CASE WHEN json_type(m.data, '$.content') = 'array' \
+                              THEN m.data END END, '$.content') c \
+                     WHERE CASE WHEN c.type = 'object' THEN \
+                       CASE json_extract(c.value, '$.type') \
+                         WHEN 'tool' THEN 1 \
+                         WHEN 'text' THEN json_type(c.value, '$.text') = 'text' \
+                         WHEN 'reasoning' THEN json_type(c.value, '$.text') = 'text' END \
+                       AND (json_extract(c.value, '$.type') = 'tool' \
+                         OR trim(json_extract(c.value, '$.text')) != '') END) \
+                 ORDER BY m.seq, m.id"
+            }
+        })?;
         let mut rows = stmt.query([id])?;
         let mut models = super::common::ModelList::default();
         while let Some(row) = rows.next()? {
@@ -489,9 +644,9 @@ fn session_models(db: &Path, id: &str) -> Result<Option<super::common::ModelList
     })
 }
 
-/// Search texts of an exported session (`export_session`): each text part
-/// of a conversation message, and the tool name, input, output and error of
-/// tool parts. Compaction summaries are skipped like in `message_from_parts`.
+/// Search texts of an exported session (`export_session`): each text of a
+/// conversation message, and the name, input, output and error of its tool
+/// calls. Compaction summaries are skipped like in `text_messages`.
 fn search_texts_of_export(data: &[u8], visit: &mut dyn FnMut(&str) -> bool) {
     super::common::for_each_jsonl_value_bytes(data, |line| {
         visit_search_record(line, &mut |_, text| visit(text))
@@ -581,10 +736,11 @@ impl AgentPlugin for OpencodePlugin {
 
     fn expand_sessions(&self, file: &Path) -> Option<Vec<(PathBuf, SystemTime)>> {
         let rows = with_connection(file, |conn| {
-            let mut stmt = conn.prepare(
+            let table = Schema::of(conn)?.session_table();
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, parent_id, directory, title, time_created, time_updated \
-                 FROM session",
-            )?;
+                 FROM {table}"
+            ))?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>("id")?, row_to_session(row)?))
             })?;
@@ -749,7 +905,62 @@ impl AgentPlugin for OpencodePlugin {
     }
 }
 
+/// Search texts of an opencode 2 export line. Only `user` and `assistant`
+/// rows are conversation; reasoning is not searched, as in 1.x. A tool's
+/// output is the text items of `state.content` (the others are files, e.g.
+/// an image as a data URI) and the `message` of `state.error`.
+fn visit_search_record_v2(
+    kind: Option<&str>,
+    data: &serde_json::Value,
+    visit: &mut TypedVisitor<'_>,
+) -> bool {
+    match kind {
+        Some("user") => data
+            .get("text")
+            .and_then(|v| v.as_str())
+            .is_none_or(|text| visit(K::User, text)),
+        Some("assistant") => {
+            let items = data.get("content").and_then(|v| v.as_array());
+            items.into_iter().flatten().all(|item| {
+                match item.get("type").and_then(|v| v.as_str()) {
+                    Some("text") => item
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|text| visit(K::Assistant, text)),
+                    Some("tool") => {
+                        let state = item.get("state");
+                        super::common::visit_tool_call(
+                            item.get("name"),
+                            state.and_then(|s| s.get("input")),
+                            &mut |text| visit(K::ToolInput, text),
+                        ) && {
+                            let output = state.and_then(|s| s.get("content"));
+                            let output = output.and_then(|v| v.as_array()).into_iter().flatten();
+                            let error = state.and_then(|s| s.get("error"));
+                            output
+                                .filter(|part| {
+                                    part.get("type").and_then(|v| v.as_str()) == Some("text")
+                                })
+                                .map(|part| part.get("text"))
+                                .chain([error.map(|e| e.get("message").unwrap_or(e))])
+                                .all(|text| {
+                                    text.and_then(|v| v.as_str())
+                                        .is_none_or(|text| visit(K::ToolOutput, text))
+                                })
+                        }
+                    }
+                    _ => true,
+                }
+            })
+        }
+        _ => true,
+    }
+}
+
 fn visit_search_record(line: &serde_json::Value, visit: &mut TypedVisitor<'_>) -> bool {
+    if let Some(data) = line.get("data") {
+        return visit_search_record_v2(line.get("type").and_then(|v| v.as_str()), data, visit);
+    }
     if line.pointer("/info/summary").and_then(|v| v.as_bool()) == Some(true) {
         return true;
     }
@@ -1189,5 +1400,200 @@ mod tests {
         );
         assert!(PLUGIN.resolve_models(&db.join("ses_empty")).is_none());
         assert!(PLUGIN.resolve_models(&db.join("ses_missing")).is_none());
+    }
+
+    /// Turn `create_db` into what opencode 2 leaves after upgrading it: the
+    /// 1.x tables stay, and the sessions live in `session_v2` /
+    /// `session_message`. `ses_aaa` was migrated; `ses_two` is new, with no
+    /// title yet, and exists only in the new tables.
+    fn create_db_v2(dir: &Path) -> PathBuf {
+        let db = create_db(dir);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                parent_id TEXT, slug TEXT NOT NULL, directory TEXT NOT NULL,
+                title TEXT, version TEXT NOT NULL, model TEXT,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+            CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+            CREATE TABLE session_part (message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL, type TEXT NOT NULL, call_id TEXT,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL, PRIMARY KEY (message_id, ordinal));
+            INSERT INTO session_v2 VALUES
+                ('ses_aaa', 'p', NULL, 'a', '/data/home/me/proj', 'My title', '1', NULL,
+                 1700000000000, 1700000100000),
+                ('ses_two', 'p', NULL, 't', '/data/home/me/two', NULL, '2.3.2', NULL,
+                 1700000300000, 1700000400000),
+                ('ses_kid', 'p', 'ses_two', 'k', '/data/home/me/two', 'Kid', '2.3.2', NULL,
+                 1700000300000, 1700000350000);
+            -- `seq` orders the rows; it has gaps and follows neither id nor time.
+            INSERT INTO session_message VALUES
+                ('msg_z', 'ses_two', 'user', 4, 9, 9,
+                 '{"time":{"created":1700000300000},"text":" first prompt ","files":[]}'),
+                ('msg_y', 'ses_two', 'system', 5, 8, 8, '{"text":"tools changed"}'),
+                ('msg_x', 'ses_two', 'assistant', 6, 7, 7,
+                 '{"time":{"created":1700000301000},"model":{"id":"model-a","providerID":"p"},"content":[{"type":"reasoning","text":"thinking-v2"},{"type":"text","text":"one"},{"type":"tool","id":"c1","name":"shell","state":{"status":"completed","input":{"command":"ls needle-input"},"content":[{"type":"text","text":"needle-output"},{"type":"file","uri":"data:image/png;base64,needle-image","mime":"image/png"}]}},{"type":"tool","id":"c2","name":"read","state":{"status":"error","input":{},"error":{"type":"tool.execution","message":"needle-error"}}},"stray",{"type":"text","text":{"not":"a string"}},{"type":"text","text":"two"}]}'),
+                ('msg_w', 'ses_two', 'synthetic', 7, 6, 6, '{"text":"Continue if you have next steps"}'),
+                ('msg_v', 'ses_two', 'compaction', 8, 5, 5, '{"status":"completed","summary":"compacted"}'),
+                ('msg_u', 'ses_two', 'assistant', 9, 4, 4,
+                 '{"model":{"id":"interrupted"},"content":[{"type":"reasoning","text":""}]}'),
+                ('msg_t', 'ses_two', 'assistant', 10, 3, 3,
+                 '{"model":{"id":"model-b"},"content":[{"type":"tool","id":"c3","name":"read","state":{}}]}'),
+                ('msg_s', 'ses_two', 'assistant', 11, 2, 2,
+                 '{"model":{"id":7},"content":[{"type":"text","text":"numbered"}]}'),
+                ('msg_r', 'ses_two', 'assistant', 12, 1, 1, '{"model":{"id":"no-content"},"content":"x"}'),
+                ('msg_q', 'ses_two', 'user', 13, 1, 1, '{"text":"second prompt"}'),
+                ('msg_p', 'ses_two', 'idle', 20, 1, 1, '{"outcome":"succeeded"}'),
+                ('msg_o', 'ses_two', 'user', 21, 1, 1, 'not json'),
+                ('msg_n', 'ses_two', 'assistant', 22, 1, 1, 'not json'),
+                ('msg_m', 'ses_two', 'user', 23, 1, 1, '{"text":{"not":"a prompt"}}'),
+                ('msg_l', 'ses_two', 'assistant', 24, 1, 1,
+                 '{"model":{"id":"not-an-array"},"content":{"a":{"type":"text","text":"not an item"}}}'),
+                ('msg_k', 'ses_two', 'assistant', 25, 1, 1,
+                 '{"model":{"id":"not-a-text"},"content":[{"type":"text","text":["x"]}]}'),
+                ('msg_j', 'ses_two', 'assistant', 26, 1, 1, '["not an object"]');
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+        db
+    }
+
+    #[test]
+    fn v2_lists_sessions_from_session_v2() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = create_db_v2(tmp.path());
+        let mut sessions = PLUGIN.expand_sessions(&db).unwrap();
+        sessions.sort();
+        // `ses_child` and `ses_empty` are only in the 1.x table.
+        assert_eq!(
+            sessions,
+            vec![
+                (db.join("ses_aaa"), millis_to_system_time(1700000100000)),
+                (db.join("ses_kid"), millis_to_system_time(1700000350000)),
+                (db.join("ses_two"), millis_to_system_time(1700000400000)),
+            ]
+        );
+        let path = db.join("ses_two");
+        let home = Path::new("/data/home/me");
+        assert_eq!(PLUGIN.resolve_title(&path, home), None);
+        assert_eq!(PLUGIN.resolve_project(&path, home).as_deref(), Some("two"));
+        assert_eq!(
+            PLUGIN.session_created(&path),
+            Some(millis_to_system_time(1700000300000))
+        );
+        assert_eq!(
+            PLUGIN.parent_session_id(&db.join("ses_kid")).as_deref(),
+            Some("ses_two")
+        );
+        PLUGIN.clear_caches();
+        assert_eq!(
+            PLUGIN.session_mtime(&path),
+            Some(millis_to_system_time(1700000400000))
+        );
+        assert_eq!(PLUGIN.session_mtime(&db.join("ses_child")), None);
+    }
+
+    #[test]
+    fn v2_parses_user_and_assistant_rows_in_seq_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = create_db_v2(tmp.path());
+        let path = db.join("ses_two");
+        let expected = vec![
+            Message::user("first prompt".to_string()).at(Some(&1700000300000i64.into())),
+            Message::assistant("one\n\ntwo".to_string()).at(Some(&1700000301000i64.into())),
+            Message::assistant("numbered".to_string()),
+            Message::user("second prompt".to_string()),
+        ];
+        assert_eq!(collect_messages(&path), expected);
+        let bytes = PLUGIN.session_bytes(&path).unwrap();
+        let mut from_bytes = Vec::new();
+        PLUGIN.iter_messages_from_bytes(&path, &bytes, &mut |m| {
+            from_bytes.push(m);
+            true
+        });
+        assert_eq!(from_bytes, expected);
+        // A migrated session reads from the new tables, where it has no rows
+        // in this fixture.
+        assert!(collect_messages(&db.join("ses_aaa")).is_empty());
+    }
+
+    #[test]
+    fn v2_session_bytes_hold_every_row_and_match_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = create_db_v2(tmp.path());
+        let path = db.join("ses_two");
+        let bytes = PLUGIN.session_bytes(&path).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(text.lines().count(), 17);
+        assert_eq!(
+            text.lines().next(),
+            Some(
+                r#"{"id":"msg_z","type":"user","data":{"time":{"created":1700000300000},"text":" first prompt ","files":[]}}"#
+            )
+        );
+        assert_eq!(PLUGIN.raw_content(&path).as_deref(), Some(text));
+        assert_eq!(PLUGIN.session_size(&path), Some(bytes.len() as u64));
+        assert_eq!(PLUGIN.session_size(&db.join("ses_aaa")), Some(0));
+        assert!(PLUGIN.session_bytes(&db.join("ses_aaa")).is_none());
+    }
+
+    #[test]
+    fn v2_searches_conversation_text_and_tool_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = create_db_v2(tmp.path());
+        let mut texts = Vec::new();
+        PLUGIN.iter_search_texts(&db.join("ses_two"), &mut |text| {
+            texts.push(text.to_string());
+            true
+        });
+        assert_eq!(
+            texts,
+            vec![
+                " first prompt ",
+                "one",
+                "shell",
+                "ls needle-input",
+                "needle-output",
+                "read",
+                "needle-error",
+                "two",
+                "read",
+                "numbered",
+                "second prompt",
+            ]
+        );
+    }
+
+    #[test]
+    fn v2_model_lists_answering_model_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = create_db_v2(tmp.path());
+        assert_eq!(
+            PLUGIN
+                .resolve_models(&db.join("ses_two"))
+                .map(|m| m.joined())
+                .as_deref(),
+            Some("model-a,model-b")
+        );
+        assert!(PLUGIN.resolve_models(&db.join("ses_aaa")).is_none());
+    }
+
+    #[test]
+    fn session_v2_without_session_message_reads_the_1x_tables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = create_db_v2(tmp.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TABLE session_message;").unwrap();
+        drop(conn);
+        assert_eq!(PLUGIN.expand_sessions(&db).unwrap().len(), 3);
+        assert_eq!(collect_messages(&db.join("ses_aaa")).len(), 3);
+        assert_eq!(
+            PLUGIN.session_mtime(&db.join("ses_child")),
+            Some(millis_to_system_time(1700000200000))
+        );
     }
 }
