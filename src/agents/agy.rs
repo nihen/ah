@@ -813,13 +813,11 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO conversations_fts VALUES ('c1', 'false')",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO conversations_fts VALUES ('c1', 'false')", [])
+            .unwrap();
         // Force a checkpoint so the initial DB is clean, then keep WAL active.
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
 
         std::os::unix::fs::symlink(&real_db, base.join("conversation_summaries.db")).unwrap();
 
