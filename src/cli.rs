@@ -213,7 +213,7 @@ impl Field {
             Field::Size => "Session file size in bytes",
             Field::Running => "Whether the session is currently running",
             Field::Pid => "PID of running agent process",
-            Field::Archived => "Whether the agent archived the session (Codex, agy)",
+            Field::Archived => "Whether the agent archived the session (Codex, agy, opencode)",
             Field::ParentId => "Id of the session that spawned this subagent session",
             Field::Model => "Model that answered last",
             Field::Models => "Models that answered, comma-separated in first-use order",
@@ -583,7 +583,7 @@ pub struct FilterArgs {
     #[arg(long = "running", global = true)]
     pub running: bool,
 
-    /// Hide sessions the agent has archived (Codex, agy)
+    /// Hide sessions the agent has archived (Codex, agy, opencode)
     #[arg(long = "no-archived", global = true)]
     pub no_archived: bool,
 
@@ -1744,7 +1744,7 @@ Global options:
   --no-preview            Disable preview in interactive mode
   --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
   --running               Show only currently running sessions (Claude, Codex, Copilot, Grok, agy)
-  --no-archived           Hide sessions the agent has archived (Codex, agy)
+  --no-archived           Hide sessions the agent has archived (Codex, agy, opencode)
   --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
@@ -1782,7 +1782,7 @@ const GLOBAL_OPTIONS: &str = r#"Global options:
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --running               Show only currently running sessions (Claude, Codex, Copilot, Grok, agy)
-  --no-archived           Hide sessions the agent has archived (Codex, agy)
+  --no-archived           Hide sessions the agent has archived (Codex, agy, opencode)
   --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --color                 Force colored output (even through pipes)

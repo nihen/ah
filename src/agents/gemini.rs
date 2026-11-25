@@ -564,20 +564,32 @@ impl AgentPlugin for GeminiPlugin {
 
     fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
         let base = gemini_base(home);
-        context_file_names(&base)
+        let mut sources: Vec<MemorySource> = context_file_names(&base)
             .iter()
             .map(|name| MemorySource::new(&base, name, MemoryKind::Instruction))
-            .collect()
+            .collect();
+        sources.push(MemorySource::new(
+            &base,
+            "skills/*/SKILL.md",
+            MemoryKind::Skill,
+        ));
+        sources
     }
 
     fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
         let base = gemini_base(&super::common::canonical_home());
-        context_file_names(&base)
+        let mut sources: Vec<MemorySource> = context_file_names(&base)
             .iter()
             // A project AGENTS.md is listed once, as shared.
             .filter(|name| name.as_str() != "AGENTS.md")
             .map(|name| MemorySource::new(dir, name, MemoryKind::Instruction))
-            .collect()
+            .collect();
+        sources.push(MemorySource::new(
+            dir,
+            ".gemini/skills/*/SKILL.md",
+            MemoryKind::Skill,
+        ));
+        sources
     }
 
     fn project_desc(&self) -> &'static str {

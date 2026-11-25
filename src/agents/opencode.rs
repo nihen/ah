@@ -195,6 +195,7 @@ struct SessionRow {
     title: String,
     time_created: i64,
     time_updated: i64,
+    archived: bool,
 }
 
 static SESSION_CACHE: LazyLock<Mutex<HashMap<PathBuf, Option<SessionRow>>>> =
@@ -335,7 +336,27 @@ fn column_bytes(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Vec<u8>
     })
 }
 
+fn time_archived_expr(conn: &Connection, table: &str) -> rusqlite::Result<&'static str> {
+    let sql = match table {
+        "session_v2" => {
+            "SELECT 1 FROM pragma_table_info('session_v2') WHERE name = 'time_archived' LIMIT 1"
+        }
+        _ => "SELECT 1 FROM pragma_table_info('session') WHERE name = 'time_archived' LIMIT 1",
+    };
+    let has_col = conn
+        .prepare_cached(sql)?
+        .query_row([], |_| Ok(()))
+        .optional()?
+        .is_some();
+    Ok(if has_col {
+        "time_archived"
+    } else {
+        "NULL AS time_archived"
+    })
+}
+
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+    let time_archived: Option<i64> = row.get("time_archived")?;
     Ok(SessionRow {
         parent_id: row.get("parent_id")?,
         directory: row.get("directory")?,
@@ -343,6 +364,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         title: row.get::<_, Option<String>>("title")?.unwrap_or_default(),
         time_created: row.get("time_created")?,
         time_updated: row.get("time_updated")?,
+        archived: time_archived.is_some_and(|t| t != 0),
     })
 }
 
@@ -357,8 +379,9 @@ fn session_row(path: &Path) -> Option<SessionRow> {
     let (db, id) = split_virtual_path(path)?;
     let row = match with_connection(db, |conn| {
         let table = Schema::of(conn)?.session_table();
+        let archived_col = time_archived_expr(conn, table)?;
         conn.prepare_cached(&format!(
-            "SELECT parent_id, directory, title, time_created, time_updated \
+            "SELECT parent_id, directory, title, time_created, time_updated, {archived_col} \
              FROM {table} WHERE id = ?1"
         ))?
         .query_row([id], row_to_session)
@@ -709,17 +732,25 @@ impl AgentPlugin for OpencodePlugin {
 
     fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
         let config = opencode_config_dir(home);
-        let mut sources = vec![MemorySource::new(
-            &config,
-            "AGENTS.md",
-            MemoryKind::Instruction,
-        )];
+        let mut sources = vec![
+            MemorySource::new(&config, "AGENTS.md", MemoryKind::Instruction),
+            MemorySource::new(&config, "skills/*/SKILL.md", MemoryKind::Skill),
+        ];
         sources.extend(configured_instructions(&config, home));
         sources
     }
 
     fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
-        configured_instructions(dir, &super::common::canonical_home())
+        let mut sources = vec![MemorySource::new(
+            dir,
+            ".opencode/skills/*/SKILL.md",
+            MemoryKind::Skill,
+        )];
+        sources.extend(configured_instructions(
+            dir,
+            &super::common::canonical_home(),
+        ));
+        sources
     }
 
     fn project_desc(&self) -> &'static str {
@@ -737,8 +768,9 @@ impl AgentPlugin for OpencodePlugin {
     fn expand_sessions(&self, file: &Path) -> Option<Vec<(PathBuf, SystemTime)>> {
         let rows = with_connection(file, |conn| {
             let table = Schema::of(conn)?.session_table();
+            let archived_col = time_archived_expr(conn, table)?;
             let mut stmt = conn.prepare(&format!(
-                "SELECT id, parent_id, directory, title, time_created, time_updated \
+                "SELECT id, parent_id, directory, title, time_created, time_updated, {archived_col} \
                  FROM {table}"
             ))?;
             let rows = stmt.query_map([], |row| {
@@ -898,6 +930,10 @@ impl AgentPlugin for OpencodePlugin {
         let (db, id) = split_virtual_path(path)?;
         session_row(path)?;
         session_models(db, id).map_err(|e| warn_once(db, &e)).ok()?
+    }
+
+    fn is_archived(&self, path: &Path) -> bool {
+        session_row(path).is_some_and(|row| row.archived)
     }
 
     fn parent_session_id(&self, path: &Path) -> Option<String> {
@@ -1595,5 +1631,24 @@ mod tests {
             PLUGIN.session_mtime(&db.join("ses_child")),
             Some(millis_to_system_time(1700000200000))
         );
+    }
+
+    #[test]
+    fn archived_sessions_are_detected_from_time_archived() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = create_db_v2(tmp.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("ALTER TABLE session_v2 ADD COLUMN time_archived INTEGER;")
+            .unwrap();
+        conn.execute(
+            "UPDATE session_v2 SET time_archived = 1700000500000 WHERE id = 'ses_aaa'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        PLUGIN.clear_caches();
+        assert!(PLUGIN.is_archived(&db.join("ses_aaa")));
+        assert!(!PLUGIN.is_archived(&db.join("ses_two")));
     }
 }

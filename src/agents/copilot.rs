@@ -230,11 +230,10 @@ impl AgentPlugin for CopilotPlugin {
     fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
         let base =
             crate::config::resolve_agent_base(self.id()).unwrap_or_else(|| home.join(".copilot"));
-        vec![MemorySource::new(
-            &base,
-            "copilot-instructions.md",
-            MemoryKind::Instruction,
-        )]
+        vec![
+            MemorySource::new(&base, "copilot-instructions.md", MemoryKind::Instruction),
+            MemorySource::new(&base, "skills/*/SKILL.md", MemoryKind::Skill),
+        ]
     }
 
     fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
@@ -250,6 +249,7 @@ impl AgentPlugin for CopilotPlugin {
                 ".github/instructions/**/*.instructions.md",
                 MemoryKind::Rule,
             ),
+            MemorySource::new(dir, ".github/skills/*/SKILL.md", MemoryKind::Skill),
         ]
     }
 

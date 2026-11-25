@@ -227,7 +227,7 @@ Files listed per agent (global paths honor each agent's env var; project paths a
 | Pi | `~/.pi/agent/AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `SYSTEM.md`, `APPEND_SYSTEM.md` | `.pi/SYSTEM.md`, `.pi/APPEND_SYSTEM.md` |
 | shared | — | `AGENTS.md` |
 
-Types: `instruction` (always-loaded files), `rule`, `memory` (or the type in a memory file's frontmatter, such as `feedback`), and `skill`. Skills (`SKILL.md` under `skills/*/` of Claude, Codex, and agy, anywhere under Pi's `skills/`, and `.agents/skills/*/`) are listed only with `-t skill`.
+Types: `instruction` (always-loaded files), `rule`, `memory` (or the type in a memory file's frontmatter, such as `feedback`), and `skill`. Skills (`SKILL.md` under each agent's `skills/*/` directory, anywhere under Pi's `skills/`, and `.agents/skills/*/`) are listed only with `-t skill`.
 
 Show session summary per agent:
 
@@ -293,7 +293,7 @@ A prompt counts on the local day it was sent, and a session counts when it has a
 | Codex | ✓ | ✓ | ✓ | ✓ | ✓¹ | ✓ | ✓ |
 | Gemini | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
 | Copilot | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Cursor | ✓ | ✓ | ✓ | ✓ | | ✓ | |
+| Cursor | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
 | Antigravity (agy) | ✓ | ✓ | ✓ | ✓ | ✓¹ | ✓ | |
 | Grok | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | opencode | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
@@ -443,7 +443,7 @@ Global options:
   --no-preview            Disable preview in interactive mode
   --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
   --running               Show only currently running sessions (Claude, Codex, Copilot, Grok, agy)
-  --no-archived           Hide sessions the agent has archived (Codex, agy)
+  --no-archived           Hide sessions the agent has archived (Codex, agy, opencode)
   --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
@@ -561,7 +561,7 @@ Global options:
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --running               Show only currently running sessions (Claude, Codex, Copilot, Grok, agy)
-  --no-archived           Hide sessions the agent has archived (Codex, agy)
+  --no-archived           Hide sessions the agent has archived (Codex, agy, opencode)
   --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --color                 Force colored output (even through pipes)
@@ -629,7 +629,7 @@ Global options:
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --running               Show only currently running sessions (Claude, Codex, Copilot, Grok, agy)
-  --no-archived           Hide sessions the agent has archived (Codex, agy)
+  --no-archived           Hide sessions the agent has archived (Codex, agy, opencode)
   --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --color                 Force colored output (even through pipes)
@@ -980,7 +980,7 @@ DeepSeek Harness compresses its session logs with Zstandard by default; `ah` dec
 
 opencode stores all sessions in one SQLite database. `ah` reads it read-only and lists each session under the virtual path `<db>/<session-id>`, which works with `ah show`, `ah resume`, and `-o path` like a regular session file. `ah show --raw` prints one JSON line per message: its `info` and `parts` for an opencode 1.x database, its `type` and `data` once opencode 2 has moved the sessions to its new tables.
 
-Codex sessions archived with `codex archive` and Antigravity sessions archived in `conversation_summaries.db` stay listed and resumable (`codex resume` / `agy --conversation` still find them). They carry `archived=true` (`-o archived`); hide them with `--no-archived`.
+Codex sessions archived with `codex archive`, Antigravity sessions archived in `conversation_summaries.db`, and opencode sessions with `time_archived` set stay listed and resumable (`codex resume` / `agy --conversation` / `opencode --session` still find them). They carry `archived=true` (`-o archived`); hide them with `--no-archived`.
 
 Subagent sessions (started by another session, e.g. Claude's Task tool) are hidden from `log`, `project`, and `agent` unless `--subagents` is given; `-o parent_id` shows the session that spawned them. A subagent's id or path still works with `ah show` directly. Claude, Cursor, and Gemini subagent transcripts cannot be resumed on their own, so they have no resume command.
 

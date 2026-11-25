@@ -1,10 +1,13 @@
 use super::entries::{RecordVisitor, SearchKind as K, TypedVisitor};
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, SystemTime};
 
 use regex::Regex;
+use rusqlite::{Connection, OpenFlags};
 
 use super::AgentPlugin;
 use super::Message;
@@ -304,6 +307,12 @@ impl AgentPlugin for CursorPlugin {
         if let Ok(mut c) = LISTING_CACHE.lock() {
             c.clear();
         }
+        if let Ok(mut c) = CHAT_STORE_INDEX_CACHE.lock() {
+            c.clear();
+        }
+        if let Ok(mut c) = CHAT_META_CACHE.lock() {
+            c.clear();
+        }
     }
 
     fn id(&self) -> &'static str {
@@ -334,20 +343,21 @@ impl AgentPlugin for CursorPlugin {
         true
     }
 
-    /// User rules live in `$HOME/.cursor/rules` even when `CURSOR_DATA_DIR`
-    /// moves the session data.
+    /// User rules and skills live in `$HOME/.cursor/` even when
+    /// `CURSOR_DATA_DIR` moves the session data.
     fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
-        vec![MemorySource::new(
-            &home.join(".cursor/rules"),
-            "**/*.mdc",
-            MemoryKind::Rule,
-        )]
+        let base = home.join(".cursor");
+        vec![
+            MemorySource::new(&base.join("rules"), "**/*.mdc", MemoryKind::Rule),
+            MemorySource::new(&base, "skills/*/SKILL.md", MemoryKind::Skill),
+        ]
     }
 
     fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
         vec![
             MemorySource::new(dir, ".cursorrules", MemoryKind::Instruction),
             MemorySource::new(dir, ".cursor/rules/**/*.mdc", MemoryKind::Rule),
+            MemorySource::new(dir, ".cursor/skills/*/SKILL.md", MemoryKind::Skill),
         ]
     }
 
@@ -430,6 +440,17 @@ impl AgentPlugin for CursorPlugin {
             .or_else(|| Some("?".to_string()))
     }
 
+    fn resolve_title(&self, path: &Path, home: &Path) -> Option<String> {
+        chat_meta_for(path, home)?.title
+    }
+
+    fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
+        let model = chat_meta_for(path, Path::new(""))?.model?;
+        let mut list = super::common::ModelList::default();
+        list.push(&model);
+        Some(list)
+    }
+
     // Subagent transcripts are not resumable chats of their own.
     fn resolve_resume_id(&self, path: &Path, home: &Path) -> Option<String> {
         if subagent_parent(path).is_some() {
@@ -448,6 +469,203 @@ impl AgentPlugin for CursorPlugin {
         let id = self.resolve_resume_id(path, home)?;
         Some(vec!["cursor-agent".to_string(), "--resume".to_string(), id])
     }
+}
+
+#[derive(Clone, Default)]
+struct ChatMeta {
+    title: Option<String>,
+    model: Option<String>,
+}
+
+type FileStamp = Option<(SystemTime, u64)>;
+
+fn file_stamp(path: &Path) -> FileStamp {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+struct CachedStoreIndex {
+    stamp: (Option<SystemTime>, usize, Option<SystemTime>),
+    by_id: Arc<HashMap<String, PathBuf>>,
+}
+
+struct CachedChatMeta {
+    stamp: [FileStamp; 2],
+    meta: ChatMeta,
+}
+
+static CHAT_STORE_INDEX_CACHE: LazyLock<Mutex<HashMap<PathBuf, CachedStoreIndex>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static CHAT_META_CACHE: LazyLock<Mutex<HashMap<PathBuf, CachedChatMeta>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Walk up from `<base>/projects/<encoded>/agent-transcripts/...` to `<base>`.
+fn cursor_data_base(path: &Path) -> Option<PathBuf> {
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        if dir.file_name().and_then(|s| s.to_str()) == Some("projects") {
+            return dir.parent().map(Path::to_path_buf);
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+/// Stamp covering `chats/` and all immediate `<hash>` subdirectories so adding
+/// a new `<hash>` or `<hash>/<id>` directory invalidates the cached index.
+fn chats_dir_stamp(chats_dir: &Path) -> (Option<SystemTime>, usize, Option<SystemTime>) {
+    let root_mtime = fs::metadata(chats_dir).and_then(|m| m.modified()).ok();
+    let mut count = 0usize;
+    let mut max_sub_mtime: Option<SystemTime> = None;
+    if let Ok(entries) = fs::read_dir(chats_dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_dir() {
+                    count += 1;
+                    if let Ok(m) = meta.modified() {
+                        max_sub_mtime = Some(match max_sub_mtime {
+                            Some(prev) if prev >= m => prev,
+                            _ => m,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    (root_mtime, count, max_sub_mtime)
+}
+
+fn chat_store_path(base: &Path, id: &str) -> Option<PathBuf> {
+    let chats_dir = base.join("chats");
+    if let Ok(mut cache) = CHAT_STORE_INDEX_CACHE.lock() {
+        // Fast path: known chat IDs resolve in O(1) with zero filesystem I/O.
+        if let Some(entry) = cache.get(base) {
+            if let Some(db) = entry.by_id.get(id) {
+                return Some(db.clone());
+            }
+        }
+        // Only check subdirectory mtimes / rescan on a cache miss.
+        let stamp = chats_dir_stamp(&chats_dir);
+        if let Some(entry) = cache.get(base) {
+            if entry.stamp == stamp {
+                return None;
+            }
+        }
+        let mut by_id = HashMap::new();
+        if let Ok(hashes) = fs::read_dir(&chats_dir) {
+            for hash_entry in hashes.flatten() {
+                if let Ok(chats) = fs::read_dir(hash_entry.path()) {
+                    for chat_entry in chats.flatten() {
+                        let chat_id = chat_entry.file_name().to_string_lossy().to_string();
+                        // Record the expected store.db path even if store.db has not
+                        // been created inside this chat dir yet, so later creation is
+                        // detected without rescanning `chats/`.
+                        by_id.insert(chat_id, chat_entry.path().join("store.db"));
+                    }
+                }
+            }
+        }
+        let found = by_id.get(id).cloned();
+        cache.insert(
+            base.to_path_buf(),
+            CachedStoreIndex {
+                stamp,
+                by_id: Arc::new(by_id),
+            },
+        );
+        return found;
+    }
+    None
+}
+
+fn decode_hex(hex: &str) -> Option<Vec<u8>> {
+    let bytes = hex.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
+fn read_chat_meta(db: &Path) -> ChatMeta {
+    let real = fs::canonicalize(db).unwrap_or_else(|_| db.to_path_buf());
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let wal = format!("{}-wal", real.display());
+    let conn = if Path::new(&wal).exists() {
+        Connection::open_with_flags(&real, flags)
+    } else {
+        Connection::open_with_flags(
+            format!("file:{}?immutable=1", super::opencode::uri_path(&real)),
+            flags | OpenFlags::SQLITE_OPEN_URI,
+        )
+    };
+    let Ok(conn) = conn else {
+        return ChatMeta::default();
+    };
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+    let raw: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = '0'", [], |row| {
+            row.get(0)
+        })
+        .ok();
+    let Some(raw) = raw else {
+        return ChatMeta::default();
+    };
+    let decoded = decode_hex(raw.trim()).unwrap_or_else(|| raw.into_bytes());
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
+        return ChatMeta::default();
+    };
+    let title = val
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "New Agent")
+        .map(str::to_string);
+    let model = val
+        .get("lastUsedModel")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "default")
+        .map(str::to_string);
+    ChatMeta { title, model }
+}
+
+fn chat_meta_for(path: &Path, _home: &Path) -> Option<ChatMeta> {
+    let base = cursor_data_base(path)?;
+    let id = PLUGIN.session_id(path, _home)?;
+    let db = chat_store_path(&base, &id)?;
+    if !db.is_file() {
+        return None;
+    }
+    let real = fs::canonicalize(&db).unwrap_or_else(|_| db.clone());
+    let wal = PathBuf::from(format!("{}-wal", real.display()));
+    let stamp = [file_stamp(&real), file_stamp(&wal)];
+    if let Ok(cache) = CHAT_META_CACHE.lock() {
+        if let Some(entry) = cache.get(&db) {
+            if entry.stamp == stamp {
+                return Some(entry.meta.clone());
+            }
+        }
+    }
+    // Read SQLite outside the global mutex so parallel resolvers for different
+    // chats do not block each other on a single busy database.
+    let meta = read_chat_meta(&db);
+    if let Ok(mut cache) = CHAT_META_CACHE.lock() {
+        cache.insert(
+            db,
+            CachedChatMeta {
+                stamp,
+                meta: meta.clone(),
+            },
+        );
+    }
+    Some(meta)
 }
 
 fn visit_search_record(val: &serde_json::Value, visit: &mut TypedVisitor<'_>) -> bool {
@@ -714,5 +932,106 @@ mod tests {
             decode(&root, &format!("P-{}leaf", "a-".repeat(45))),
             root.join("P/leaf").to_string_lossy()
         );
+    }
+
+    fn hex_encode(s: &str) -> String {
+        s.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn resolves_title_and_model_from_chat_store_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join(".cursor");
+        let transcript_dir = base.join("projects/tmp-proj/agent-transcripts");
+        fs::create_dir_all(&transcript_dir).unwrap();
+
+        let write_store = |id: &str, json: &str| -> (PathBuf, PathBuf) {
+            let db_dir = base.join("chats/deadbeef").join(id);
+            fs::create_dir_all(&db_dir).unwrap();
+            let db = db_dir.join("store.db");
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO meta VALUES ('0', ?1)", [hex_encode(json)])
+                .unwrap();
+            let transcript = transcript_dir.join(format!("{id}.jsonl"));
+            fs::write(&transcript, "").unwrap();
+            (transcript, db)
+        };
+
+        let (t1, db1) = write_store(
+            "11111111-aaaa",
+            r#"{"agentId":"11111111-aaaa","name":"Status Line","lastUsedModel":"composer-2-fast"}"#,
+        );
+        let (t2, _) = write_store(
+            "22222222-bbbb",
+            r#"{"agentId":"22222222-bbbb","name":"New Agent","lastUsedModel":"default"}"#,
+        );
+        let t3 = transcript_dir.join("33333333-cccc.jsonl");
+        fs::write(&t3, "").unwrap();
+
+        let home = tmp.path();
+        assert_eq!(
+            PLUGIN.resolve_title(&t1, home).as_deref(),
+            Some("Status Line")
+        );
+        assert_eq!(
+            PLUGIN.resolve_models(&t1).map(|m| m.joined()).as_deref(),
+            Some("composer-2-fast")
+        );
+
+        // Placeholder title and default model are omitted.
+        assert_eq!(PLUGIN.resolve_title(&t2, home), None);
+        assert!(PLUGIN.resolve_models(&t2).is_none());
+
+        // Missing store.db falls back cleanly, and creating store.db later
+        // inside an existing chat dir is detected without clearing caches.
+        assert_eq!(PLUGIN.resolve_title(&t3, home), None);
+        assert!(PLUGIN.resolve_models(&t3).is_none());
+
+        let late_dir = base.join("chats/deadbeef/44444444-dddd");
+        fs::create_dir_all(&late_dir).unwrap();
+        let t4 = transcript_dir.join("44444444-dddd.jsonl");
+        fs::write(&t4, "").unwrap();
+        assert_eq!(PLUGIN.resolve_title(&t4, home), None);
+        let late_db = late_dir.join("store.db");
+        let late_conn = Connection::open(&late_db).unwrap();
+        late_conn
+            .execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
+        late_conn
+            .execute(
+                "INSERT INTO meta VALUES ('0', ?1)",
+                [hex_encode(
+                    r#"{"agentId":"44444444-dddd","name":"Late DB","lastUsedModel":"composer-2-fast"}"#,
+                )],
+            )
+            .unwrap();
+        drop(late_conn);
+        assert_eq!(PLUGIN.resolve_title(&t4, home).as_deref(), Some("Late DB"));
+        assert_eq!(
+            PLUGIN.resolve_models(&t4).map(|m| m.joined()).as_deref(),
+            Some("composer-2-fast")
+        );
+
+        // Updating store.db in WAL mode invalidates the cached metadata.
+        let conn = Connection::open(&db1).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = '0'",
+            [hex_encode(
+                r#"{"agentId":"11111111-aaaa","name":"Renamed Chat","lastUsedModel":"claude-4.6-opus"}"#,
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            PLUGIN.resolve_title(&t1, home).as_deref(),
+            Some("Renamed Chat")
+        );
+        assert_eq!(
+            PLUGIN.resolve_models(&t1).map(|m| m.joined()).as_deref(),
+            Some("claude-4.6-opus")
+        );
+        drop(conn);
     }
 }
