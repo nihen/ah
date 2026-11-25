@@ -290,13 +290,13 @@ A prompt counts on the local day it was sent, and a session counts when it has a
 | Gemini | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
 | Copilot | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Cursor | ✓ | ✓ | ✓ | ✓ | | ✓ | |
-| Antigravity (agy) | ✓ | ✓ | ✓ | ✓ | | ✓ | |
+| Antigravity (agy) | ✓ | ✓ | ✓ | ✓ | ✓¹ | ✓ | |
 | Grok | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | opencode | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
 | Pi | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
 | DeepSeek Harness (dsh) | ✓ | ✓ | ✓ | ✓² | | | ✓ |
 
-Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.json` (checking `procStart` so a reused PID is not reported), Grok's `active_sessions.json`, Copilot's `session-state/<id>/inuse.<pid>.lock`, and Codex's `thread-writer-locks/<id>.lock`. ¹ Codex is detected on Linux only, from the kernel lock table (`/proc/locks`); its PID is the lock holder, which for the interactive TUI is the Codex app-server. Running detection needs a PID liveness check, which is not implemented on Windows.
+Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.json` (checking `procStart` so a reused PID is not reported), Grok's `active_sessions.json`, Copilot's `session-state/<id>/inuse.<pid>.lock`, Codex's `thread-writer-locks/<id>.lock`, and Antigravity's `presence/<id>.lock`. ¹ Codex and Antigravity are detected on Linux only, from the kernel lock table (`/proc/locks`); the PID is the lock holder (for the Codex TUI, the Codex app-server). Running detection needs a PID liveness check, which is not implemented on Windows.
 
 The `model` field is the model that answered last in a session, and `models` (`-o models`) lists every model that answered, comma-separated in first-use order. For Copilot these are the models that actually answered, not the `auto` selection; for older Copilot logs whose replies name no model, `model` falls back to the last model in the session's usage metrics. Both are empty when the session records no model (e.g. older Codex and Grok logs, or a session with no reply). `model` is a default column, and on a TTY `ah log` shows it as a `Model:` line, omitted when empty.
 
@@ -438,8 +438,8 @@ Global options:
   -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
   --no-preview            Disable preview in interactive mode
   --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
-  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok)
-  --no-archived           Hide sessions the agent has archived (Codex)
+  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok, agy)
+  --no-archived           Hide sessions the agent has archived (Codex, agy)
   --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
@@ -556,8 +556,8 @@ Global options:
   -n, --limit N           Max session files to scan (default: 0, no limit)
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
-  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok)
-  --no-archived           Hide sessions the agent has archived (Codex)
+  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok, agy)
+  --no-archived           Hide sessions the agent has archived (Codex, agy)
   --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --color                 Force colored output (even through pipes)
@@ -624,8 +624,8 @@ Global options:
   -n, --limit N           Max session files to scan (default: 0, no limit)
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
-  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok)
-  --no-archived           Hide sessions the agent has archived (Codex)
+  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok, agy)
+  --no-archived           Hide sessions the agent has archived (Codex, agy)
   --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
   --color                 Force colored output (even through pipes)
@@ -976,7 +976,7 @@ DeepSeek Harness compresses its session logs with Zstandard by default; `ah` dec
 
 opencode stores all sessions in one SQLite database. `ah` reads it read-only and lists each session under the virtual path `<db>/<session-id>`, which works with `ah show`, `ah resume`, and `-o path` like a regular session file. `ah show --raw` prints one JSON line per message: its `info` and `parts` for an opencode 1.x database, its `type` and `data` once opencode 2 has moved the sessions to its new tables.
 
-Codex sessions archived with `codex archive` stay listed and resumable (`codex resume` still finds them). They carry `archived=true` (`-o archived`); hide them with `--no-archived`.
+Codex sessions archived with `codex archive` and Antigravity sessions archived in `conversation_summaries.db` stay listed and resumable (`codex resume` / `agy --conversation` still find them). They carry `archived=true` (`-o archived`); hide them with `--no-archived`.
 
 Subagent sessions (started by another session, e.g. Claude's Task tool) are hidden from `log`, `project`, and `agent` unless `--subagents` is given; `-o parent_id` shows the session that spawned them. A subagent's id or path still works with `ah show` directly. Claude, Cursor, and Gemini subagent transcripts cannot be resumed on their own, so they have no resume command.
 
@@ -986,6 +986,7 @@ Subagent sessions (started by another session, e.g. Claude's Task tool) are hidd
 | Codex | sessions whose `session_meta` source is a subagent | ✓ (spawned threads) |
 | Gemini | `tmp/*/chats/<parent>/<id>.json(l)` | ✓ |
 | Cursor | `projects/*/agent-transcripts/<parent>/subagents/*.jsonl` | ✓ |
+| Antigravity (agy) | child conversations (`parent_conversation_id` / `conversation_parents` in `conversation_summaries.db`) | ✓ |
 | Grok | `summary.json` with `session_kind: subagent` | not recorded |
 | opencode | child sessions (`parent_id` column) | ✓ |
 | DeepSeek Harness | sessions whose header has `origin: subagent` or `parentSession` | ✓ |

@@ -337,13 +337,20 @@ pub trait AgentPlugin: Sync {
     }
 }
 
-/// Map of session id → pid (if known) for every running session of the
-/// built-in agents that can detect it.
-pub fn running_session_map() -> std::collections::HashMap<String, Option<u32>> {
+/// Map of `(plugin id, session id)` → pid (if known) for every running session
+/// of the built-in agents that can detect it. Keying by plugin id prevents a
+/// UUID shared with another agent (e.g. `agy` and `cursor`) from falsely
+/// marking that other agent's session as running.
+pub fn running_session_map() -> std::collections::HashMap<(&'static str, String), Option<u32>> {
     all_plugins()
         .iter()
         .filter(|p| p.can_detect_running())
-        .flat_map(|p| p.running_sessions())
+        .flat_map(|p| {
+            let plugin_id = p.id();
+            p.running_sessions()
+                .into_iter()
+                .map(move |(id, pid)| ((plugin_id, id), pid))
+        })
         .collect()
 }
 

@@ -354,8 +354,9 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
     // Running sessions reported by the agent plugins
     let pid_map = crate::agents::running_session_map();
     for session in &mut sessions {
+        let plugin_id = agents::find_plugin_for_path(&session.path).id();
         let session_id = session.fields.get(&Field::Id).cloned().unwrap_or_default();
-        if let Some(pid) = pid_map.get(&session_id) {
+        if let Some(pid) = pid_map.get(&(plugin_id, session_id)) {
             if let Some(pid) = pid {
                 session.fields.insert(Field::Pid, pid.to_string());
             }

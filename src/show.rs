@@ -284,7 +284,7 @@ pub(crate) fn emit_session_meta_tsv(
     let mut resolved = resolver::resolve_fields(path, plugin, mtime, home, &resolve_set, &opts);
     // The pipeline path enriches `running`/`pid` from the live pid map; do
     // the same here so `ah show -o running,pid` returns truthful values.
-    enrich_running_pid(&mut resolved, fields);
+    enrich_running_pid(&mut resolved, plugin.id(), fields);
     // Escape `\t` / `\n` / `\r` in every field value (including
     // `Field::Path`) so multiline fields like `transcript`/`first_prompt`/
     // `matched` don't break TSV row/column boundaries. Backslashes pass
@@ -305,6 +305,7 @@ pub(crate) fn emit_session_meta_tsv(
 /// metadata mode stays consistent.
 pub(crate) fn enrich_running_pid(
     resolved: &mut std::collections::BTreeMap<crate::cli::Field, String>,
+    plugin_id: &'static str,
     requested: &[crate::cli::Field],
 ) {
     use crate::cli::Field;
@@ -319,7 +320,9 @@ pub(crate) fn enrich_running_pid(
     let entry = if id.is_empty() {
         None
     } else {
-        crate::agents::running_session_map().get(&id).copied()
+        crate::agents::running_session_map()
+            .get(&(plugin_id, id))
+            .copied()
     };
     if requested.contains(&Field::Running) {
         let v = if entry.is_some() { "true" } else { "false" };
