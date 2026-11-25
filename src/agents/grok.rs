@@ -313,11 +313,15 @@ impl AgentPlugin for GrokPlugin {
             MemorySource::new(&base, "rules/*.md", MemoryKind::Rule),
             // Legacy (v1) global memory notes, written by `/remember`.
             MemorySource::new(&base, "memory/MEMORY.md", MemoryKind::Memory),
+            MemorySource::new(&base, "skills/*/SKILL.md", MemoryKind::Skill),
         ]
     }
 
     fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
-        vec![MemorySource::new(dir, ".grok/rules/*.md", MemoryKind::Rule)]
+        vec![
+            MemorySource::new(dir, ".grok/rules/*.md", MemoryKind::Rule),
+            MemorySource::new(dir, ".grok/skills/*/SKILL.md", MemoryKind::Skill),
+        ]
     }
 
     /// Cross-session memory (`memory-v2`): curated topic files under
