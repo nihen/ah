@@ -82,10 +82,10 @@ pub fn serve(filter: FilterArgs, ia: &InteractiveArgs) -> Result<(), String> {
     if filter.color {
         return Err("ah mcp: --color does not apply (stdout carries protocol messages)".into());
     }
-    if let Some(ms) = std::env::var_os(TEST_DELAY_ENV) {
-        if let Some(ms) = ms.to_str().and_then(|s| s.parse::<u64>().ok()) {
-            crate::cancel::set_checkpoint_delay_ms(ms);
-        }
+    if let Some(ms) = std::env::var_os(TEST_DELAY_ENV)
+        && let Some(ms) = ms.to_str().and_then(|s| s.parse::<u64>().ok())
+    {
+        crate::cancel::set_checkpoint_delay_ms(ms);
     }
     run(filter);
     Ok(())
@@ -311,17 +311,15 @@ fn server_info() -> Value {
 /// Add the fields 2026-07-28 results carry (`resultType`, server identity,
 /// cache hints for list results). Legacy clients get the bare result.
 fn finish(mut result: Value, modern: bool, cacheable: bool) -> Value {
-    if modern {
-        if let Some(map) = result.as_object_mut() {
-            map.insert("resultType".into(), "complete".into());
-            map.insert(
-                "_meta".into(),
-                json!({ "io.modelcontextprotocol/serverInfo": server_info() }),
-            );
-            if cacheable {
-                map.insert("ttlMs".into(), json!(3_600_000));
-                map.insert("cacheScope".into(), json!("private"));
-            }
+    if modern && let Some(map) = result.as_object_mut() {
+        map.insert("resultType".into(), "complete".into());
+        map.insert(
+            "_meta".into(),
+            json!({ "io.modelcontextprotocol/serverInfo": server_info() }),
+        );
+        if cacheable {
+            map.insert("ttlMs".into(), json!(3_600_000));
+            map.insert("cacheScope".into(), json!("private"));
         }
     }
     result

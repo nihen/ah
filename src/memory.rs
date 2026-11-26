@@ -625,36 +625,37 @@ pub fn build_memory_records(
             // Agent filter
             // Shared files (project AGENTS.md) are read by several agents,
             // so they match any agent filter.
-            if let Some(ref agent_filter) = filter.agent {
-                if entry.agent != *agent_filter && entry.agent != SHARED_AGENT {
-                    return None;
-                }
+            if let Some(ref agent_filter) = filter.agent
+                && entry.agent != *agent_filter
+                && entry.agent != SHARED_AGENT
+            {
+                return None;
             }
 
             // Time range filter
-            if let Some(ref since) = since {
-                if &entry.mtime < since {
-                    return None;
-                }
+            if let Some(ref since) = since
+                && &entry.mtime < since
+            {
+                return None;
             }
-            if let Some(ref until) = until {
-                if &entry.mtime > until {
-                    return None;
-                }
+            if let Some(ref until) = until
+                && &entry.mtime > until
+            {
+                return None;
             }
 
             // Project filter
-            if let Some(ref project_filter) = filter.project {
-                if entry.project != *project_filter {
-                    return None;
-                }
+            if let Some(ref project_filter) = filter.project
+                && entry.project != *project_filter
+            {
+                return None;
             }
 
             // --type filter
-            if let Some(ref t) = args.memory_type {
-                if entry.memory_type != *t {
-                    return None;
-                }
+            if let Some(ref t) = args.memory_type
+                && entry.memory_type != *t
+            {
+                return None;
             }
 
             // Query filter

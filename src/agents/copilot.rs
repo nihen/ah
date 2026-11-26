@@ -497,10 +497,10 @@ fn running_in(
                 continue;
             }
             let locked_at = file.metadata().and_then(|m| m.modified()).ok();
-            if let (Some(locked_at), Some(started)) = (locked_at, start_time(pid)) {
-                if started > locked_at + LOCK_START_SLACK {
-                    continue;
-                }
+            if let (Some(locked_at), Some(started)) = (locked_at, start_time(pid))
+                && started > locked_at + LOCK_START_SLACK
+            {
+                continue;
             }
             out.push((
                 session.file_name().to_string_lossy().into_owned(),

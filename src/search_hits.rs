@@ -295,6 +295,7 @@ fn snippet(text: &str, start: usize, end: usize, limit: usize) -> (String, Optio
 fn print_hits(hits: &[SearchHit], args: &MatchSearchArgs) {
     let pretty =
         !args.json && !args.tsv && (crate::pager::is_active() || std::io::stdout().is_terminal());
+    let terminal = !args.json && !pretty && crate::output::terminal_bound();
     let mut previous_path = None;
     for hit in hits {
         if args.json {
@@ -334,7 +335,7 @@ fn print_hits(hits: &[SearchHit], args: &MatchSearchArgs) {
                     hit.position.clone()
                 ]
                 .iter()
-                .map(|v| escape_tsv_lossless(v))
+                .map(|v| crate::output::tsv_value(v, terminal, escape_tsv_lossless))
                 .collect::<Vec<_>>()
                 .join("\t")
             );
@@ -407,19 +408,17 @@ fn highlighted_snippet(text: &str, span: Option<[usize; 2]>, colored: bool) -> S
     if colored {
         // Remote data may be old or malformed. Never slice unchecked offsets
         // and never guess the match by searching a truncated excerpt again.
-        if let Some([start, end]) = span {
-            if start < end {
-                if let (Some(before), Some(matched), Some(after)) =
-                    (text.get(..start), text.get(start..end), text.get(end..))
-                {
-                    return format!(
-                        "{}{}{}",
-                        display_text(before),
-                        color::colorize(BOLD_YELLOW, &display_text(matched)),
-                        display_text(after)
-                    );
-                }
-            }
+        if let Some([start, end]) = span
+            && start < end
+            && let (Some(before), Some(matched), Some(after)) =
+                (text.get(..start), text.get(start..end), text.get(end..))
+        {
+            return format!(
+                "{}{}{}",
+                display_text(before),
+                color::colorize(BOLD_YELLOW, &display_text(matched)),
+                display_text(after)
+            );
         }
     }
     display_text(text)
@@ -430,7 +429,7 @@ fn highlighted_snippet(text: &str, span: Option<[usize; 2]>, colored: bool) -> S
 pub(crate) fn display_text(s: &str) -> String {
     s.chars()
         .flat_map(|c| {
-            if c.is_control() {
+            if c.is_control() || crate::output::is_bidi_control(c) {
                 c.escape_default().collect::<Vec<_>>()
             } else {
                 vec![c]

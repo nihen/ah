@@ -103,15 +103,15 @@ pub fn build_project_records(
             if crate::cancel::checkpoint() {
                 return None;
             }
-            if let Some(ref since) = since {
-                if mtime < since {
-                    return None;
-                }
+            if let Some(ref since) = since
+                && mtime < since
+            {
+                return None;
             }
-            if let Some(ref until) = until {
-                if mtime > until {
-                    return None;
-                }
+            if let Some(ref until) = until
+                && mtime > until
+            {
+                return None;
             }
 
             let agent = config::find_agent_for_path(path);
@@ -163,42 +163,40 @@ pub fn build_project_records(
         if entry.mtime > info.latest {
             info.latest = entry.mtime;
         }
-        if needs_created_at {
-            if let Some(created) = entry.fields.get(&Field::CreatedAt) {
-                if !created.is_empty()
-                    && info
-                        .first_created
-                        .as_ref()
-                        .is_none_or(|c| created.as_str() < c.as_str())
-                {
-                    info.first_created = Some(created.clone());
-                }
-            }
+        if needs_created_at
+            && let Some(created) = entry.fields.get(&Field::CreatedAt)
+            && !created.is_empty()
+            && info
+                .first_created
+                .as_ref()
+                .is_none_or(|c| created.as_str() < c.as_str())
+        {
+            info.first_created = Some(created.clone());
         }
-        if needs_project_raw {
-            if let Some(raw) = entry.fields.get(&Field::ProjectRaw) {
-                if !raw.is_empty() && !info.project_raws.contains(raw) {
-                    info.project_raws.push(raw.clone());
-                }
-            }
+        if needs_project_raw
+            && let Some(raw) = entry.fields.get(&Field::ProjectRaw)
+            && !raw.is_empty()
+            && !info.project_raws.contains(raw)
+        {
+            info.project_raws.push(raw.clone());
         }
-        if needs_cwd {
-            if let Some(cwd) = entry.fields.get(&Field::Cwd) {
-                if !cwd.is_empty() && !info.cwds.contains(cwd) {
-                    info.cwds.push(cwd.clone());
-                }
-            }
+        if needs_cwd
+            && let Some(cwd) = entry.fields.get(&Field::Cwd)
+            && !cwd.is_empty()
+            && !info.cwds.contains(cwd)
+        {
+            info.cwds.push(cwd.clone());
         }
         if needs_sessions {
             let mut obj = serde_json::Map::new();
             for sf in &session_fields {
-                if let Some(val) = entry.fields.get(sf) {
-                    if !val.is_empty() {
-                        obj.insert(
-                            sf.name().to_string(),
-                            serde_json::Value::String(val.clone()),
-                        );
-                    }
+                if let Some(val) = entry.fields.get(sf)
+                    && !val.is_empty()
+                {
+                    obj.insert(
+                        sf.name().to_string(),
+                        serde_json::Value::String(val.clone()),
+                    );
                 }
             }
             info.sessions.push(obj);

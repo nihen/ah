@@ -324,7 +324,7 @@ pub fn fetch_remote_sessions(
     for result in results {
         match result {
             Ok(sessions) => all_sessions.extend(sessions),
-            Err(e) => eprintln!("Warning: {}", e),
+            Err(e) => eprintln!("Warning: {}", crate::output::sanitize_multiline(&e)),
         }
     }
 
@@ -427,13 +427,19 @@ pub fn exec_remote_show(
             Ok(Some(fields)) => match run_remote_show_meta(remote, remote_path, &fields, filter) {
                 Ok(()) => process::exit(0),
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    eprintln!(
+                        "Error: {}",
+                        crate::output::sanitize_multiline(&e.to_string())
+                    );
                     process::exit(1);
                 }
             },
             Ok(None) => unreachable!("metadata_mode is true => meta_fields() is Some"),
             Err(e) => {
-                eprintln!("Error: {}", e);
+                eprintln!(
+                    "Error: {}",
+                    crate::output::sanitize_multiline(&e.to_string())
+                );
                 process::exit(1);
             }
         }
@@ -547,9 +553,15 @@ pub fn run_remote_show_meta(
         .enumerate()
         .filter_map(|(i, f)| (*f == Field::ResumeCmd).then_some(i))
         .collect();
+    // The remote writes to a pipe, so strip terminal controls here.
+    let terminal = crate::output::terminal_bound();
     run_ssh_streaming(remote, &ah_args, |line| {
         let out = retag_remote_show_meta_line(line, &path_idxs, &resume_idxs, remote);
-        println!("{}", out);
+        if terminal {
+            println!("{}", crate::output::strip_ansi_tsv_line(&out));
+        } else {
+            println!("{}", out);
+        }
     })
 }
 
@@ -749,7 +761,7 @@ pub fn fetch_remote_projects(
     for result in results {
         match result {
             Ok(records) => all.extend(records),
-            Err(e) => eprintln!("Warning: {}", e),
+            Err(e) => eprintln!("Warning: {}", crate::output::sanitize_multiline(&e)),
         }
     }
     all
@@ -805,7 +817,7 @@ pub fn fetch_remote_agent_stats(
     for result in results {
         match result {
             Ok(stats) => all.extend(stats),
-            Err(e) => eprintln!("Warning: {}", e),
+            Err(e) => eprintln!("Warning: {}", crate::output::sanitize_multiline(&e)),
         }
     }
     all
@@ -907,7 +919,7 @@ pub fn fetch_remote_memory(
     for result in results {
         match result {
             Ok(records) => all.extend(records),
-            Err(e) => eprintln!("Warning: {}", e),
+            Err(e) => eprintln!("Warning: {}", crate::output::sanitize_multiline(&e)),
         }
     }
     all

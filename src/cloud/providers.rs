@@ -596,19 +596,18 @@ impl Source {
                         let mut row = row;
                         row.created = row.created.or(first_created);
                         row.modified = row.modified.or(last_updated).or(row.created);
-                        if row.title == row.id {
-                            if let Some(first) =
+                        if row.title == row.id
+                            && let Some(first) =
                                 lines.iter().find(|line: &&Line| line.role == "user")
-                            {
-                                row.title = first
-                                    .text
-                                    .lines()
-                                    .next()
-                                    .unwrap_or(id)
-                                    .chars()
-                                    .take(180)
-                                    .collect();
-                            }
+                        {
+                            row.title = first
+                                .text
+                                .lines()
+                                .next()
+                                .unwrap_or(id)
+                                .chars()
+                                .take(180)
+                                .collect();
                         }
                         return Ok(snapshot(row, lines));
                     };
@@ -819,14 +818,13 @@ impl Source {
             } else {
                 next.map(str::to_owned)
             };
-            if let Some(ref token) = next {
-                if token.len() > 1024
+            if let Some(ref token) = next
+                && (token.len() > 1024
                     || token.chars().any(char::is_control)
-                    || !seen_cursors.insert(token.clone())
-                {
-                    self.save_cursor(None)?;
-                    return Err("invalid or repeated pagination cursor");
-                }
+                    || !seen_cursors.insert(token.clone()))
+            {
+                self.save_cursor(None)?;
+                return Err("invalid or repeated pagination cursor");
             }
             self.save_cursor(next.as_deref())?;
             let Some(next) = next else {
@@ -1212,10 +1210,10 @@ pub(crate) fn fetch(
 }
 
 pub(crate) fn hydrate(path: &Path, offline: bool) -> Result<(), String> {
-    if let Some(source) = source_for_path(path) {
-        if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
-            fetch_source(source, id, offline, false)?;
-        }
+    if let Some(source) = source_for_path(path)
+        && let Some(id) = path.file_stem().and_then(|s| s.to_str())
+    {
+        fetch_source(source, id, offline, false)?;
     }
     Ok(())
 }
@@ -1271,7 +1269,11 @@ fn fetch_source(
         {
             Ok(published) => Ok(Some(published)),
             Err(err) if cached.is_some() && source_for_path(&path).is_some() => {
-                eprintln!("Cloud history not refreshed: {}: {err}", source.name());
+                eprintln!(
+                    "Cloud history not refreshed: {}: {}",
+                    source.name(),
+                    crate::output::sanitize_multiline(err)
+                );
                 Ok(Some(path.clone()))
             }
             Err(err) => Err(err),
@@ -1340,12 +1342,12 @@ pub(crate) fn configured_claude_url(value: &str, agent: Option<&str>) -> bool {
 }
 
 pub(crate) fn explicit_resume(value: &str, agent: Option<&str>) -> Option<Vec<String>> {
-    if value.contains("://") {
-        if let Some((source, id)) = routed(value, agent) {
-            let url = source.url(&id);
-            if !url.is_empty() {
-                return Some(browser_args(url));
-            }
+    if value.contains("://")
+        && let Some((source, id)) = routed(value, agent)
+    {
+        let url = source.url(&id);
+        if !url.is_empty() {
+            return Some(browser_args(url));
         }
     }
     let entries = config::cloud_entries()?;

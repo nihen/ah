@@ -170,15 +170,15 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
                 return None;
             }
             // Time range filter
-            if let Some(since) = &params.since {
-                if mtime < since {
-                    return None;
-                }
+            if let Some(since) = &params.since
+                && mtime < since
+            {
+                return None;
             }
-            if let Some(until) = &params.until {
-                if mtime > until {
-                    return None;
-                }
+            if let Some(until) = &params.until
+                && mtime > until
+            {
+                return None;
             }
 
             let plugin = agents::find_plugin_for_path(path);
@@ -316,10 +316,10 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
                 &params.resolve_opts,
                 session_mmap,
             );
-            if let Some(matched) = matched {
-                if wants_matched {
-                    fields.insert(Field::Matched, matched);
-                }
+            if let Some(matched) = matched
+                && wants_matched
+            {
+                fields.insert(Field::Matched, matched);
             }
 
             // Skip if Matched was requested but is empty

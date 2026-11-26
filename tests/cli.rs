@@ -3107,3 +3107,181 @@ fn dsh_sessions_are_decoded_listed_and_shown() {
             r#"{"type":"session","version":4"#,
         ));
 }
+
+// ─── Terminal control sequences in session data ───────────────────
+
+const HOSTILE: &str = "RED\u{1b}[31m \u{1b}]8;;https://evil.example\u{7}link\u{1b}]8;;\u{7} \u{1b}]52;c;QUJD\u{7}\u{1b}]52;c;QUJD\u{1b}\\\u{9b}2J safe\rFAKE\r\n日本語 **md**";
+
+fn codex_session_with(lines: &[String]) -> (TempDir, String) {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp
+        .path()
+        .join(".codex/sessions/2026/03/24/rollout-2026-03-24T20-43-12-codex-sess-ctl.jsonl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut body = String::from(
+        r#"{"type":"session.start","payload":{"id":"codex-sess-ctl","cwd":"/Users/test/ctl"}}"#,
+    );
+    body.push('\n');
+    for line in lines {
+        body.push_str(line);
+        body.push('\n');
+    }
+    fs::write(&path, body).unwrap();
+    (tmp, path.display().to_string())
+}
+
+fn hostile_codex_session() -> (TempDir, String) {
+    let message = |role: &str, kind: &str| {
+        serde_json::json!({"type":"response_item","payload":{"role":role,
+            "content":[{"type":kind,"text":HOSTILE}]}})
+        .to_string()
+    };
+    codex_session_with(&[
+        message("user", "input_text"),
+        message("assistant", "output_text"),
+    ])
+}
+
+fn assert_no_terminal_controls(out: &str) {
+    for c in ['\x1b', '\x07', '\r', '\u{9b}'] {
+        assert!(!out.contains(c), "{c:?} left in {out:?}");
+    }
+}
+
+fn stdout_of(args: &[&str]) -> String {
+    let assert = ah().args(args).assert().success();
+    String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+}
+
+#[test]
+fn show_pretty_strips_terminal_controls_from_messages() {
+    let (_tmp, path) = hostile_codex_session();
+    let out = stdout_of(&["show", "--no-pager", "--no-color", &path]);
+    assert_no_terminal_controls(&out);
+    assert!(
+        out.contains(">>> RED link 2J safeFAKE\n日本語 **md**"),
+        "{out:?}"
+    );
+
+    // With color, ah's own styling remains but data sequences do not.
+    let out = stdout_of(&["show", "--no-pager", "--color", &path]);
+    assert!(out.contains("\x1b[1m>>> "), "{out:?}");
+    for seq in ["\x1b[31m", "\x1b]8;", "\x1b]52;", "\u{9b}", "\r"] {
+        assert!(!out.contains(seq), "{seq:?} left in {out:?}");
+    }
+}
+
+#[test]
+fn show_md_strips_terminal_controls() {
+    let (_tmp, path) = hostile_codex_session();
+    let out = stdout_of(&["show", "--md", &path]);
+    assert_no_terminal_controls(&out);
+    assert!(out.contains("## User\n\nRED link"), "{out:?}");
+    assert!(out.contains("日本語 **md**"), "{out:?}");
+}
+
+#[test]
+fn show_metadata_only_fallback_strips_terminal_controls() {
+    let line = "{\"type\":\"note\",\"text\":\"BEFORE\u{1b}]52;c;QUJD\u{7}AFTER\r\n\"}".to_string();
+    let (_tmp, path) = codex_session_with(&[line]);
+    let assert = ah()
+        .args(["show", "--no-pager", "--no-color", &path])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("only metadata"));
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_no_terminal_controls(&out);
+    assert!(out.contains("BEFOREAFTER"), "{out:?}");
+}
+
+#[test]
+fn show_raw_keeps_original_bytes() {
+    let line = "{\"type\":\"note\",\"text\":\"BEFORE\u{1b}]52;c;QUJD\u{7}AFTER\"}".to_string();
+    let (_tmp, path) = codex_session_with(&[line]);
+    let out = stdout_of(&["show", "--raw", &path]);
+    assert!(out.contains("BEFORE\x1b]52;c;QUJD\x07AFTER"), "{out:?}");
+}
+
+#[test]
+fn show_json_escapes_terminal_controls() {
+    let (_tmp, path) = hostile_codex_session();
+    let out = stdout_of(&["show", "--json", &path]);
+    // serde_json escapes C0 controls; the value itself is lossless.
+    for c in ['\x1b', '\x07', '\r'] {
+        assert!(!out.contains(c), "{c:?} left in {out:?}");
+    }
+    let first: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+    assert_eq!(first["text"], HOSTILE);
+}
+
+#[test]
+fn show_meta_tsv_is_unchanged_in_pipes_and_stripped_for_terminals() {
+    let (_tmp, path) = hostile_codex_session();
+    let piped = stdout_of(&["show", &path, "-o", "agent,first_prompt"]);
+    assert!(piped.starts_with("codex\t"), "{piped:?}");
+    assert!(piped.contains("\x1b]52;c;QUJD\x07"), "{piped:?}");
+    assert!(piped.contains("safe\\rFAKE\\r\\n"), "{piped:?}");
+
+    // `--color` means a terminal renders the output (e.g. an fzf preview).
+    let colored = stdout_of(&["show", "--color", &path, "-o", "agent,first_prompt"]);
+    assert_no_terminal_controls(&colored);
+
+    // NO_COLOR turns the colors off but the output still goes to a terminal.
+    let assert = ah()
+        .env("NO_COLOR", "1")
+        .args(["show", "--color", &path, "-o", "agent,first_prompt"])
+        .assert()
+        .success();
+    let no_color = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_no_terminal_controls(&no_color);
+    assert_eq!(no_color, colored);
+    assert!(colored.starts_with("codex\t"), "{colored:?}");
+    assert!(colored.contains("safe\\rFAKE\\r\\n"), "{colored:?}");
+}
+
+#[test]
+fn show_opens_session_path_with_bidi_control() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join(".codex/sessions/2026/03/24");
+    fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, prompt: &str| {
+        let path = dir.join(name);
+        let session = fs::read_to_string(fixture_path("codex_session.jsonl"))
+            .unwrap()
+            .replace("add redis caching", prompt);
+        fs::write(&path, session).unwrap();
+        path.display().to_string()
+    };
+    let bidi = write(
+        "rollout-2026-03-24T20-43-12-bidi-\u{202E}.jsonl",
+        "the bidi one",
+    );
+    write("rollout-2026-03-24T20-43-12-bidi-.jsonl", "the other one");
+    let out = stdout_of(&["show", "--json", &bidi]);
+    assert!(out.contains("the bidi one"), "{out:?}");
+    let del = write(
+        "rollout-2026-03-24T20-43-12-del-\u{7f}.jsonl",
+        "the del one",
+    );
+    write("rollout-2026-03-24T20-43-12-del-.jsonl", "another one");
+    let out = stdout_of(&["show", "--json", &del]);
+    assert!(out.contains("the del one"), "{out:?}");
+}
+
+#[test]
+fn log_table_strips_terminal_controls() {
+    let (tmp, _path) = hostile_codex_session();
+    let assert = ah()
+        .env("HOME", tmp.path())
+        .env("CLAUDE_CONFIG_DIR", "/nonexistent")
+        .env("GEMINI_CLI_HOME", "/nonexistent")
+        .env("COPILOT_HOME", "/nonexistent")
+        .env("CURSOR_DATA_DIR", "/nonexistent")
+        .env_remove("XDG_DATA_HOME")
+        .args(["log", "-a", "--table", "--no-color", "-o", "id,title"])
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_no_terminal_controls(&out);
+    assert!(out.contains("codex-sess-ctl"), "{out:?}");
+}

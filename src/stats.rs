@@ -353,7 +353,7 @@ fn grouped(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -552,7 +552,11 @@ pub fn render(stats: &Stats, ascii: bool, color: bool) -> Vec<String> {
                     month_name(era.to)
                 )
             };
-            let model = fit(&era.model, MODEL_NAME_WIDTH).replace('…', glyphs.ellipsis);
+            let model = fit(
+                &crate::output::sanitize_for_display(&era.model),
+                MODEL_NAME_WIDTH,
+            )
+            .replace('…', glyphs.ellipsis);
             out.push(format!("   {months:<9} {model}"));
         }
     }

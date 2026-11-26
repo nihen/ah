@@ -223,16 +223,16 @@ static WARNED: LazyLock<Mutex<std::collections::HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 fn warn_once(db: &Path, err: &str) {
-    if let Ok(mut warned) = WARNED.lock() {
-        if warned.insert(db.to_path_buf()) {
-            // A failing stderr must not abort the listing.
-            let _ = writeln!(
-                std::io::stderr(),
-                "ah: opencode: cannot read {}: {}",
-                db.display(),
-                err
-            );
-        }
+    if let Ok(mut warned) = WARNED.lock()
+        && warned.insert(db.to_path_buf())
+    {
+        // A failing stderr must not abort the listing.
+        let _ = writeln!(
+            std::io::stderr(),
+            "ah: opencode: cannot read {}: {}",
+            crate::output::sanitize_for_display(&db.to_string_lossy()),
+            crate::output::sanitize_for_display(err)
+        );
     }
 }
 
@@ -373,10 +373,10 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
 /// Session metadata for a virtual path (cached; queried on a cache miss,
 /// e.g. `ah show <path>` without a prior collection).
 fn session_row(path: &Path) -> Option<SessionRow> {
-    if let Ok(cache) = SESSION_CACHE.lock() {
-        if let Some(row) = cache.get(path) {
-            return row.clone();
-        }
+    if let Ok(cache) = SESSION_CACHE.lock()
+        && let Some(row) = cache.get(path)
+    {
+        return row.clone();
     }
     let (db, id) = split_virtual_path(path)?;
     let row = match with_connection(db, |conn| {
@@ -598,12 +598,12 @@ fn text_messages_v2(conn: &Connection, id: &str) -> rusqlite::Result<Vec<Message
             continue;
         }
         let message_id: String = row.get(0)?;
-        if let Some((last_id, last)) = messages.last_mut() {
-            if *last_id == message_id {
-                last.text.push_str("\n\n");
-                last.text.push_str(text);
-                continue;
-            }
+        if let Some((last_id, last)) = messages.last_mut()
+            && *last_id == message_id
+        {
+            last.text.push_str("\n\n");
+            last.text.push_str(text);
+            continue;
         }
         let time = match row.get_ref(2)? {
             ValueRef::Integer(ms) => Some(ms.into()),

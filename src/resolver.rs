@@ -413,13 +413,12 @@ fn resolve_message_fields(
 /// missing from the messages come from `AgentPlugin::prompt_times` when it
 /// accounts for every prompt.
 fn prompt_times_json(plugin: &dyn AgentPlugin, path: &Path, mut times: Vec<Option<i64>>) -> String {
-    if times.iter().any(Option::is_none) {
-        if let Some(recorded) = plugin
+    if times.iter().any(Option::is_none)
+        && let Some(recorded) = plugin
             .prompt_times(path)
             .filter(|recorded| recorded.len() == times.len())
-        {
-            times = recorded;
-        }
+    {
+        times = recorded;
     }
     let times: Vec<String> = times
         .into_iter()

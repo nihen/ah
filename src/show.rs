@@ -4,7 +4,7 @@ use crate::agents::common::canonical_home;
 use crate::agents::{self, MessageRole};
 use crate::cli::{FilterArgs, ShowArgs, ShowFormat};
 use crate::color::{self, BOLD, DIM, RESET};
-use crate::output::{strip_ansi, strip_quotes};
+use crate::output::{sanitize_multiline, strip_quotes};
 use crate::remote;
 use crate::resolver;
 use crate::subcmd;
@@ -55,10 +55,9 @@ fn run_inner(args: ShowArgs, filter: &FilterArgs, check_account: bool) -> Result
         if filter.remote.is_empty()
             && filter.agent.as_deref().is_none_or(|agent| agent == "codex")
             && crate::cloud::enabled()
+            && let Some(id) = crate::cloud::url_id(strip_quotes(&session))
         {
-            if let Some(id) = crate::cloud::url_id(strip_quotes(&session)) {
-                return id.to_owned();
-            }
+            return id.to_owned();
         }
         session
     });
@@ -127,10 +126,15 @@ fn run_inner(args: ShowArgs, filter: &FilterArgs, check_account: bool) -> Result
         } else {
             match subcmd::resolve_session_ref_of(session, &home, filter.agent.as_deref()) {
                 Ok(path) => {
-                    if explicit_arg && check_account && filter.remote.is_empty() {
-                        if let Err(err) = crate::cloud::providers::hydrate(&path, args.offline) {
-                            eprintln!("Cloud history not refreshed: {err}");
-                        }
+                    if explicit_arg
+                        && check_account
+                        && filter.remote.is_empty()
+                        && let Err(err) = crate::cloud::providers::hydrate(&path, args.offline)
+                    {
+                        eprintln!(
+                            "Cloud history not refreshed: {}",
+                            crate::output::sanitize_multiline(&err.to_string())
+                        );
                     }
                     path
                 }
@@ -211,7 +215,10 @@ fn run_inner(args: ShowArgs, filter: &FilterArgs, check_account: bool) -> Result
             if let Some(content) = plugin.raw_content(&path) {
                 print!("{}", content);
             } else {
-                return Err(format!("Failed to read: {}", path.display()));
+                return Err(format!(
+                    "Failed to read: {}",
+                    crate::output::sanitize_for_display(&path.to_string_lossy())
+                ));
             }
         }
         ShowFormat::Pretty => {
@@ -265,9 +272,12 @@ pub(crate) fn emit_session_meta_tsv(
     let plugin = agents::find_plugin_for_path(path);
     // Fail fast if the file is unreadable so scripts get a non-zero exit
     // instead of plausible-but-empty TSV values.
-    let mtime = plugin
-        .session_mtime(path)
-        .ok_or_else(|| format!("Failed to read session metadata: {}", path.display()))?;
+    let mtime = plugin.session_mtime(path).ok_or_else(|| {
+        format!(
+            "Failed to read session metadata: {}",
+            crate::output::sanitize_for_display(&path.to_string_lossy())
+        )
+    })?;
     // Pass query through to ResolveOpts so the `matched` field can populate
     // for `ah show -q QUERY -o matched`. transcript_limit/title_limit = 0 to
     // avoid truncating fields like `transcript`/`first_prompt`/`title` —
@@ -292,9 +302,18 @@ pub(crate) fn emit_session_meta_tsv(
     // non-path fields stay readable. Paths with literal tabs/newlines (rare
     // but legal on Unix) round-trip via `subcmd::resolve_session_ref`'s
     // raw-first / `unescape_tsv`-fallback ordering.
+    // On a terminal, escape sequences and control characters from session
+    // data are stripped as well; pipes get the values unchanged.
+    let terminal = crate::output::terminal_bound();
     let values: Vec<String> = fields
         .iter()
-        .map(|f| crate::output::escape_tsv(resolved.get(f).map_or("", |s| s.as_str())))
+        .map(|f| {
+            crate::output::tsv_value(
+                resolved.get(f).map_or("", |s| s.as_str()),
+                terminal,
+                crate::output::escape_tsv,
+            )
+        })
         .collect();
     println!("{}", values.join("\t"));
     Ok(())
@@ -352,7 +371,7 @@ fn run_pretty(path: &std::path::Path, head: Option<usize>, hl_re: Option<&regex:
         }
         first = false;
 
-        let text = strip_ansi(&message.text);
+        let text = sanitize_multiline(&message.text);
         let text = if is_tty {
             if let Some(re) = hl_re {
                 highlight_text(&text, re)
@@ -385,8 +404,9 @@ fn run_pretty(path: &std::path::Path, head: Option<usize>, hl_re: Option<&regex:
     if first {
         eprintln!("(only metadata — no conversation messages)");
         eprintln!();
+        // Session data is untrusted: only `--raw` prints it verbatim.
         if let Some(content) = agents::find_plugin_for_path(path).raw_content(path) {
-            print!("{}", content);
+            print!("{}", sanitize_multiline(&content));
         }
     }
 }
@@ -447,7 +467,7 @@ fn md_section(first: bool, role: &str, text: &str) -> String {
         "{}{}\n\n{}\n",
         if first { "" } else { "\n---\n\n" },
         heading,
-        strip_ansi(text)
+        sanitize_multiline(text)
     )
 }
 
@@ -491,11 +511,14 @@ fn run_follow(
         eprintln!(
             "{}--- following {} (Ctrl-C to stop) ---{}",
             DIM,
-            path.display(),
+            crate::output::sanitize_for_display(&path.to_string_lossy()),
             RESET
         );
     } else {
-        eprintln!("--- following {} (Ctrl-C to stop) ---", path.display());
+        eprintln!(
+            "--- following {} (Ctrl-C to stop) ---",
+            crate::output::sanitize_for_display(&path.to_string_lossy())
+        );
     }
 
     // Buffer for incomplete trailing lines across iterations
@@ -559,7 +582,7 @@ fn run_follow(
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                 for message in plugin.messages_from_value(&val) {
                     println!();
-                    let text = strip_ansi(&message.text);
+                    let text = sanitize_multiline(&message.text);
                     let text = if is_tty {
                         if let Some(re) = hl_re {
                             highlight_text(&text, re)

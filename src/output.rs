@@ -102,8 +102,8 @@ pub fn strip_ansi(s: &str) -> String {
                         }
                     }
                 }
-                Some(']') => {
-                    // OSC sequence: ESC ] ... (ST = ESC\ or BEL)
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    // OSC, DCS, SOS, PM and APC strings: ESC <c> ... (ST = ESC\ or BEL)
                     chars.next();
                     while let Some(&ch) = chars.peek() {
                         if ch == '\x07' {
@@ -141,6 +141,68 @@ pub fn strip_ansi(s: &str) -> String {
     result
 }
 
+/// [`strip_ansi`] for display: also drops DEL and Unicode bidirectional
+/// controls.
+/// Not for values that are used again, such as session references, where
+/// those characters can be part of a real path.
+pub fn strip_for_display(s: &str) -> String {
+    let mut out = strip_ansi(s);
+    out.retain(|c| c != '\x7f' && !is_bidi_control(c));
+    out
+}
+
+/// Unicode bidirectional formatting characters (`Bidi_Control`). They
+/// reorder how the surrounding text is displayed, so session data could use
+/// them to make a path or command look different from what it is.
+pub fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Sanitize untrusted text for multi-line terminal display: strip escape
+/// sequences and control characters, normalize CRLF to LF and drop lone CRs
+/// so a line cannot rewind the cursor and overwrite what precedes it.
+/// LF and TAB are kept.
+pub fn sanitize_multiline(s: &str) -> String {
+    let stripped = strip_for_display(s);
+    if !stripped.contains('\r') {
+        return stripped;
+    }
+    stripped.replace("\r\n", "\n").replace('\r', "")
+}
+
+/// Whether stdout is rendered by a terminal: a TTY, the pager, or output
+/// requested with `--color`/`AH_COLOR=1` (e.g. an fzf preview), whether or
+/// not `NO_COLOR` disables the colors. Machine-readable formats strip control
+/// characters from data only in this case and stay unchanged in pipes.
+pub fn terminal_bound() -> bool {
+    crate::pager::is_active()
+        || std::io::IsTerminal::is_terminal(&std::io::stdout())
+        || color::color_requested()
+        || color::use_color()
+}
+
+/// Apply `escape` to a TSV/LTSV value, stripping escape sequences and
+/// control characters first when `terminal` is set.
+pub fn tsv_value(s: &str, terminal: bool, escape: fn(&str) -> String) -> String {
+    if terminal {
+        escape(&strip_for_display(s))
+    } else {
+        escape(s)
+    }
+}
+
+/// Strip escape sequences from each column of an already-escaped TSV line,
+/// so an unterminated sequence cannot swallow the tabs after it.
+pub fn strip_ansi_tsv_line(line: &str) -> String {
+    line.split('\t')
+        .map(strip_for_display)
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
 /// Strip surrounding single or double quotes.
 pub fn strip_quotes(s: &str) -> &str {
     if s.len() >= 2
@@ -154,7 +216,7 @@ pub fn strip_quotes(s: &str) -> &str {
 /// Sanitize a value for single-line display: strip control sequences,
 /// then replace newlines/tabs with space.
 pub fn sanitize_for_display(s: &str) -> String {
-    let stripped = strip_ansi(s);
+    let stripped = strip_for_display(s);
     stripped
         .replace('\n', " ")
         .replace('\r', "")
@@ -226,22 +288,30 @@ fn output_log(sessions: &[Session], query: &str) {
             println!();
         }
 
-        let id = session.fields.get(&Field::Id).map_or("", |v| v.as_str());
-        let agent = session.fields.get(&Field::Agent).map_or("", |v| v.as_str());
-        let model = session.fields.get(&Field::Model).map_or("", |v| v.as_str());
-        let project = session
-            .fields
-            .get(&Field::Project)
-            .map_or("", |v| v.as_str());
-        let cwd = session.fields.get(&Field::Cwd).map_or("", |v| v.as_str());
-        let created = session
-            .fields
-            .get(&Field::CreatedAt)
-            .map_or("", |v| v.as_str());
-        let modified = session
-            .fields
-            .get(&Field::ModifiedAt)
-            .map_or("", |v| v.as_str());
+        let id = &sanitize_for_display(session.fields.get(&Field::Id).map_or("", |v| v.as_str()));
+        let agent =
+            &sanitize_for_display(session.fields.get(&Field::Agent).map_or("", |v| v.as_str()));
+        let model =
+            &sanitize_for_display(session.fields.get(&Field::Model).map_or("", |v| v.as_str()));
+        let project = &sanitize_for_display(
+            session
+                .fields
+                .get(&Field::Project)
+                .map_or("", |v| v.as_str()),
+        );
+        let cwd = &sanitize_for_display(session.fields.get(&Field::Cwd).map_or("", |v| v.as_str()));
+        let created = &sanitize_for_display(
+            session
+                .fields
+                .get(&Field::CreatedAt)
+                .map_or("", |v| v.as_str()),
+        );
+        let modified = &sanitize_for_display(
+            session
+                .fields
+                .get(&Field::ModifiedAt)
+                .map_or("", |v| v.as_str()),
+        );
         let title = session.fields.get(&Field::Title).map_or("", |v| v.as_str());
         let prompt = session
             .fields
@@ -283,7 +353,8 @@ fn output_log(sessions: &[Session], query: &str) {
         }
 
         // Title (like git commit subject line, first line only)
-        let title_line = title.lines().next().unwrap_or(title);
+        let raw_title_line = title.lines().next().unwrap_or(title);
+        let title_line = &sanitize_title_line(raw_title_line);
         if !title_line.is_empty() {
             println!();
             println!("    {}", title_line);
@@ -291,13 +362,9 @@ fn output_log(sessions: &[Session], query: &str) {
 
         // First prompt (like git commit body, up to 5 lines)
         // Skip if prompt adds nothing beyond the title
-        let prompt_first_line = prompt.lines().next().unwrap_or("");
-        let title_base = title_line.strip_suffix("..").unwrap_or(title_line);
-        let prompt_redundant =
-            prompt.is_empty() || prompt == title_line || prompt_first_line.starts_with(title_base);
-        if !prompt_redundant {
+        let prompt_text = sanitize_multiline(prompt);
+        if !prompt_is_redundant(&prompt_text, raw_title_line) {
             println!();
-            let prompt_text = strip_ansi(prompt);
             let lines: Vec<&str> = prompt_text.lines().collect();
             let truncated = lines.len() > 5;
             for line in lines.iter().take(5) {
@@ -331,6 +398,32 @@ fn output_log(sessions: &[Session], query: &str) {
             }
         }
     }
+}
+
+/// A title line for display. A title truncated with `..` can end inside an
+/// escape sequence, so the marker is put back after sanitizing.
+fn sanitize_title_line(raw: &str) -> String {
+    match raw.strip_suffix("..") {
+        Some(base) => format!("{}..", sanitize_for_display(base)),
+        None => sanitize_for_display(raw),
+    }
+}
+
+/// Whether the first prompt (already sanitized for display) adds nothing to
+/// the title line shown above it. Both sides are compared in the title's
+/// single-line form; the `..` of a truncated title is removed before
+/// sanitizing, since truncation can cut an escape sequence in half. A title
+/// that sanitizes to nothing does not hide the prompt.
+fn prompt_is_redundant(prompt: &str, raw_title_line: &str) -> bool {
+    if prompt.is_empty() {
+        return true;
+    }
+    let title = sanitize_for_display(raw_title_line);
+    let title_base =
+        sanitize_for_display(raw_title_line.strip_suffix("..").unwrap_or(raw_title_line));
+    let first_line = sanitize_for_display(prompt.lines().next().unwrap_or(""));
+    sanitize_for_display(prompt) == title
+        || (!title_base.is_empty() && first_line.starts_with(&title_base))
 }
 
 /// Highlight matching portions in text with ANSI bold yellow.
@@ -462,6 +555,7 @@ fn output_table(sessions: &[Session], fields: &[Field], query: &str) {
 
 /// TSV output.
 fn output_tsv(sessions: &[Session], fields: &[Field], query: &str) {
+    let terminal = terminal_bound();
     let has_matched = fields.contains(&Field::Matched);
     let is_tty = color::use_color();
     let highlight_re = if has_matched && is_tty && !query.is_empty() {
@@ -475,12 +569,12 @@ fn output_tsv(sessions: &[Session], fields: &[Field], query: &str) {
             .iter()
             .map(|f| {
                 let val = session.fields.get(f).map_or("", |v| v.as_str());
-                let escaped = escape_tsv(val);
+                let escaped = tsv_value(val, terminal, escape_tsv);
                 if is_tty {
-                    if *f == Field::Matched {
-                        if let Some(ref re) = highlight_re {
-                            return highlight_matches(&escaped, re);
-                        }
+                    if *f == Field::Matched
+                        && let Some(ref re) = highlight_re
+                    {
+                        return highlight_matches(&escaped, re);
                     }
                     colorize_field(f, &escaped)
                 } else {
@@ -551,12 +645,13 @@ pub fn unescape_tsv(s: &str) -> String {
 
 /// LTSV output (Labeled Tab-Separated Values).
 fn output_ltsv(sessions: &[Session], fields: &[Field]) {
+    let terminal = terminal_bound();
     for session in sessions {
         let pairs: Vec<String> = fields
             .iter()
             .map(|f| {
                 let val = session.fields.get(f).map_or("", |v| v.as_str());
-                format!("{}:{}", f.name(), escape_tsv(val))
+                format!("{}:{}", f.name(), tsv_value(val, terminal, escape_tsv))
             })
             .collect();
         println!("{}", pairs.join("\t"));
@@ -573,11 +668,11 @@ pub fn session_to_json(
     let mut map = serde_json::Map::new();
     for field in fields {
         let val = session.fields.get(field).cloned().unwrap_or_default();
-        if matches!(*field, Field::Prompts | Field::Responses | Field::Messages) {
-            if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&val) {
-                map.insert(field.name().to_string(), arr);
-                continue;
-            }
+        if matches!(*field, Field::Prompts | Field::Responses | Field::Messages)
+            && let Ok(arr) = serde_json::from_str::<serde_json::Value>(&val)
+        {
+            map.insert(field.name().to_string(), arr);
+            continue;
         }
         map.insert(field.name().to_string(), serde_json::Value::String(val));
     }
@@ -668,13 +763,14 @@ fn output_projects_tsv(
     records: &[std::collections::BTreeMap<ProjectField, String>],
     fields: &[ProjectField],
 ) {
+    let terminal = terminal_bound();
     let is_tty = color::use_color();
     for record in records {
         let values: Vec<String> = fields
             .iter()
             .map(|f| {
                 let val = record.get(f).map_or("", |v| v.as_str());
-                let escaped = escape_tsv(val);
+                let escaped = tsv_value(val, terminal, escape_tsv);
                 if is_tty {
                     colorize_project(f, &escaped)
                 } else {
@@ -690,12 +786,13 @@ fn output_projects_ltsv(
     records: &[std::collections::BTreeMap<ProjectField, String>],
     fields: &[ProjectField],
 ) {
+    let terminal = terminal_bound();
     for record in records {
         let pairs: Vec<String> = fields
             .iter()
             .map(|f| {
                 let val = record.get(f).map_or("", |v| v.as_str());
-                format!("{}:{}", f.name(), escape_tsv(val))
+                format!("{}:{}", f.name(), tsv_value(val, terminal, escape_tsv))
             })
             .collect();
         println!("{}", pairs.join("\t"));
@@ -712,21 +809,21 @@ pub fn project_to_json(
     for field in fields {
         let val = record.get(field).cloned().unwrap_or_default();
         // sessions as JSON array
-        if *field == ProjectField::Sessions {
-            if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&val) {
-                map.insert(field.name().to_string(), arr);
-                continue;
-            }
+        if *field == ProjectField::Sessions
+            && let Ok(arr) = serde_json::from_str::<serde_json::Value>(&val)
+        {
+            map.insert(field.name().to_string(), arr);
+            continue;
         }
         // session_count as number
-        if *field == ProjectField::SessionCount {
-            if let Ok(n) = val.parse::<u64>() {
-                map.insert(
-                    field.name().to_string(),
-                    serde_json::Value::Number(n.into()),
-                );
-                continue;
-            }
+        if *field == ProjectField::SessionCount
+            && let Ok(n) = val.parse::<u64>()
+        {
+            map.insert(
+                field.name().to_string(),
+                serde_json::Value::Number(n.into()),
+            );
+            continue;
         }
         map.insert(field.name().to_string(), serde_json::Value::String(val));
     }
@@ -837,6 +934,7 @@ fn output_memory_tsv(
     fields: &[MemoryField],
     query: &str,
 ) {
+    let terminal = terminal_bound();
     let is_tty = color::use_color();
     let highlight_re = if is_tty && !query.is_empty() {
         Regex::new(&format!("(?i){}", query)).ok()
@@ -849,7 +947,7 @@ fn output_memory_tsv(
             .iter()
             .map(|f| {
                 let val = record.get(f).map_or("", |v| v.as_str());
-                let escaped = escape_tsv(val);
+                let escaped = tsv_value(val, terminal, escape_tsv);
                 if is_tty {
                     colorize_memory(f, &escaped)
                 } else {
@@ -870,12 +968,13 @@ fn output_memory_ltsv(
     records: &[std::collections::BTreeMap<MemoryField, String>],
     fields: &[MemoryField],
 ) {
+    let terminal = terminal_bound();
     for record in records {
         let pairs: Vec<String> = fields
             .iter()
             .map(|f| {
                 let val = record.get(f).map_or("", |v| v.as_str());
-                format!("{}:{}", f.name(), escape_tsv(val))
+                format!("{}:{}", f.name(), tsv_value(val, terminal, escape_tsv))
             })
             .collect();
         println!("{}", pairs.join("\t"));
@@ -1026,12 +1125,112 @@ mod tests {
     fn test_strip_ansi_c0_controls() {
         // NUL, BEL, BS should be stripped; \n \r \t preserved
         assert_eq!(strip_ansi("a\x00b\x07c\x08d"), "abcd");
+        // DEL can be part of a session reference; display helpers drop it.
+        assert_eq!(strip_ansi("left\x7fright"), "left\x7fright");
+        assert_eq!(strip_for_display("left\x7fright"), "leftright");
+        assert_eq!(sanitize_multiline("left\x7fright"), "leftright");
         assert_eq!(strip_ansi("a\nb\rc\td"), "a\nb\rc\td");
     }
 
     #[test]
     fn test_strip_ansi_c1_controls() {
         assert_eq!(strip_ansi("a\u{0080}b\u{009f}c"), "abc");
+    }
+
+    #[test]
+    fn test_strip_ansi_string_sequences() {
+        // DCS, SOS, PM and APC payloads are dropped with their ST/BEL terminator.
+        assert_eq!(strip_ansi("a\x1bPq#0;2;0;0;0\x1b\\b"), "ab");
+        assert_eq!(strip_ansi("a\x1b_payload\x07b"), "ab");
+        assert_eq!(strip_ansi("a\x1b^pm\x1b\\b\x1bXsos\x1b\\c"), "abc");
+    }
+
+    #[test]
+    fn test_sanitize_multiline_strips_terminal_controls() {
+        let input = concat!(
+            "\x1b[31mred\x1b[0m ",
+            "\x1b]8;;https://evil.example\x07link\x1b]8;;\x07 ",
+            "\x1b]52;c;QUJD\x07",
+            "\x1b]52;c;QUJD\x1b\\",
+            "\u{9b}2J\u{9d}0;t",
+            "\x07\x08\x00end",
+        );
+        let out = sanitize_multiline(input);
+        assert_eq!(out, "red link 2J0;tend");
+        for c in ['\x1b', '\x07', '\x08', '\0', '\u{9b}', '\u{9d}'] {
+            assert!(!out.contains(c), "{c:?} left in {out:?}");
+        }
+    }
+
+    #[test]
+    fn test_sanitize_multiline_line_endings() {
+        assert_eq!(sanitize_multiline("a\r\nb\r\n"), "a\nb\n");
+        // A lone CR must not rewind the cursor over the start of the line.
+        assert_eq!(sanitize_multiline("safe\rFAKE"), "safeFAKE");
+        assert_eq!(sanitize_multiline("a\r\r\nb"), "a\nb");
+        assert_eq!(sanitize_multiline("tab\tkept"), "tab\tkept");
+    }
+
+    #[test]
+    fn test_sanitize_multiline_keeps_text_and_markdown() {
+        let md = "## 見出し\n\n- **太字** と `code`\n\n```rust\nfn main() {}\n```\n";
+        assert_eq!(sanitize_multiline(md), md);
+    }
+
+    #[test]
+    fn test_tsv_value_strips_only_for_terminal() {
+        let v = "a\x1b]52;c;QUJD\x07b\tc";
+        assert_eq!(tsv_value(v, false, escape_tsv), "a\x1b]52;c;QUJD\x07b\\tc");
+        assert_eq!(tsv_value(v, true, escape_tsv), "ab\\tc");
+        assert_eq!(
+            tsv_value("x\x1b[1m\\y", true, escape_tsv_lossless),
+            "x\\\\y"
+        );
+    }
+
+    #[test]
+    fn test_strip_ansi_bidi_controls() {
+        assert_eq!(
+            strip_for_display("run \u{202E}txt.exe\u{202C} \u{2066}x\u{2069}\u{200F}\u{061C}"),
+            "run txt.exe x"
+        );
+        assert_eq!(strip_for_display("שלום مرحبا"), "שלום مرحبا");
+        assert_eq!(sanitize_multiline("a\u{202E}b"), "ab");
+        assert_eq!(sanitize_for_display("a\u{2066}b"), "ab");
+        assert_eq!(tsv_value("a\u{202E}b", true, escape_tsv), "ab");
+        // Values used again, such as session references, keep them.
+        assert_eq!(strip_ansi("bidi-\u{202E}.jsonl"), "bidi-\u{202E}.jsonl");
+    }
+
+    #[test]
+    fn test_prompt_is_redundant_compares_sanitized_text() {
+        assert!(prompt_is_redundant(
+            "fix the bug",
+            "\x1b[31mfix the bug\x1b[0m"
+        ));
+        // A TAB is a space in the title.
+        assert!(prompt_is_redundant("col1\tcol2 and more", "col1 col2.."));
+        // Truncation right after an ESC must not eat the `..` marker.
+        assert!(prompt_is_redundant("fix the bug now", "fix the bug\x1b.."));
+        assert_eq!(sanitize_title_line("fix the bug\x1b.."), "fix the bug..");
+        assert_eq!(sanitize_title_line("fix\x1b]8;;http.."), "fix..");
+        assert_eq!(sanitize_title_line("\x1b[1mfix\x1b[0m"), "fix");
+        assert!(prompt_is_redundant(
+            "fix the bug in parser\nmore",
+            "fix the bug.."
+        ));
+        // An empty title (e.g. only escape sequences) does not hide the prompt.
+        assert!(!prompt_is_redundant("real prompt", ""));
+        assert!(!prompt_is_redundant("real prompt", ".."));
+        assert!(prompt_is_redundant("", "title"));
+    }
+
+    #[test]
+    fn test_strip_ansi_tsv_line_keeps_columns() {
+        let line = "path\tA\x1b]8;;unterminated\tcodex\tB\x1b[31m";
+        assert_eq!(strip_ansi_tsv_line(line), "path\tA\tcodex\tB");
+        // Joining first would drop the later columns.
+        assert_eq!(strip_ansi(line).split('\t').count(), 2);
     }
 
     #[test]
