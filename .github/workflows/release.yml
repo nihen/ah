@@ -37,7 +37,7 @@ jobs:
             artifact: ah-darwin-x86_64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
@@ -75,7 +75,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
@@ -87,7 +87,7 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
       - name: Generate formula and push to tap
