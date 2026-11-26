@@ -324,7 +324,7 @@ pub fn fetch_remote_sessions(
     for result in results {
         match result {
             Ok(sessions) => all_sessions.extend(sessions),
-            Err(e) => eprintln!("Warning: {}", e),
+            Err(e) => eprintln!("Warning: {}", crate::output::sanitize_multiline(&e)),
         }
     }
 
@@ -427,13 +427,19 @@ pub fn exec_remote_show(
             Ok(Some(fields)) => match run_remote_show_meta(remote, remote_path, &fields, filter) {
                 Ok(()) => process::exit(0),
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    eprintln!(
+                        "Error: {}",
+                        crate::output::sanitize_multiline(&e.to_string())
+                    );
                     process::exit(1);
                 }
             },
             Ok(None) => unreachable!("metadata_mode is true => meta_fields() is Some"),
             Err(e) => {
-                eprintln!("Error: {}", e);
+                eprintln!(
+                    "Error: {}",
+                    crate::output::sanitize_multiline(&e.to_string())
+                );
                 process::exit(1);
             }
         }
@@ -755,7 +761,7 @@ pub fn fetch_remote_projects(
     for result in results {
         match result {
             Ok(records) => all.extend(records),
-            Err(e) => eprintln!("Warning: {}", e),
+            Err(e) => eprintln!("Warning: {}", crate::output::sanitize_multiline(&e)),
         }
     }
     all
@@ -811,7 +817,7 @@ pub fn fetch_remote_agent_stats(
     for result in results {
         match result {
             Ok(stats) => all.extend(stats),
-            Err(e) => eprintln!("Warning: {}", e),
+            Err(e) => eprintln!("Warning: {}", crate::output::sanitize_multiline(&e)),
         }
     }
     all
@@ -913,7 +919,7 @@ pub fn fetch_remote_memory(
     for result in results {
         match result {
             Ok(records) => all.extend(records),
-            Err(e) => eprintln!("Warning: {}", e),
+            Err(e) => eprintln!("Warning: {}", crate::output::sanitize_multiline(&e)),
         }
     }
     all

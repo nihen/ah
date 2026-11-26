@@ -131,7 +131,10 @@ fn run_inner(args: ShowArgs, filter: &FilterArgs, check_account: bool) -> Result
                         && filter.remote.is_empty()
                         && let Err(err) = crate::cloud::providers::hydrate(&path, args.offline)
                     {
-                        eprintln!("Cloud history not refreshed: {err}");
+                        eprintln!(
+                            "Cloud history not refreshed: {}",
+                            crate::output::sanitize_multiline(&err.to_string())
+                        );
                     }
                     path
                 }

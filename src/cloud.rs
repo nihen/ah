@@ -607,14 +607,21 @@ pub fn refresh_for_log(offline: bool, force: bool, agent: Option<&str>) {
                     force,
                     (Instant::now() + if force { budget } else { BUDGET }).min(end),
                 ) {
-                    eprintln!("Warning: Codex Cloud (tasks): {e} (using saved history)");
+                    eprintln!(
+                        "Warning: Codex Cloud (tasks): {} (using saved history)",
+                        crate::output::sanitize_multiline(e)
+                    );
                 }
             });
         }
         for source in sources {
             scope.spawn(move || {
                 if let Err(e) = source.refresh(force, end) {
-                    eprintln!("Warning: {}: {e} (using saved history)", source.name());
+                    eprintln!(
+                        "Warning: {}: {} (using saved history)",
+                        source.name(),
+                        crate::output::sanitize_multiline(e)
+                    );
                 }
             });
         }
