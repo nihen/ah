@@ -805,8 +805,16 @@ fn parse_proc_locks(text: &str) -> std::collections::HashMap<(u64, u64, u64), u3
 fn parse_sqlite_wal_holders(text: &str) -> std::collections::HashMap<(u64, u64, u64), Vec<u32>> {
     let mut map: std::collections::HashMap<_, Vec<u32>> = std::collections::HashMap::new();
     for row in proc_lock_rows(text) {
-        if (row.0, row.1, row.4, row.5) == ("POSIX", "READ", "128", "128") {
-            map.entry(row.3).or_default().push(row.2);
+        // The kernel merges this lock with the adjacent read marks the same
+        // process holds (bytes 123 to 127), so the range only has to cover
+        // byte 128.
+        let covers = row.4.parse::<u64>().is_ok_and(|start| start <= 128)
+            && (row.5 == "EOF" || row.5.parse::<u64>().is_ok_and(|end| end >= 128));
+        if (row.0, row.1) == ("POSIX", "READ") && covers {
+            let pids = map.entry(row.3).or_default();
+            if !pids.contains(&row.2) {
+                pids.push(row.2);
+            }
         }
     }
     map
@@ -1191,6 +1199,17 @@ mod tests {
         let map = parse_sqlite_wal_holders(text);
         assert_eq!(map.get(&(0xfc, 0, 500)), Some(&vec![10, 11]));
         assert_eq!(map.len(), 1);
+
+        // Merged with the read mark next to it, and listed once per process.
+        let merged = "1: POSIX  ADVISORY  READ 20 fc:00:600 127 128\n\
+                      2: POSIX  ADVISORY  READ 20 fc:00:600 124 124\n\
+                      3: POSIX  ADVISORY  READ 21 fc:00:600 0 EOF\n\
+                      4: POSIX  ADVISORY  READ 22 fc:00:600 129 EOF\n\
+                      5: POSIX  ADVISORY  READ 23 fc:00:600 120 127\n\
+                      6: POSIX  ADVISORY  READ 0 fc:00:600 128 128\n\
+                      7: POSIX  ADVISORY  READ 0 fc:00:600 128 128\n";
+        let map = parse_sqlite_wal_holders(merged);
+        assert_eq!(map.get(&(0xfc, 0, 600)), Some(&vec![20, 21, 0]));
     }
 
     #[test]
