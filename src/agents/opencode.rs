@@ -954,26 +954,46 @@ impl AgentPlugin for OpencodePlugin {
             .filter(|pid| is_opencode(*pid))
             .filter_map(|pid| Some((pid, super::common::process_args(pid)?)))
             .collect();
-        // The service a client of opencode 2 shares, or else one a client
-        // started for itself with `--standalone`, which writes no state
-        // file. A busy row counts from the start of the service: a state
-        // file can outlive its service and name a pid that was reused.
-        let service = service_pid(&state.join("opencode/service.json")).or_else(|| {
-            clients
-                .iter()
-                .find(|(_, args)| is_service(args))
-                .map(|(pid, _)| *pid)
-        });
-        let started = service.and_then(super::common::process_start_time);
+        // The service of a database is the one its channel's state file
+        // names, or one a client started for itself with `--standalone`,
+        // which writes no state file. Where its open files can be listed it
+        // must have the database open: a service of another channel or of
+        // another data directory says nothing about this one's rows.
+        let serving: Vec<u32> = clients
+            .iter()
+            .filter(|(_, args)| is_service(args))
+            .map(|(pid, _)| *pid)
+            .collect();
         let mut running = Vec::new();
-        if let (Some(pid), Some(started)) = (service, started) {
-            for db in &dbs {
-                running.extend(
-                    busy_sessions(db, started)
-                        .into_iter()
-                        .map(|id| (id, Some(pid))),
-                );
-            }
+        for db in &dbs {
+            let Some(channel) = db
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("opencode")?.strip_suffix(".db"))
+            else {
+                continue;
+            };
+            let has_open = |pid: u32| super::common::process_has_open(pid, db);
+            let service = service_pid(&state.join(format!("opencode/service{channel}.json")))
+                .filter(|pid| has_open(*pid) != Some(false))
+                .or_else(|| {
+                    serving
+                        .iter()
+                        .copied()
+                        .find(|pid| has_open(*pid) == Some(true))
+                });
+            // A busy row counts from the start of the service: a state file
+            // can outlive its service and name a pid that was reused.
+            let Some((pid, started)) =
+                service.and_then(|pid| Some((pid, super::common::process_start_time(pid)?)))
+            else {
+                continue;
+            };
+            running.extend(
+                busy_sessions(db, started)
+                    .into_iter()
+                    .map(|id| (id, Some(pid))),
+            );
         }
         for (pid, args) in &clients {
             if let Some(id) = client_session(args) {

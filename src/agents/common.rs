@@ -860,6 +860,26 @@ pub fn process_name(pid: u32) -> Option<String> {
     }
 }
 
+/// Whether a running process has `file` open. `None` where its open files
+/// cannot be listed.
+pub fn process_has_open(pid: u32, file: &Path) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let wanted = fs::metadata(file).ok()?;
+        let open = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+        Some(open.flatten().any(|fd| {
+            fs::metadata(fd.path())
+                .is_ok_and(|meta| (meta.dev(), meta.ino()) == (wanted.dev(), wanted.ino()))
+        }))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, file);
+        None
+    }
+}
+
 /// Every process id. Empty where the process table cannot be listed.
 pub fn all_pids() -> Vec<u32> {
     #[cfg(target_os = "linux")]
@@ -1132,6 +1152,20 @@ mod tests {
         let map = parse_proc_locks(text);
         assert_eq!(map.get(&(0x103, 0x02, 23794220)), Some(&165470));
         assert_eq!(map.len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_files_of_this_process_are_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (held, other) = (tmp.path().join("held"), tmp.path().join("other"));
+        std::fs::write(&held, "").unwrap();
+        std::fs::write(&other, "").unwrap();
+        let _file = std::fs::File::open(&held).unwrap();
+        let pid = std::process::id();
+        assert_eq!(process_has_open(pid, &held), Some(true));
+        assert_eq!(process_has_open(pid, &other), Some(false));
+        assert_eq!(process_has_open(pid, &tmp.path().join("missing")), None);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
