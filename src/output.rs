@@ -136,9 +136,22 @@ pub fn strip_ansi(s: &str) -> String {
         if (0x80..=0x9f).contains(&(c as u32)) {
             continue;
         }
+        if is_bidi_control(c) {
+            continue;
+        }
         result.push(c);
     }
     result
+}
+
+/// Unicode bidirectional formatting characters (`Bidi_Control`). They
+/// reorder how the surrounding text is displayed, so session data could use
+/// them to make a path or command look different from what it is.
+pub fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Sanitize untrusted text for multi-line terminal display: strip escape
@@ -153,12 +166,14 @@ pub fn sanitize_multiline(s: &str) -> String {
     stripped.replace("\r\n", "\n").replace('\r', "")
 }
 
-/// Whether stdout is rendered by a terminal: a TTY, the pager, or forced
-/// color (e.g. an fzf preview). Machine-readable formats strip control
+/// Whether stdout is rendered by a terminal: a TTY, the pager, or output
+/// requested with `--color`/`AH_COLOR=1` (e.g. an fzf preview), whether or
+/// not `NO_COLOR` disables the colors. Machine-readable formats strip control
 /// characters from data only in this case and stay unchanged in pipes.
 pub fn terminal_bound() -> bool {
     crate::pager::is_active()
         || std::io::IsTerminal::is_terminal(&std::io::stdout())
+        || color::color_requested()
         || color::use_color()
 }
 
@@ -170,6 +185,15 @@ pub fn tsv_value(s: &str, terminal: bool, escape: fn(&str) -> String) -> String 
     } else {
         escape(s)
     }
+}
+
+/// Strip escape sequences from each column of an already-escaped TSV line,
+/// so an unterminated sequence cannot swallow the tabs after it.
+pub fn strip_ansi_tsv_line(line: &str) -> String {
+    line.split('\t')
+        .map(strip_ansi)
+        .collect::<Vec<_>>()
+        .join("\t")
 }
 
 /// Strip surrounding single or double quotes.
@@ -1129,6 +1153,23 @@ mod tests {
             tsv_value("x\x1b[1m\\y", true, escape_tsv_lossless),
             "x\\\\y"
         );
+    }
+
+    #[test]
+    fn test_strip_ansi_bidi_controls() {
+        assert_eq!(
+            strip_ansi("run \u{202E}txt.exe\u{202C} \u{2066}x\u{2069}\u{200F}\u{061C}"),
+            "run txt.exe x"
+        );
+        assert_eq!(strip_ansi("שלום مرحبا"), "שלום مرحبا");
+    }
+
+    #[test]
+    fn test_strip_ansi_tsv_line_keeps_columns() {
+        let line = "path\tA\x1b]8;;unterminated\tcodex\tB\x1b[31m";
+        assert_eq!(strip_ansi_tsv_line(line), "path\tA\tcodex\tB");
+        // Joining first would drop the later columns.
+        assert_eq!(strip_ansi(line).split('\t').count(), 2);
     }
 
     #[test]

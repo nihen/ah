@@ -3225,6 +3225,16 @@ fn show_meta_tsv_is_unchanged_in_pipes_and_stripped_for_terminals() {
     // `--color` means a terminal renders the output (e.g. an fzf preview).
     let colored = stdout_of(&["show", "--color", &path, "-o", "agent,first_prompt"]);
     assert_no_terminal_controls(&colored);
+
+    // NO_COLOR turns the colors off but the output still goes to a terminal.
+    let assert = ah()
+        .env("NO_COLOR", "1")
+        .args(["show", "--color", &path, "-o", "agent,first_prompt"])
+        .assert()
+        .success();
+    let no_color = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_no_terminal_controls(&no_color);
+    assert_eq!(no_color, colored);
     assert!(colored.starts_with("codex\t"), "{colored:?}");
     assert!(colored.contains("safe\\rFAKE\\r\\n"), "{colored:?}");
 }
