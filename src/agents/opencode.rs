@@ -236,7 +236,8 @@ fn warn_once(db: &Path, err: &str) {
     }
 }
 
-/// 9999-12-31T23:59:59Z; larger values would overflow date formatting.
+/// 9999-12-31T23:59:59Z, a bound for corrupt values; date formatting shows
+/// times past jiff's range as its end.
 const MAX_MILLIS: i64 = 253_402_300_799_000;
 
 fn millis_to_system_time(ms: i64) -> SystemTime {

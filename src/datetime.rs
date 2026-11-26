@@ -68,9 +68,20 @@ fn instant_in(dt: DateTime, tz: &TimeZone) -> Option<SystemTime> {
     SystemTime::try_from(ts).ok()
 }
 
-/// `YYYY-MM-DD HH:MM` in local time.
+/// Whole Unix seconds, rounded down like chrono's `timestamp()` (jiff's
+/// `as_second` rounds toward zero, which matters before 1970).
+pub fn unix_seconds(ts: Timestamp) -> i64 {
+    ts.as_second() - i64::from(ts.subsec_nanosecond() < 0)
+}
+
+/// `YYYY-MM-DD HH:MM` in local time. A time outside jiff's range (which ends
+/// at 9999-12-30T22:00Z) shows as its nearest end, not as some other date.
 pub fn format_local_minutes(time: SystemTime) -> String {
-    let ts = Timestamp::try_from(time).unwrap_or(Timestamp::UNIX_EPOCH);
+    let ts = Timestamp::try_from(time).unwrap_or(if time > SystemTime::UNIX_EPOCH {
+        Timestamp::MAX
+    } else {
+        Timestamp::MIN
+    });
     local_tz()
         .to_datetime(ts)
         .strftime("%Y-%m-%d %H:%M")
@@ -124,6 +135,27 @@ mod tests {
         assert_eq!(at("2026-11-01T01:30"), None);
         let fall = Timestamp::from_second(1_793_511_000).unwrap();
         assert_eq!(ny.to_datetime(fall).to_string(), "2026-11-01T01:30:00");
+    }
+
+    #[test]
+    fn unix_seconds_round_down() {
+        let at = |s: &str| unix_seconds(parse_rfc3339(s).unwrap());
+        assert_eq!(at("1969-12-31T23:59:59.500Z"), -1);
+        assert_eq!(at("1970-01-01T00:00:00.500Z"), 0);
+        assert_eq!(at("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(at("1969-12-31T23:59:59Z"), -1);
+    }
+
+    #[test]
+    fn out_of_range_times_format_as_range_ends() {
+        let far = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(300_000_000_000);
+        assert!(format_local_minutes(far).starts_with("9999-12-"));
+        let early = SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(400_000_000_000);
+        assert!(
+            format_local_minutes(early).starts_with("-9999-01-"),
+            "{}",
+            format_local_minutes(early)
+        );
     }
 
     #[test]

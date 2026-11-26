@@ -482,7 +482,7 @@ impl Source {
                 row["createdAt"]
                     .as_str()
                     .and_then(crate::datetime::parse_rfc3339)
-                    .and_then(|t| u64::try_from(t.as_second()).ok()),
+                    .and_then(|t| u64::try_from(crate::datetime::unix_seconds(t)).ok()),
                 row["updatedAt"].as_str().map(str::to_owned),
             ),
             Kind::OpenCode => (
@@ -498,7 +498,7 @@ impl Source {
             Kind::Cursor => row["updatedAt"]
                 .as_str()
                 .and_then(crate::datetime::parse_rfc3339)
-                .and_then(|t| u64::try_from(t.as_second()).ok()),
+                .and_then(|t| u64::try_from(crate::datetime::unix_seconds(t)).ok()),
             Kind::OpenCode => row["time"]["updated"].as_u64().map(|ms| ms / 1000),
         };
         Ok(Row {
@@ -1043,7 +1043,8 @@ fn encode_query(s: &str) -> String {
 }
 
 fn rfc3339(v: Option<&str>) -> Option<u64> {
-    crate::datetime::parse_rfc3339(v?).and_then(|t| u64::try_from(t.as_second()).ok())
+    crate::datetime::parse_rfc3339(v?)
+        .and_then(|t| u64::try_from(crate::datetime::unix_seconds(t)).ok())
 }
 
 fn messages_coverage() -> String {
