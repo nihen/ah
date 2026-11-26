@@ -81,10 +81,8 @@ pub fn build_agent_stats(
             }
 
             let agent = config::find_agent_for_path(path);
-            let plugin = agent
-                .map(|a| a.plugin)
-                .unwrap_or_else(agents::unknown_plugin);
-            let id = agent.map(|a| a.id.as_str()).unwrap_or("unknown");
+            let plugin = agent.map_or_else(agents::unknown_plugin, |a| a.plugin);
+            let id = agent.map_or("unknown", |a| a.id.as_str());
 
             // Apply --agent filter
             if filter.agent.as_ref().is_some_and(|f| id != f) {
@@ -100,7 +98,7 @@ pub fn build_agent_stats(
                 &Default::default(),
             );
             let field = |fields: &BTreeMap<Field, String>, f: Field| {
-                fields.get(&f).map(|v| v.as_str()).unwrap_or("").to_string()
+                fields.get(&f).map_or("", |v| v.as_str()).to_string()
             };
             // Apply --project filter
             if filter

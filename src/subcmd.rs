@@ -394,7 +394,7 @@ fn resolve_by_id(id: &str, home: &Path, agent: Option<&str>) -> Result<PathBuf, 
                 return None;
             }
             let agent_def = config::find_agent_for_path(fpath);
-            let agent_id = agent_def.map(|a| a.id.as_str()).unwrap_or("");
+            let agent_id = agent_def.map_or("", |a| a.id.as_str());
             if agent.is_some_and(|wanted| wanted != agent_id) {
                 return None;
             }

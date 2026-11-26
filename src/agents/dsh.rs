@@ -219,7 +219,7 @@ fn may_be_read(line: &[u8]) -> bool {
 }
 
 fn for_each_event(log: &[u8], mut visit: impl FnMut(&str, &serde_json::Value) -> bool) {
-    for line in log.split(|&b| b == b'\n') {
+    for line in super::common::jsonl_lines(log) {
         if line.len() < 2 || !may_be_read(line) {
             continue;
         }

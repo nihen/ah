@@ -41,6 +41,9 @@ pub static PLUGIN: ClaudePlugin = ClaudePlugin;
 /// `permission-mode`, `bridge-session`, ...) before the first line carrying
 /// `cwd`, so look further than the first few lines.
 const CWD_SCAN_LINES: usize = 50;
+/// Bytes read from the start of a session to find its cwd; most sessions
+/// name it well within them.
+const CWD_HEAD_BYTES: usize = 32 * 1024;
 
 /// How far from the end of a session to look for title records. They are
 /// re-appended after every turn and observed within ~40 KiB of the end;
@@ -52,7 +55,7 @@ pub struct ClaudePlugin;
 impl ClaudePlugin {
     fn extract_cwd_from_bytes(data: &[u8]) -> Option<String> {
         let cwd_needle = b"\"cwd\"";
-        for line_bytes in data.split(|&b| b == b'\n').take(CWD_SCAN_LINES) {
+        for line_bytes in super::common::jsonl_lines(data).take(CWD_SCAN_LINES) {
             if memchr::memmem::find(line_bytes, cwd_needle).is_none() {
                 continue;
             }
@@ -68,6 +71,28 @@ impl ClaudePlugin {
             }
         }
         None
+    }
+
+    /// The cwd as `extract_cwd_from_bytes` finds it, read from the first
+    /// `CWD_HEAD_BYTES` of the file without mapping it. `None` when those
+    /// bytes do not decide it: the file is longer and its complete lines
+    /// among them name no cwd, or it is not a regular file.
+    fn cwd_from_head(path: &Path) -> Option<Option<String>> {
+        use std::io::Read;
+        let file = std::fs::File::open(path).ok()?;
+        // Reading a FIFO or a device could block; the mapping path skips them.
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut head = Vec::with_capacity(CWD_HEAD_BYTES);
+        file.take(CWD_HEAD_BYTES as u64)
+            .read_to_end(&mut head)
+            .ok()?;
+        if head.len() < CWD_HEAD_BYTES {
+            return Some(Self::extract_cwd_from_bytes(&head));
+        }
+        let complete = memchr::memrchr(b'\n', &head)?;
+        Self::extract_cwd_from_bytes(&head[..complete]).map(Some)
     }
 
     /// Value of `field` in the latest `record_type` record within the tail of
@@ -90,8 +115,7 @@ impl ClaudePlugin {
         .chain((tail_start == 0 && data.starts_with(&needle.as_bytes()[1..])).then_some(0));
         line_starts.find_map(|line_start| {
             let line_end = memchr::memchr(b'\n', &data[line_start..])
-                .map(|idx| line_start + idx)
-                .unwrap_or(data.len());
+                .map_or(data.len(), |idx| line_start + idx);
             // A line that fails to parse (e.g. still being appended) is
             // skipped in favor of the previous record.
             let val =
@@ -119,7 +143,7 @@ impl ClaudePlugin {
     }
 
     pub(crate) fn first_user_prompt_from_mmap(mmap: &[u8]) -> Option<String> {
-        for line_bytes in mmap.split(|&b| b == b'\n') {
+        for line_bytes in super::common::jsonl_lines(mmap) {
             if line_bytes.len() < 10 {
                 continue;
             }
@@ -368,7 +392,7 @@ impl AgentPlugin for ClaudePlugin {
                 if let Some(contents) = msg.get("content").and_then(|v| v.as_array()) {
                     for item in contents {
                         let text = match item.get("type").and_then(|v| v.as_str()) {
-                            Some("text") | Some("input_text") => {
+                            Some("text" | "input_text") => {
                                 item.get("text").and_then(|v| v.as_str())
                             }
                             _ => item.get("text").and_then(|v| v.as_str()),
@@ -406,6 +430,9 @@ impl AgentPlugin for ClaudePlugin {
     }
 
     fn resolve_cwd(&self, path: &Path, _home: &Path) -> Option<String> {
+        if let Some(cwd) = Self::cwd_from_head(path) {
+            return cwd;
+        }
         let mmap = mmap_file(path)?;
         Self::extract_cwd_from_bytes(&mmap)
     }
@@ -529,8 +556,10 @@ impl AgentPlugin for ClaudePlugin {
                 let project = session_cwd
                     .as_deref()
                     .and_then(|c| Path::new(c).file_name())
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| decode_claude_project(&encoded_name));
+                    .map_or_else(
+                        || decode_claude_project(&encoded_name),
+                        |n| n.to_string_lossy().to_string(),
+                    );
                 Some(AgentMemoryFile { path, project })
             })
             .collect()
@@ -659,6 +688,51 @@ mod tests {
             ClaudePlugin::extract_cwd_from_bytes(&data).as_deref(),
             Some("/Users/test/headers-project")
         );
+    }
+
+    #[test]
+    fn cwd_is_read_the_same_from_the_head_and_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Path::new("/h");
+        let cwd_line = "{\"cwd\":\"/work\"}\n";
+        let filler = format!("{{\"pad\":\"{}\"}}\n", "x".repeat(CWD_HEAD_BYTES));
+        let cases = [
+            // the whole file fits in the head
+            (cwd_line.to_string(), Some("/work")),
+            ("{\"type\":\"mode\"}\n".to_string(), None),
+            (String::new(), None),
+            // the cwd line lies within the head of a longer file
+            (format!("{cwd_line}{filler}"), Some("/work")),
+            // the cwd line lies beyond the head
+            (format!("{filler}{cwd_line}"), Some("/work")),
+            (format!("{filler}{filler}"), None),
+        ];
+        for (i, (content, expected)) in cases.iter().enumerate() {
+            let path = dir.path().join(format!("{i}.jsonl"));
+            std::fs::write(&path, content).unwrap();
+            assert_eq!(PLUGIN.resolve_cwd(&path, home).as_deref(), *expected);
+            assert_eq!(
+                ClaudePlugin::extract_cwd_from_bytes(content.as_bytes()).as_deref(),
+                *expected
+            );
+        }
+    }
+
+    /// A FIFO whose writer sends nothing must not block the lookup.
+    #[cfg(unix)]
+    #[test]
+    fn cwd_lookup_skips_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fifo.jsonl");
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // Opening for both ends does not wait for a peer and keeps a writer.
+        let _writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(PLUGIN.resolve_cwd(&path, Path::new("/h")), None);
     }
 
     #[test]

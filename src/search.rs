@@ -23,6 +23,12 @@ pub fn search_fulltext_matches(
     }
 }
 
+/// The excerpt around the first match of `pattern` in `text`.
+fn match_context(pattern: &Regex, text: &str) -> Option<String> {
+    let m = pattern.find(text)?;
+    Some(extract_match_context(text, m.start(), m.end(), 30))
+}
+
 /// Prompt-only search through the plugin-provided user messages. Returns
 /// the match context of the first matching prompt, or `None` when none
 /// matches. `data` is the session file's content when already loaded.
@@ -40,13 +46,8 @@ pub fn search_prompts(
         if message.role != MessageRole::User {
             return true;
         }
-        match pattern.find(&message.text) {
-            Some(m) => {
-                found = Some(extract_match_context(&message.text, m.start(), m.end(), 30));
-                false
-            }
-            None => true,
-        }
+        found = match_context(pattern, &message.text);
+        found.is_none()
     };
     match data {
         Some(data) => plugin.iter_messages_from_bytes(path, data, &mut visit),
@@ -72,13 +73,11 @@ pub fn search_texts(
         if crate::cancel::requested() {
             return false;
         }
-        match pattern.find(text).filter(|_| !text.is_empty()) {
-            Some(m) => {
-                found = Some(extract_match_context(text, m.start(), m.end(), 30));
-                false
-            }
-            None => true,
+        if text.is_empty() {
+            return true;
         }
+        found = match_context(pattern, text);
+        found.is_none()
     };
     match data {
         Some(data) => plugin.iter_search_texts_from_bytes(path, data, &mut visit),

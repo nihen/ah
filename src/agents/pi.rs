@@ -59,7 +59,7 @@ impl PiPlugin {
     fn title_from_bytes(data: &[u8]) -> Option<String> {
         let finder = memmem::Finder::new(b"\"session_info\"");
         let mut name = None;
-        for line in data.split(|&b| b == b'\n') {
+        for line in super::common::jsonl_lines(data) {
             if finder.find(line).is_none() {
                 continue;
             }
@@ -291,6 +291,10 @@ impl AgentPlugin for PiPlugin {
 
     fn resolve_cwd(&self, path: &Path, _home: &Path) -> Option<String> {
         Self::cwd_from_bytes(&mmap_file(path)?)
+    }
+
+    fn cwd_in_session_bytes(&self) -> bool {
+        true
     }
 
     fn resolve_cwd_from_mmap(&self, _path: &Path, _home: &Path, mmap: &[u8]) -> Option<String> {

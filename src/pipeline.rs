@@ -43,6 +43,26 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
     let debug = color::is_debug();
     let t0 = Instant::now();
 
+    let has_query = !params.query.is_empty();
+    let raw_search = params.search_mode == SearchMode::Raw;
+    let bytes_pattern = if has_query && raw_search {
+        Some(compile_bytes_regex(&params.query)?)
+    } else {
+        None
+    };
+    let text_pattern = if has_query && !raw_search {
+        Some(compile_text_regex(&params.query)?)
+    } else {
+        None
+    };
+
+    // Running sessions are looked up while the files are scanned. Started
+    // only once the query is known to compile: nothing below returns early,
+    // so the lookup is always joined.
+    let running = std::thread::Builder::new()
+        .spawn(crate::agents::running_session_map)
+        .ok();
+
     let home = agents::common::canonical_home();
     let files = collector::collect_files(params.collect_limit);
 
@@ -65,18 +85,6 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
         }
     }
 
-    let has_query = !params.query.is_empty();
-    let raw_search = params.search_mode == SearchMode::Raw;
-    let bytes_pattern = if has_query && raw_search {
-        Some(compile_bytes_regex(&params.query)?)
-    } else {
-        None
-    };
-    let text_pattern = if has_query && !raw_search {
-        Some(compile_text_regex(&params.query)?)
-    } else {
-        None
-    };
     let query_prefilter = if has_query && !raw_search {
         search::QueryPrefilter::new(&params.query)
     } else {
@@ -181,7 +189,11 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
             // and only for full-text search.
             let search_path = plugin.search_path(path);
             let is_session_file = search_path == *path;
-            let mut mmap = if plugin.cheap_session_bytes() {
+            let cheap_bytes = plugin.cheap_session_bytes();
+            // With early filters, sessions they reject are not mapped at all
+            // unless the plugin reads the cwd from these bytes.
+            let load_early = cheap_bytes && (!has_early_filters || plugin.cwd_in_session_bytes());
+            let mut mmap = if load_early {
                 plugin.session_bytes(path)
             } else {
                 None
@@ -205,13 +217,13 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
                     session_mmap,
                 );
                 for f in &early_filters {
-                    if early_fields.get(&f.field).map(|v| v.as_str()).unwrap_or("") != f.value {
+                    if early_fields.get(&f.field).map_or("", |v| v.as_str()) != f.value {
                         return None;
                     }
                 }
             }
 
-            if mmap.is_none() && has_query && raw_search && !plugin.cheap_session_bytes() {
+            if !load_early && (cheap_bytes || (has_query && raw_search)) {
                 mmap = plugin.session_bytes(path);
             }
 
@@ -320,7 +332,7 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
 
             // Late field filters (--project etc.)
             for f in &late_filters {
-                if fields.get(&f.field).map(|v| v.as_str()).unwrap_or("") != f.value {
+                if fields.get(&f.field).map_or("", |v| v.as_str()) != f.value {
                     return None;
                 }
             }
@@ -352,7 +364,9 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
     }
 
     // Running sessions reported by the agent plugins
-    let pid_map = crate::agents::running_session_map();
+    let pid_map = running
+        .and_then(|lookup| lookup.join().ok())
+        .unwrap_or_else(crate::agents::running_session_map);
     for session in &mut sessions {
         let plugin_id = agents::find_plugin_for_path(&session.path).id();
         let session_id = session.fields.get(&Field::Id).cloned().unwrap_or_default();
@@ -436,9 +450,7 @@ pub fn unique_session_copies<'a>(copies: impl Iterator<Item = SessionCopy<'a>>) 
         if copy.id.is_empty() {
             continue;
         }
-        let agent = config::find_agent_for_path(copy.path)
-            .map(|a| a.id.as_str())
-            .unwrap_or("");
+        let agent = config::find_agent_for_path(copy.path).map_or("", |a| a.id.as_str());
         best.entry((agent, copy.id, copy.parent_id, cloud_namespace(copy.path)))
             .and_modify(|j| {
                 let other = &copies[*j];
@@ -460,7 +472,7 @@ pub fn unique_session_copies<'a>(copies: impl Iterator<Item = SessionCopy<'a>>) 
 /// Keep one session per agent, id and parent (see `unique_session_copies`).
 fn dedup_by_id(sessions: Vec<(Session, SystemTime)>) -> Vec<Session> {
     fn field(session: &Session, field: Field) -> &str {
-        session.fields.get(&field).map(|v| v.as_str()).unwrap_or("")
+        session.fields.get(&field).map_or("", |v| v.as_str())
     }
     let keep = unique_session_copies(sessions.iter().map(|(session, mtime)| SessionCopy {
         path: &session.path,

@@ -53,9 +53,7 @@ pub fn strip_home(path: &str, home: &Path) -> String {
 /// `/home/user` → `/data/home/user` so that it matches the canonicalized cwd
 /// filter); otherwise return it unchanged.
 pub fn canonicalize_if_exists(path: &str) -> String {
-    fs::canonicalize(path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| path.to_string())
+    fs::canonicalize(path).map_or_else(|_| path.to_string(), |p| p.to_string_lossy().to_string())
 }
 
 /// A session/conversation id is safe to pass as a positional CLI argument
@@ -370,6 +368,50 @@ pub fn jsonl_lines(data: &[u8]) -> impl Iterator<Item = &[u8]> {
     })
 }
 
+/// Finds the JSONL lines of `data` that contain a needle, searching the
+/// buffer for the needle rather than splitting it into lines first: the
+/// bytes of lines without it are read once, not once per search.
+pub struct LinesWith<'a, 'n> {
+    data: &'a [u8],
+    finder: memchr::memmem::Finder<'n>,
+    /// The last line found (`None` once the needle does not occur again),
+    /// reused while the caller has not passed it.
+    found: Option<Option<std::ops::Range<usize>>>,
+}
+
+impl<'a, 'n> LinesWith<'a, 'n> {
+    pub fn new(data: &'a [u8], needle: &'n [u8]) -> Self {
+        Self {
+            data,
+            finder: memchr::memmem::Finder::new(needle),
+            found: None,
+        }
+    }
+
+    /// Byte range (without the trailing `\n`) of the first line starting at
+    /// or after `from` that contains the needle. `from` must be the start of
+    /// a line and must not decrease between calls.
+    pub fn next_from(&mut self, from: usize) -> Option<std::ops::Range<usize>> {
+        match &self.found {
+            Some(None) => return None,
+            Some(Some(line)) if line.start >= from => return Some(line.clone()),
+            _ => {}
+        }
+        let data = self.data;
+        let line = data
+            .get(from..)
+            .and_then(|rest| self.finder.find(rest))
+            .map(|pos| {
+                let at = from + pos;
+                let start = memchr::memrchr(b'\n', &data[from..at]).map_or(from, |i| from + i + 1);
+                let end = memchr::memchr(b'\n', &data[at..]).map_or(data.len(), |i| at + i);
+                start..end
+            });
+        self.found = Some(line.clone());
+        line
+    }
+}
+
 /// Models from the JSONL lines that contain `needle`; other lines are
 /// skipped without parsing. `model_of` sees only the values at `paths`
 /// (see `parse_json_paths`).
@@ -380,13 +422,12 @@ pub fn jsonl_models(
     model_of: impl for<'a> Fn(&'a serde_json::Value) -> Option<&'a str>,
 ) -> Option<ModelList> {
     let data = mmap_file(path)?;
-    let finder = memchr::memmem::Finder::new(needle);
+    let mut lines = LinesWith::new(&data, needle);
     let mut models = ModelList::default();
-    for line in jsonl_lines(&data) {
-        if finder.find(line).is_none() {
-            continue;
-        }
-        if let Some(val) = parse_json_paths(line, paths) {
+    let mut from = 0;
+    while let Some(line) = lines.next_from(from) {
+        from = line.end + 1;
+        if let Some(val) = parse_json_paths(&data[line], paths) {
             if let Some(model) = model_of(&val) {
                 models.push(model);
             }
@@ -396,7 +437,7 @@ pub fn jsonl_models(
 }
 
 pub fn for_each_jsonl_value_bytes(data: &[u8], mut visit: impl FnMut(&serde_json::Value) -> bool) {
-    for line_bytes in data.split(|&b| b == b'\n') {
+    for line_bytes in jsonl_lines(data) {
         if line_bytes.len() < 2 {
             continue;
         }
@@ -880,6 +921,34 @@ mod tests {
             let data = data.as_bytes();
             let expected: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
             assert_eq!(jsonl_lines(data).collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[test]
+    fn lines_with_finds_the_lines_a_line_scan_finds() {
+        for data in [
+            "",
+            "x",
+            "ab\n",
+            "ab",
+            "a\nab\nb\nxabx ab\n\nab",
+            "\nab\nab\n",
+            "abab\nb\n",
+        ] {
+            let data = data.as_bytes();
+            let expected: Vec<&[u8]> = jsonl_lines(data)
+                .filter(|line| memchr::memmem::find(line, b"ab").is_some())
+                .collect();
+            let mut lines = LinesWith::new(data, b"ab");
+            let mut found = Vec::new();
+            let mut from = 0;
+            while let Some(line) = lines.next_from(from) {
+                // asking again before moving on gives the same line
+                assert_eq!(lines.next_from(from), Some(line.clone()));
+                from = line.end + 1;
+                found.push(&data[line]);
+            }
+            assert_eq!(found, expected);
         }
     }
 

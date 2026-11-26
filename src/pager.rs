@@ -66,13 +66,12 @@ pub fn setup(no_pager: bool) -> Option<Pager> {
         .ok()?;
 
     // Take the pager's stdin pipe
-    let pager_stdin = match child.stdin.take() {
-        Some(stdin) => stdin,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
+    let pager_stdin = if let Some(stdin) = child.stdin.take() {
+        stdin
+    } else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
     };
 
     // Redirect our stdout to the pager's stdin pipe via dup2

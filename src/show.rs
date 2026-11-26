@@ -186,7 +186,7 @@ fn run_inner(args: ShowArgs, filter: &FilterArgs, check_account: bool) -> Result
                 crate::cli::SearchMode::Text | crate::cli::SearchMode::Prompt => {
                     regex::Regex::new(&format!("(?i){}", query))
                         .map(drop)
-                        .map_err(|e| format!("Invalid regex '{}': {}", query, e))?
+                        .map_err(|e| format!("Invalid regex '{}': {}", query, e))?;
                 }
             }
         }
@@ -294,7 +294,7 @@ pub(crate) fn emit_session_meta_tsv(
     // raw-first / `unescape_tsv`-fallback ordering.
     let values: Vec<String> = fields
         .iter()
-        .map(|f| crate::output::escape_tsv(resolved.get(f).map(|s| s.as_str()).unwrap_or("")))
+        .map(|f| crate::output::escape_tsv(resolved.get(f).map_or("", |s| s.as_str())))
         .collect();
     println!("{}", values.join("\t"));
     Ok(())

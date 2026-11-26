@@ -226,51 +226,27 @@ fn output_log(sessions: &[Session], query: &str) {
             println!();
         }
 
-        let id = session
-            .fields
-            .get(&Field::Id)
-            .map(|v| v.as_str())
-            .unwrap_or("");
-        let agent = session
-            .fields
-            .get(&Field::Agent)
-            .map(|v| v.as_str())
-            .unwrap_or("");
-        let model = session
-            .fields
-            .get(&Field::Model)
-            .map(|v| v.as_str())
-            .unwrap_or("");
+        let id = session.fields.get(&Field::Id).map_or("", |v| v.as_str());
+        let agent = session.fields.get(&Field::Agent).map_or("", |v| v.as_str());
+        let model = session.fields.get(&Field::Model).map_or("", |v| v.as_str());
         let project = session
             .fields
             .get(&Field::Project)
-            .map(|v| v.as_str())
-            .unwrap_or("");
-        let cwd = session
-            .fields
-            .get(&Field::Cwd)
-            .map(|v| v.as_str())
-            .unwrap_or("");
+            .map_or("", |v| v.as_str());
+        let cwd = session.fields.get(&Field::Cwd).map_or("", |v| v.as_str());
         let created = session
             .fields
             .get(&Field::CreatedAt)
-            .map(|v| v.as_str())
-            .unwrap_or("");
+            .map_or("", |v| v.as_str());
         let modified = session
             .fields
             .get(&Field::ModifiedAt)
-            .map(|v| v.as_str())
-            .unwrap_or("");
-        let title = session
-            .fields
-            .get(&Field::Title)
-            .map(|v| v.as_str())
-            .unwrap_or("");
+            .map_or("", |v| v.as_str());
+        let title = session.fields.get(&Field::Title).map_or("", |v| v.as_str());
         let prompt = session
             .fields
             .get(&Field::FirstPrompt)
-            .map(|v| v.as_str())
-            .unwrap_or("");
+            .map_or("", |v| v.as_str());
         let is_running = session
             .fields
             .get(&Field::Running)
@@ -340,8 +316,7 @@ fn output_log(sessions: &[Session], query: &str) {
         let matched = session
             .fields
             .get(&Field::Matched)
-            .map(|v| v.as_str())
-            .unwrap_or("");
+            .map_or("", |v| v.as_str());
         if !matched.is_empty() {
             println!();
             let matched_text = if let Some(ref re) = highlight_re {
@@ -396,7 +371,7 @@ fn output_table(sessions: &[Session], fields: &[Field], query: &str) {
             display_fields
                 .iter()
                 .map(|f| {
-                    let val = session.fields.get(f).map(|v| v.as_str()).unwrap_or("");
+                    let val = session.fields.get(f).map_or("", |v| v.as_str());
                     sanitize_for_display(val)
                 })
                 .collect()
@@ -499,7 +474,7 @@ fn output_tsv(sessions: &[Session], fields: &[Field], query: &str) {
         let values: Vec<String> = fields
             .iter()
             .map(|f| {
-                let val = session.fields.get(f).map(|v| v.as_str()).unwrap_or("");
+                let val = session.fields.get(f).map_or("", |v| v.as_str());
                 let escaped = escape_tsv(val);
                 if is_tty {
                     if *f == Field::Matched {
@@ -580,7 +555,7 @@ fn output_ltsv(sessions: &[Session], fields: &[Field]) {
         let pairs: Vec<String> = fields
             .iter()
             .map(|f| {
-                let val = session.fields.get(f).map(|v| v.as_str()).unwrap_or("");
+                let val = session.fields.get(f).map_or("", |v| v.as_str());
                 format!("{}:{}", f.name(), escape_tsv(val))
             })
             .collect();
@@ -661,7 +636,7 @@ fn output_projects_table(
             fields
                 .iter()
                 .map(|f| {
-                    let val = record.get(f).map(|v| v.as_str()).unwrap_or("");
+                    let val = record.get(f).map_or("", |v| v.as_str());
                     sanitize_for_display(val)
                 })
                 .collect()
@@ -698,7 +673,7 @@ fn output_projects_tsv(
         let values: Vec<String> = fields
             .iter()
             .map(|f| {
-                let val = record.get(f).map(|v| v.as_str()).unwrap_or("");
+                let val = record.get(f).map_or("", |v| v.as_str());
                 let escaped = escape_tsv(val);
                 if is_tty {
                     colorize_project(f, &escaped)
@@ -719,7 +694,7 @@ fn output_projects_ltsv(
         let pairs: Vec<String> = fields
             .iter()
             .map(|f| {
-                let val = record.get(f).map(|v| v.as_str()).unwrap_or("");
+                let val = record.get(f).map_or("", |v| v.as_str());
                 format!("{}:{}", f.name(), escape_tsv(val))
             })
             .collect();
@@ -824,7 +799,7 @@ fn output_memory_table(
             fields
                 .iter()
                 .map(|f| {
-                    let val = record.get(f).map(|v| v.as_str()).unwrap_or("");
+                    let val = record.get(f).map_or("", |v| v.as_str());
                     sanitize_for_display(val)
                 })
                 .collect()
@@ -873,7 +848,7 @@ fn output_memory_tsv(
         let values: Vec<String> = fields
             .iter()
             .map(|f| {
-                let val = record.get(f).map(|v| v.as_str()).unwrap_or("");
+                let val = record.get(f).map_or("", |v| v.as_str());
                 let escaped = escape_tsv(val);
                 if is_tty {
                     colorize_memory(f, &escaped)
@@ -899,7 +874,7 @@ fn output_memory_ltsv(
         let pairs: Vec<String> = fields
             .iter()
             .map(|f| {
-                let val = record.get(f).map(|v| v.as_str()).unwrap_or("");
+                let val = record.get(f).map_or("", |v| v.as_str());
                 format!("{}:{}", f.name(), escape_tsv(val))
             })
             .collect();

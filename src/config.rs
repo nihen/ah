@@ -74,12 +74,11 @@ where
             ) {
                 return None;
             }
-            match value.try_into() {
-                Ok(entry) => Some((name, entry)),
-                Err(_) => {
-                    eprintln!("Warning: ignoring invalid [cloud.{name}] configuration.");
-                    None
-                }
+            if let Ok(entry) = value.try_into() {
+                Some((name, entry))
+            } else {
+                eprintln!("Warning: ignoring invalid [cloud.{name}] configuration.");
+                None
             }
         })
         .collect())
@@ -427,24 +426,23 @@ fn load_config(home: &Path) -> (Vec<AgentDef>, Vec<RemoteDef>, CloudConfig) {
                                 .filter(|(id, _)| id != agent_id)
                                 .flat_map(|(_, patterns)| patterns.iter().cloned())
                                 .collect();
-                            match extra_path_marker(&expanded, home, &other_patterns) {
-                                Some(marker) => {
-                                    if !existing.path_markers.contains(&marker) {
-                                        existing.path_markers.push(marker);
-                                    }
+                            if let Some(marker) =
+                                extra_path_marker(&expanded, home, &other_patterns)
+                            {
+                                if !existing.path_markers.contains(&marker) {
+                                    existing.path_markers.push(marker);
                                 }
-                                None => {
-                                    eprintln!(
-                                        "Warning: ~/.ahrc [agents.{}]: extra pattern '{}' cannot be \
-                                         told apart from HOME or another agent's directory; only \
-                                         matches already inside this agent's own locations are used \
-                                         (use a dedicated directory or name prefix)",
-                                        agent_id, pattern
-                                    );
-                                    // Still scanned: matches under the agent's default
-                                    // locations map back to it; the collector skips others.
-                                    existing.unattributed_patterns.push(expanded.clone());
-                                }
+                            } else {
+                                eprintln!(
+                                    "Warning: ~/.ahrc [agents.{}]: extra pattern '{}' cannot be \
+                                     told apart from HOME or another agent's directory; only \
+                                     matches already inside this agent's own locations are used \
+                                     (use a dedicated directory or name prefix)",
+                                    agent_id, pattern
+                                );
+                                // Still scanned: matches under the agent's default
+                                // locations map back to it; the collector skips others.
+                                existing.unattributed_patterns.push(expanded.clone());
                             }
                             existing.glob_patterns.push(expanded);
                         }
@@ -628,9 +626,7 @@ pub fn find_plugin_for_path(path: &Path) -> &'static dyn AgentPlugin {
     {
         return &crate::cloud::providers::PLUGIN;
     }
-    find_agent_for_path(path)
-        .map(|a| a.plugin)
-        .unwrap_or_else(agents::unknown_plugin)
+    find_agent_for_path(path).map_or_else(agents::unknown_plugin, |a| a.plugin)
 }
 
 #[cfg(test)]
@@ -729,10 +725,10 @@ mod tests {
 
     #[test]
     fn test_parse_ahrc_disabled() {
-        let toml_str = r#"
+        let toml_str = r"
 [agents.codex]
 disabled = true
-"#;
+";
         let config: AhrcConfig = toml::from_str(toml_str).unwrap();
         assert!(config.agents["codex"].disabled.unwrap());
     }

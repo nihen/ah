@@ -213,7 +213,7 @@ pub fn definitions() -> Vec<Value> {
                 ("type", json!({"type": "string", "description": "Only this memory type (e.g. instruction, rule, memory, skill; skills are listed only when requested)"})),
                 ("query", json!({"type": "string", "description": "Case-insensitive regex over file contents; the matched field holds the hit"})),
                 ("sort", json!({"type": "string", "enum": memory_fields, "description": "Sort field (default modified_at)"})),
-                ("order", order.clone()),
+                ("order", order),
                 ("max_chars", json!({"type": "integer", "minimum": 0, "description": "Drop body contents from the end once the total exceeds this (default 100000, 0 = unlimited)"})),
             ], &[]),
         }),
@@ -767,8 +767,7 @@ fn tool_memory(p: &Params<'_>, base: &FilterArgs) -> Result<ToolOutput, String> 
         let body_len = |row: &Map<String, Value>| {
             row.get("body")
                 .and_then(Value::as_str)
-                .map(|s| s.chars().count())
-                .unwrap_or(0)
+                .map_or(0, |s| s.chars().count())
         };
         let mut total: usize = rows.iter().map(body_len).sum();
         for row in rows.iter_mut().rev() {
