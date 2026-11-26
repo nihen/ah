@@ -62,12 +62,11 @@ impl ClaudePlugin {
             let Ok(line) = std::str::from_utf8(line_bytes) else {
                 continue;
             };
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                if let Some(cwd) = val.get("cwd").and_then(|v| v.as_str()) {
-                    if !cwd.is_empty() {
-                        return Some(cwd.to_string());
-                    }
-                }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
+                && let Some(cwd) = val.get("cwd").and_then(|v| v.as_str())
+                && !cwd.is_empty()
+            {
+                return Some(cwd.to_string());
             }
         }
         None
@@ -169,10 +168,11 @@ impl ClaudePlugin {
             }
             if let Some(contents) = msg.get("content").and_then(|v| v.as_array()) {
                 for item in contents {
-                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        if !text.starts_with('<') && !text.starts_with("# ") {
-                            return Some(text.to_string());
-                        }
+                    if let Some(text) = item.get("text").and_then(|v| v.as_str())
+                        && !text.starts_with('<')
+                        && !text.starts_with("# ")
+                    {
+                        return Some(text.to_string());
                     }
                 }
             }
@@ -398,11 +398,12 @@ impl AgentPlugin for ClaudePlugin {
                             }
                             _ => item.get("text").and_then(|v| v.as_str()),
                         };
-                        if let Some(text) = text {
-                            if !text.starts_with('<') && !text.starts_with("# ") {
-                                msgs.push(Message::user(text.to_string()).at(val.get("timestamp")));
-                                return msgs;
-                            }
+                        if let Some(text) = text
+                            && !text.starts_with('<')
+                            && !text.starts_with("# ")
+                        {
+                            msgs.push(Message::user(text.to_string()).at(val.get("timestamp")));
+                            return msgs;
                         }
                     }
                 }
@@ -410,12 +411,12 @@ impl AgentPlugin for ClaudePlugin {
             Some("assistant") => {
                 if let Some(contents) = val.pointer("/message/content").and_then(|v| v.as_array()) {
                     for item in contents {
-                        if item.get("type").and_then(|v| v.as_str()) == Some("text") {
-                            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                                msgs.push(
-                                    Message::assistant(text.to_string()).at(val.get("timestamp")),
-                                );
-                            }
+                        if item.get("type").and_then(|v| v.as_str()) == Some("text")
+                            && let Some(text) = item.get("text").and_then(|v| v.as_str())
+                        {
+                            msgs.push(
+                                Message::assistant(text.to_string()).at(val.get("timestamp")),
+                            );
                         }
                     }
                 }
@@ -646,10 +647,10 @@ fn running_in(
             v.as_u64()
                 .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
         });
-        if let (Some(recorded), Some(actual)) = (recorded, start_ticks(pid)) {
-            if recorded != actual {
-                continue;
-            }
+        if let (Some(recorded), Some(actual)) = (recorded, start_ticks(pid))
+            && recorded != actual
+        {
+            continue;
         }
         out.push((session_id.to_string(), Some(pid)));
     }

@@ -23,10 +23,10 @@ use super::{MemoryKind, MemorySource};
 fn visit_message_value(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -> bool) -> bool {
     match val.get("role").and_then(|v| v.as_str()) {
         Some("user") => {
-            if let Some(raw) = val.get("message").and_then(first_text_part) {
-                if let Some(text) = cursor_user_body(raw) {
-                    return visit(Message::user(text.to_string()));
-                }
+            if let Some(raw) = val.get("message").and_then(first_text_part)
+                && let Some(text) = cursor_user_body(raw)
+            {
+                return visit(Message::user(text.to_string()));
             }
         }
         Some("assistant") => {
@@ -70,10 +70,10 @@ static LISTING_CACHE: LazyLock<Mutex<HashMap<PathBuf, DirListing>>> =
 /// e.g. "Users-you-src-github-com-org-repo" -> "/Users/you/src/github.com/org/repo"
 /// Results are cached per encoded string.
 fn decode_cursor_path(encoded: &str) -> Option<String> {
-    if let Ok(cache) = DECODE_CACHE.lock() {
-        if let Some(result) = cache.get(encoded) {
-            return result.clone();
-        }
+    if let Ok(cache) = DECODE_CACHE.lock()
+        && let Some(result) = cache.get(encoded)
+    {
+        return result.clone();
     }
     let result = decode_cursor_path_inner(Path::new("/"), encoded);
     if let Ok(mut cache) = DECODE_CACHE.lock() {
@@ -189,10 +189,10 @@ fn dir_id(path: &Path, _meta: &std::fs::Metadata) -> Option<DirId> {
 }
 
 fn list_dir(dir: &Path) -> DirListing {
-    if let Ok(cache) = LISTING_CACHE.lock() {
-        if let Some(listing) = cache.get(dir) {
-            return listing.clone();
-        }
+    if let Ok(cache) = LISTING_CACHE.lock()
+        && let Some(listing) = cache.get(dir)
+    {
+        return listing.clone();
     }
     let listing = std::fs::read_dir(dir)
         .ok()
@@ -539,15 +539,15 @@ fn chats_dir_stamp(chats_dir: &Path) -> (Option<SystemTime>, usize, Option<Syste
     let mut max_sub_mtime: Option<SystemTime> = None;
     if let Ok(entries) = fs::read_dir(chats_dir) {
         for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_dir() {
-                    count += 1;
-                    if let Ok(m) = meta.modified() {
-                        max_sub_mtime = Some(match max_sub_mtime {
-                            Some(prev) if prev >= m => prev,
-                            _ => m,
-                        });
-                    }
+            if let Ok(meta) = entry.metadata()
+                && meta.is_dir()
+            {
+                count += 1;
+                if let Ok(m) = meta.modified() {
+                    max_sub_mtime = Some(match max_sub_mtime {
+                        Some(prev) if prev >= m => prev,
+                        _ => m,
+                    });
                 }
             }
         }
@@ -619,17 +619,17 @@ fn chat_store_path(base: &Path, id: &str) -> Option<PathBuf> {
     let chats_dir = base.join("chats");
     if let Ok(mut cache) = CHAT_STORE_INDEX_CACHE.lock() {
         // Fast path: known chat IDs resolve in O(1) with zero filesystem I/O.
-        if let Some(entry) = cache.get(base) {
-            if let Some(db) = entry.by_id.get(id) {
-                return Some(db.clone());
-            }
+        if let Some(entry) = cache.get(base)
+            && let Some(db) = entry.by_id.get(id)
+        {
+            return Some(db.clone());
         }
         // Only check subdirectory mtimes / rescan on a cache miss.
         let stamp = chats_dir_stamp(&chats_dir);
-        if let Some(entry) = cache.get(base) {
-            if entry.stamp == stamp {
-                return None;
-            }
+        if let Some(entry) = cache.get(base)
+            && entry.stamp == stamp
+        {
+            return None;
         }
         let mut by_id = HashMap::new();
         if let Ok(hashes) = fs::read_dir(&chats_dir) {
@@ -660,11 +660,11 @@ fn chat_store_path(base: &Path, id: &str) -> Option<PathBuf> {
 
 fn decode_hex(hex: &str) -> Option<Vec<u8>> {
     let bytes = hex.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = (pair[0] as char).to_digit(16)?;
         let lo = (pair[1] as char).to_digit(16)?;
         out.push(((hi << 4) | lo) as u8);
@@ -725,12 +725,11 @@ fn chat_meta_for(path: &Path, _home: &Path) -> Option<ChatMeta> {
     let real = fs::canonicalize(&db).unwrap_or_else(|_| db.clone());
     let wal = PathBuf::from(format!("{}-wal", real.display()));
     let stamp = [file_stamp(&real), file_stamp(&wal)];
-    if let Ok(cache) = CHAT_META_CACHE.lock() {
-        if let Some(entry) = cache.get(&db) {
-            if entry.stamp == stamp {
-                return Some(entry.meta.clone());
-            }
-        }
+    if let Ok(cache) = CHAT_META_CACHE.lock()
+        && let Some(entry) = cache.get(&db)
+        && entry.stamp == stamp
+    {
+        return Some(entry.meta.clone());
     }
     // Read SQLite outside the global mutex so parallel resolvers for different
     // chats do not block each other on a single busy database.

@@ -57,10 +57,10 @@ fn title_index(index_path: &Path) -> Arc<TitleIndex> {
         .ok()
         .map(|m| (m.len(), m.modified().ok()));
     let mut cache = TITLE_INDEXES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((cached_stamp, index)) = cache.get(index_path) {
-        if *cached_stamp == stamp {
-            return index.clone();
-        }
+    if let Some((cached_stamp, index)) = cache.get(index_path)
+        && *cached_stamp == stamp
+    {
+        return index.clone();
     }
     let index = Arc::new(read_title_index(index_path));
     cache.insert(index_path.to_path_buf(), (stamp, index.clone()));
@@ -81,10 +81,10 @@ fn read_title_index(index_path: &Path) -> TitleIndex {
         };
         let id = val.get("id").and_then(|v| v.as_str());
         let name = val.get("thread_name").and_then(|v| v.as_str());
-        if let (Some(id), Some(name)) = (id, name) {
-            if !name.is_empty() {
-                names.insert(id.to_string(), name.to_string());
-            }
+        if let (Some(id), Some(name)) = (id, name)
+            && !name.is_empty()
+        {
+            names.insert(id.to_string(), name.to_string());
         }
     }
     names
@@ -262,29 +262,26 @@ fn visit_message_value(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -
                     item.get("type").and_then(|v| v.as_str()),
                     Some("input_text" | "text")
                 );
-                if is_user_text {
-                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        if (val
-                            .pointer("/payload/ah_cloud_text")
-                            .and_then(|v| v.as_bool())
-                            == Some(true)
-                            || (!text.starts_with('<') && !text.starts_with("# ")))
-                            && !visit(Message::user(text.to_string()).at(val.get("timestamp")))
-                        {
-                            return false;
-                        }
-                    }
+                if is_user_text
+                    && let Some(text) = item.get("text").and_then(|v| v.as_str())
+                    && (val
+                        .pointer("/payload/ah_cloud_text")
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                        || (!text.starts_with('<') && !text.starts_with("# ")))
+                    && !visit(Message::user(text.to_string()).at(val.get("timestamp")))
+                {
+                    return false;
                 }
             }
         }
         Some("assistant") => {
             for item in contents {
-                if item.get("type").and_then(|v| v.as_str()) == Some("output_text") {
-                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        if !visit(Message::assistant(text.to_string()).at(val.get("timestamp"))) {
-                            return false;
-                        }
-                    }
+                if item.get("type").and_then(|v| v.as_str()) == Some("output_text")
+                    && let Some(text) = item.get("text").and_then(|v| v.as_str())
+                    && !visit(Message::assistant(text.to_string()).at(val.get("timestamp")))
+                {
+                    return false;
                 }
             }
         }
@@ -327,10 +324,9 @@ fn session_meta(path: &Path) -> Option<SessionMeta> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(path)
+        && *cached_stamp == stamp
     {
-        if *cached_stamp == stamp {
-            return meta.clone();
-        }
+        return meta.clone();
     }
     let meta = read_session_meta(path);
     SESSION_METAS

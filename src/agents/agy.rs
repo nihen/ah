@@ -107,20 +107,19 @@ impl SessionIndex {
         let mut archived_ids = HashSet::new();
 
         // cache/conversation_metadata.json: {"conversations": {"<id>": {"summary": {"WorkspaceURIs": ["file:///path", ...]}}}}
-        if let Ok(content) = fs::read_to_string(base.join("cache/conversation_metadata.json")) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(convs) = val.get("conversations").and_then(|v| v.as_object()) {
-                    for (id, entry) in convs {
-                        let Some(uris) = entry
-                            .pointer("/summary/WorkspaceURIs")
-                            .and_then(|v| v.as_array())
-                        else {
-                            continue;
-                        };
-                        if let Some(cwd) = pick_cwd_from_uris(uris) {
-                            cwd_by_id.insert(id.clone(), cwd);
-                        }
-                    }
+        if let Ok(content) = fs::read_to_string(base.join("cache/conversation_metadata.json"))
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
+            && let Some(convs) = val.get("conversations").and_then(|v| v.as_object())
+        {
+            for (id, entry) in convs {
+                let Some(uris) = entry
+                    .pointer("/summary/WorkspaceURIs")
+                    .and_then(|v| v.as_array())
+                else {
+                    continue;
+                };
+                if let Some(cwd) = pick_cwd_from_uris(uris) {
+                    cwd_by_id.insert(id.clone(), cwd);
                 }
             }
         }
@@ -131,46 +130,42 @@ impl SessionIndex {
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT conversation_id, title, workspace_uris, parent_conversation_id \
                  FROM conversation_summaries",
-            ) {
-                if let Ok(rows) = stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1).unwrap_or_default(),
-                        row.get::<_, String>(2).unwrap_or_default(),
-                        row.get::<_, String>(3).unwrap_or_default(),
-                    ))
-                }) {
-                    for (id, title, uris_json, parent) in rows.flatten() {
-                        if let Ok(serde_json::Value::Array(uris)) =
-                            serde_json::from_str::<serde_json::Value>(&uris_json)
-                        {
-                            if let Some(cwd) = pick_cwd_from_uris(&uris) {
-                                cwd_by_id.insert(id.clone(), cwd);
-                            }
-                        }
-                        let title = title.trim();
-                        if !title.is_empty() {
-                            title_by_id.insert(id.clone(), title.to_string());
-                        }
-                        let parent = parent.trim();
-                        if !parent.is_empty() {
-                            parent_by_id.insert(id, parent.to_string());
-                        }
+            ) && let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, String>(2).unwrap_or_default(),
+                    row.get::<_, String>(3).unwrap_or_default(),
+                ))
+            }) {
+                for (id, title, uris_json, parent) in rows.flatten() {
+                    if let Ok(serde_json::Value::Array(uris)) =
+                        serde_json::from_str::<serde_json::Value>(&uris_json)
+                        && let Some(cwd) = pick_cwd_from_uris(&uris)
+                    {
+                        cwd_by_id.insert(id.clone(), cwd);
+                    }
+                    let title = title.trim();
+                    if !title.is_empty() {
+                        title_by_id.insert(id.clone(), title.to_string());
+                    }
+                    let parent = parent.trim();
+                    if !parent.is_empty() {
+                        parent_by_id.insert(id, parent.to_string());
                     }
                 }
             }
 
             if let Ok(mut stmt) =
                 conn.prepare("SELECT conversation_id, parent_id FROM conversation_parents")
-            {
-                if let Ok(rows) = stmt.query_map([], |row| {
+                && let Ok(rows) = stmt.query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                }) {
-                    for (id, parent) in rows.flatten() {
-                        let parent = parent.trim();
-                        if !parent.is_empty() {
-                            parent_by_id.entry(id).or_insert_with(|| parent.to_string());
-                        }
+                })
+            {
+                for (id, parent) in rows.flatten() {
+                    let parent = parent.trim();
+                    if !parent.is_empty() {
+                        parent_by_id.entry(id).or_insert_with(|| parent.to_string());
                     }
                 }
             }
@@ -178,24 +173,22 @@ impl SessionIndex {
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT DISTINCT conversation_id FROM conversations_fts \
                  WHERE CAST(archived AS INTEGER) != 0 OR lower(CAST(archived AS TEXT)) = 'true'",
-            ) {
-                if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
-                    for id in rows.flatten() {
-                        archived_ids.insert(id);
-                    }
+            ) && let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0))
+            {
+                for id in rows.flatten() {
+                    archived_ids.insert(id);
                 }
             }
         }
 
         // cache/last_conversations.json: {"<cwd>": "<id>"} — newer, overrides metadata.
-        if let Ok(content) = fs::read_to_string(base.join("cache/last_conversations.json")) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(map) = val.as_object() {
-                    for (cwd, id) in map {
-                        if let Some(id) = id.as_str() {
-                            cwd_by_id.insert(id.to_string(), canonicalize_if_exists(cwd));
-                        }
-                    }
+        if let Ok(content) = fs::read_to_string(base.join("cache/last_conversations.json"))
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
+            && let Some(map) = val.as_object()
+        {
+            for (cwd, id) in map {
+                if let Some(id) = id.as_str() {
+                    cwd_by_id.insert(id.to_string(), canonicalize_if_exists(cwd));
                 }
             }
         }
@@ -220,10 +213,10 @@ static SESSION_INDEX_CACHE: LazyLock<Mutex<HashMap<PathBuf, CachedIndex>>> =
 fn session_index(base: &Path) -> Arc<SessionIndex> {
     if let Ok(mut cache) = SESSION_INDEX_CACHE.lock() {
         let stamp = index_stamp(base);
-        if let Some(entry) = cache.get(base) {
-            if entry.stamp == stamp {
-                return Arc::clone(&entry.index);
-            }
+        if let Some(entry) = cache.get(base)
+            && entry.stamp == stamp
+        {
+            return Arc::clone(&entry.index);
         }
         // Snapshot the stamp and load while holding the lock so parallel cold
         // resolvers serialize and any write during load invalidates the cache
@@ -247,11 +240,11 @@ impl AgyPlugin {
     fn split_path(path: &Path) -> Option<(PathBuf, String)> {
         let mut current = path.parent();
         while let Some(dir) = current {
-            if let Some(parent) = dir.parent() {
-                if parent.file_name().and_then(|s| s.to_str()) == Some("brain") {
-                    let id = dir.file_name()?.to_string_lossy().to_string();
-                    return Some((parent.parent()?.to_path_buf(), id));
-                }
+            if let Some(parent) = dir.parent()
+                && parent.file_name().and_then(|s| s.to_str()) == Some("brain")
+            {
+                let id = dir.file_name()?.to_string_lossy().to_string();
+                return Some((parent.parent()?.to_path_buf(), id));
             }
             current = dir.parent();
         }
@@ -497,10 +490,10 @@ fn running_in(
 }
 
 fn visit_search_record(val: &serde_json::Value, visit: &mut TypedVisitor<'_>) -> bool {
-    if let Some(message) = AgyPlugin::message_from_value(val) {
-        if !visit(K::from_role(message.role), &message.text) {
-            return false;
-        }
+    if let Some(message) = AgyPlugin::message_from_value(val)
+        && !visit(K::from_role(message.role), &message.text)
+    {
+        return false;
     }
     if val.get("source").and_then(|v| v.as_str()) != Some("MODEL") {
         return true;

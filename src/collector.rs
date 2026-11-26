@@ -109,17 +109,17 @@ fn collect(
         })
         .collect();
 
-    if let Some(cache) = crate::cloud::cache_dir() {
-        if let Some(agent) = config::active_agents().find(|a| a.id == "codex") {
-            patterns.push((
-                agent.plugin,
-                format!(
-                    "{}/*.jsonl",
-                    glob::Pattern::escape(&cache.to_string_lossy())
-                ),
-                true,
-            ));
-        }
+    if let Some(cache) = crate::cloud::cache_dir()
+        && let Some(agent) = config::active_agents().find(|a| a.id == "codex")
+    {
+        patterns.push((
+            agent.plugin,
+            format!(
+                "{}/*.jsonl",
+                glob::Pattern::escape(&cache.to_string_lossy())
+            ),
+            true,
+        ));
     }
     patterns.extend(crate::cloud::providers::cache_patterns().map(|pattern| {
         (

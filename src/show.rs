@@ -55,10 +55,9 @@ fn run_inner(args: ShowArgs, filter: &FilterArgs, check_account: bool) -> Result
         if filter.remote.is_empty()
             && filter.agent.as_deref().is_none_or(|agent| agent == "codex")
             && crate::cloud::enabled()
+            && let Some(id) = crate::cloud::url_id(strip_quotes(&session))
         {
-            if let Some(id) = crate::cloud::url_id(strip_quotes(&session)) {
-                return id.to_owned();
-            }
+            return id.to_owned();
         }
         session
     });
@@ -127,10 +126,12 @@ fn run_inner(args: ShowArgs, filter: &FilterArgs, check_account: bool) -> Result
         } else {
             match subcmd::resolve_session_ref_of(session, &home, filter.agent.as_deref()) {
                 Ok(path) => {
-                    if explicit_arg && check_account && filter.remote.is_empty() {
-                        if let Err(err) = crate::cloud::providers::hydrate(&path, args.offline) {
-                            eprintln!("Cloud history not refreshed: {err}");
-                        }
+                    if explicit_arg
+                        && check_account
+                        && filter.remote.is_empty()
+                        && let Err(err) = crate::cloud::providers::hydrate(&path, args.offline)
+                    {
+                        eprintln!("Cloud history not refreshed: {err}");
                     }
                     path
                 }

@@ -121,16 +121,15 @@ fn main() {
             cloud::providers::pin_claude_account(filter.agent.as_deref());
         }
     }
-    if let Commands::Log(args) = &cli.command {
-        if !args.field_list
-            && !args.offline
-            && !ia.interactive
-            && (args.refresh || (filter.all && filter.project.is_none()))
-            && (args.refresh || cloud::any_enabled())
-            && Args::from_search_args(args.clone(), &filter).is_ok()
-        {
-            cloud::refresh_for_log(args.offline, args.refresh, filter.agent.as_deref());
-        }
+    if let Commands::Log(args) = &cli.command
+        && !args.field_list
+        && !args.offline
+        && !ia.interactive
+        && (args.refresh || (filter.all && filter.project.is_none()))
+        && (args.refresh || cloud::any_enabled())
+        && Args::from_search_args(args.clone(), &filter).is_ok()
+    {
+        cloud::refresh_for_log(args.offline, args.refresh, filter.agent.as_deref());
     }
 
     // Set up pager before command dispatch (must be after color init).

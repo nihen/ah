@@ -477,10 +477,10 @@ fn output_tsv(sessions: &[Session], fields: &[Field], query: &str) {
                 let val = session.fields.get(f).map_or("", |v| v.as_str());
                 let escaped = escape_tsv(val);
                 if is_tty {
-                    if *f == Field::Matched {
-                        if let Some(ref re) = highlight_re {
-                            return highlight_matches(&escaped, re);
-                        }
+                    if *f == Field::Matched
+                        && let Some(ref re) = highlight_re
+                    {
+                        return highlight_matches(&escaped, re);
                     }
                     colorize_field(f, &escaped)
                 } else {
@@ -573,11 +573,11 @@ pub fn session_to_json(
     let mut map = serde_json::Map::new();
     for field in fields {
         let val = session.fields.get(field).cloned().unwrap_or_default();
-        if matches!(*field, Field::Prompts | Field::Responses | Field::Messages) {
-            if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&val) {
-                map.insert(field.name().to_string(), arr);
-                continue;
-            }
+        if matches!(*field, Field::Prompts | Field::Responses | Field::Messages)
+            && let Ok(arr) = serde_json::from_str::<serde_json::Value>(&val)
+        {
+            map.insert(field.name().to_string(), arr);
+            continue;
         }
         map.insert(field.name().to_string(), serde_json::Value::String(val));
     }
@@ -712,21 +712,21 @@ pub fn project_to_json(
     for field in fields {
         let val = record.get(field).cloned().unwrap_or_default();
         // sessions as JSON array
-        if *field == ProjectField::Sessions {
-            if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&val) {
-                map.insert(field.name().to_string(), arr);
-                continue;
-            }
+        if *field == ProjectField::Sessions
+            && let Ok(arr) = serde_json::from_str::<serde_json::Value>(&val)
+        {
+            map.insert(field.name().to_string(), arr);
+            continue;
         }
         // session_count as number
-        if *field == ProjectField::SessionCount {
-            if let Ok(n) = val.parse::<u64>() {
-                map.insert(
-                    field.name().to_string(),
-                    serde_json::Value::Number(n.into()),
-                );
-                continue;
-            }
+        if *field == ProjectField::SessionCount
+            && let Ok(n) = val.parse::<u64>()
+        {
+            map.insert(
+                field.name().to_string(),
+                serde_json::Value::Number(n.into()),
+            );
+            continue;
         }
         map.insert(field.name().to_string(), serde_json::Value::String(val));
     }

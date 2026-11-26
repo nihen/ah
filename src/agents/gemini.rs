@@ -172,12 +172,11 @@ impl JsonlSession {
                     session.clear();
                     messages.into_iter().for_each(|m| session.upsert(m));
                 }
-            } else if is_metadata_record(&record) {
-                if let Some(serde_json::Value::Array(messages)) =
+            } else if is_metadata_record(&record)
+                && let Some(serde_json::Value::Array(messages)) =
                     record.as_object_mut().and_then(|o| o.remove("messages"))
-                {
-                    messages.into_iter().for_each(|m| session.upsert(m));
-                }
+            {
+                messages.into_iter().for_each(|m| session.upsert(m));
             }
         }
         session
@@ -239,12 +238,12 @@ fn jsonl_session_id(data: &[u8]) -> Option<String> {
 fn derive_gemini_base<'a>(path: &'a Path, project: &str) -> Option<&'a Path> {
     let mut current = path.parent();
     while let Some(dir) = current {
-        if dir.file_name().and_then(|s| s.to_str()) == Some(project) {
-            if let Some(parent) = dir.parent() {
-                let parent_name = parent.file_name().and_then(|s| s.to_str());
-                if matches!(parent_name, Some("tmp" | "history")) {
-                    return parent.parent();
-                }
+        if dir.file_name().and_then(|s| s.to_str()) == Some(project)
+            && let Some(parent) = dir.parent()
+        {
+            let parent_name = parent.file_name().and_then(|s| s.to_str());
+            if matches!(parent_name, Some("tmp" | "history")) {
+                return parent.parent();
             }
         }
         current = dir.parent();
@@ -293,10 +292,10 @@ fn visit_message(val: &serde_json::Value, visit: &mut dyn FnMut(Message) -> bool
                 .get("content")
                 .and_then(first_text_part)
                 .or_else(|| val.get("message").and_then(|v| v.as_str()));
-            if let Some(text) = text {
-                if !text.starts_with('<') {
-                    return visit(Message::user(text.to_string()).at(val.get("timestamp")));
-                }
+            if let Some(text) = text
+                && !text.starts_with('<')
+            {
+                return visit(Message::user(text.to_string()).at(val.get("timestamp")));
             }
         }
         Some("gemini") => {
@@ -642,10 +641,10 @@ impl AgentPlugin for GeminiPlugin {
     fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
         let mut models = super::common::ModelList::default();
         Self::for_each_root_message(path, |val| {
-            if val.get("type").and_then(|v| v.as_str()) == Some("gemini") {
-                if let Some(model) = val.get("model").and_then(|v| v.as_str()) {
-                    models.push(model);
-                }
+            if val.get("type").and_then(|v| v.as_str()) == Some("gemini")
+                && let Some(model) = val.get("model").and_then(|v| v.as_str())
+            {
+                models.push(model);
             }
             true
         });
@@ -794,18 +793,18 @@ impl AgentPlugin for GeminiPlugin {
         }
         let root = serde_json::from_slice::<serde_json::Value>(&mmap).ok()?;
         // chats/session-*.json: root is an object with "sessionId"
-        if let Some(id) = root.get("sessionId").and_then(|v| v.as_str()) {
-            if !id.is_empty() {
-                return Some(id.to_string());
-            }
+        if let Some(id) = root.get("sessionId").and_then(|v| v.as_str())
+            && !id.is_empty()
+        {
+            return Some(id.to_string());
         }
         // logs.json: root is an array of objects, take the last sessionId
         if let Some(arr) = root.as_array() {
             for item in arr.iter().rev() {
-                if let Some(id) = item.get("sessionId").and_then(|v| v.as_str()) {
-                    if !id.is_empty() {
-                        return Some(id.to_string());
-                    }
+                if let Some(id) = item.get("sessionId").and_then(|v| v.as_str())
+                    && !id.is_empty()
+                {
+                    return Some(id.to_string());
                 }
             }
         }

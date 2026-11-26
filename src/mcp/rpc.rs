@@ -35,18 +35,18 @@ pub fn validate_shape(value: &Value) -> Result<(), String> {
     if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err("Invalid Request: jsonrpc must be \"2.0\"".into());
     }
-    if let Some(id) = obj.get("id") {
-        if !is_valid_id(id) {
-            return Err("Invalid Request: id must be a string or an integer".into());
-        }
+    if let Some(id) = obj.get("id")
+        && !is_valid_id(id)
+    {
+        return Err("Invalid Request: id must be a string or an integer".into());
     }
     if obj.get("method").and_then(Value::as_str).is_none() {
         return Err("Invalid Request: method must be a string".into());
     }
-    if let Some(params) = obj.get("params") {
-        if !params.is_object() {
-            return Err("Invalid Request: params must be an object".into());
-        }
+    if let Some(params) = obj.get("params")
+        && !params.is_object()
+    {
+        return Err("Invalid Request: params must be an object".into());
     }
     Ok(())
 }

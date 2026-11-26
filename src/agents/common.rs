@@ -41,10 +41,10 @@ pub fn unix_time(val: &serde_json::Value) -> Option<i64> {
 pub fn strip_home(path: &str, home: &Path) -> String {
     let home_str = home.to_string_lossy();
     let home_str = home_str.trim_end_matches('/');
-    if let Some(rest) = path.strip_prefix(home_str) {
-        if rest.is_empty() || rest.starts_with('/') {
-            return rest.trim_start_matches('/').to_string();
-        }
+    if let Some(rest) = path.strip_prefix(home_str)
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        return rest.trim_start_matches('/').to_string();
     }
     path.to_string()
 }
@@ -166,10 +166,11 @@ impl ModelList {
                 .map(|m| m.trim().to_string())
                 .filter(|m| is_model(m)),
         );
-        if self.unnamed_since_metered && !self.named_since_metered {
-            if let Some(model) = self.metered[start..].last() {
-                self.last = Some(model.clone());
-            }
+        if self.unnamed_since_metered
+            && !self.named_since_metered
+            && let Some(model) = self.metered[start..].last()
+        {
+            self.last = Some(model.clone());
         }
         self.named_since_metered = false;
         self.unnamed_since_metered = false;
@@ -427,10 +428,10 @@ pub fn jsonl_models(
     let mut from = 0;
     while let Some(line) = lines.next_from(from) {
         from = line.end + 1;
-        if let Some(val) = parse_json_paths(&data[line], paths) {
-            if let Some(model) = model_of(&val) {
-                models.push(model);
-            }
+        if let Some(val) = parse_json_paths(&data[line], paths)
+            && let Some(model) = model_of(&val)
+        {
+            models.push(model);
         }
     }
     models.non_empty()
@@ -441,12 +442,11 @@ pub fn for_each_jsonl_value_bytes(data: &[u8], mut visit: impl FnMut(&serde_json
         if line_bytes.len() < 2 {
             continue;
         }
-        if let Ok(line) = std::str::from_utf8(line_bytes) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                if !visit(&val) {
-                    return;
-                }
-            }
+        if let Ok(line) = std::str::from_utf8(line_bytes)
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
+            && !visit(&val)
+        {
+            return;
         }
     }
 }
@@ -595,15 +595,15 @@ pub fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Some(b) = s
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Some(b) = s
                 .get(i + 1..i + 3)
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
-            {
-                out.push(b);
-                i += 3;
-                continue;
-            }
+        {
+            out.push(b);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;

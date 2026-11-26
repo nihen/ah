@@ -407,19 +407,17 @@ fn highlighted_snippet(text: &str, span: Option<[usize; 2]>, colored: bool) -> S
     if colored {
         // Remote data may be old or malformed. Never slice unchecked offsets
         // and never guess the match by searching a truncated excerpt again.
-        if let Some([start, end]) = span {
-            if start < end {
-                if let (Some(before), Some(matched), Some(after)) =
-                    (text.get(..start), text.get(start..end), text.get(end..))
-                {
-                    return format!(
-                        "{}{}{}",
-                        display_text(before),
-                        color::colorize(BOLD_YELLOW, &display_text(matched)),
-                        display_text(after)
-                    );
-                }
-            }
+        if let Some([start, end]) = span
+            && start < end
+            && let (Some(before), Some(matched), Some(after)) =
+                (text.get(..start), text.get(start..end), text.get(end..))
+        {
+            return format!(
+                "{}{}{}",
+                display_text(before),
+                color::colorize(BOLD_YELLOW, &display_text(matched)),
+                display_text(after)
+            );
         }
     }
     display_text(text)

@@ -526,11 +526,11 @@ fn fit_records_around_selected(records: &mut Vec<show::AtRecord>, max: usize) ->
     }
     // The selected record alone may still exceed the limit (a huge tool
     // output): keep a window of `max` characters around the match.
-    if total > max {
-        if let Some(r) = records.iter_mut().find(|r| r.selected) {
-            window_around_match(r, max);
-            dropped = true;
-        }
+    if total > max
+        && let Some(r) = records.iter_mut().find(|r| r.selected)
+    {
+        window_around_match(r, max);
+        dropped = true;
     }
     dropped
 }
