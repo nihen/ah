@@ -128,8 +128,8 @@ pub fn strip_ansi(s: &str) -> String {
             }
             continue;
         }
-        // C0 controls (except \n \r \t)
-        if c as u32 <= 0x1f && c != '\n' && c != '\r' && c != '\t' {
+        // C0 controls (except \n \r \t) and DEL
+        if (c as u32 <= 0x1f && c != '\n' && c != '\r' && c != '\t') || c == '\x7f' {
             continue;
         }
         // C1 controls
@@ -1124,6 +1124,7 @@ mod tests {
     fn test_strip_ansi_c0_controls() {
         // NUL, BEL, BS should be stripped; \n \r \t preserved
         assert_eq!(strip_ansi("a\x00b\x07c\x08d"), "abcd");
+        assert_eq!(strip_ansi("left\x7fright"), "leftright");
         assert_eq!(strip_ansi("a\nb\rc\td"), "a\nb\rc\td");
     }
 
