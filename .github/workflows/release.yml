@@ -60,7 +60,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
       - run: chmod +x ah-*/ah-*
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
           generate_release_notes: true
