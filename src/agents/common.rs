@@ -724,43 +724,107 @@ pub fn process_start_time(pid: u32) -> Option<SystemTime> {
 /// and blocked-waiter (`->`) entries are ignored. Empty where the kernel does
 /// not expose the table.
 pub fn file_lock_holders() -> std::collections::HashMap<(u64, u64, u64), u32> {
+    proc_locks()
+        .map(|table| parse_proc_locks(&table))
+        .unwrap_or_default()
+}
+
+/// Processes with a connection open to a SQLite database in WAL mode, keyed
+/// by the `(device major, device minor, inode)` of its `-shm` file. SQLite
+/// holds a shared POSIX lock on byte 128 of that file for as long as a
+/// connection is open, so any reader of the database is listed, not only
+/// its owner. Empty where the kernel does not expose the lock table.
+pub fn sqlite_wal_holders() -> std::collections::HashMap<(u64, u64, u64), Vec<u32>> {
+    proc_locks()
+        .map(|table| parse_sqlite_wal_holders(&table))
+        .unwrap_or_default()
+}
+
+fn proc_locks() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        fs::read_to_string("/proc/locks")
-            .map(|s| parse_proc_locks(&s))
-            .unwrap_or_default()
+        fs::read_to_string("/proc/locks").ok()
     }
     #[cfg(not(target_os = "linux"))]
     {
-        std::collections::HashMap::new()
+        None
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn parse_proc_locks(text: &str) -> std::collections::HashMap<(u64, u64, u64), u32> {
-    let mut map = std::collections::HashMap::new();
-    for line in text.lines() {
-        // "1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF"
+/// One held lock of `/proc/locks`: `(kind, access, pid, file, start, end)`,
+/// e.g. `1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF`. Blocked waiters
+/// (`1: -> FLOCK ...`) are skipped.
+fn proc_lock_rows(
+    text: &str,
+) -> impl Iterator<Item = (&str, &str, u32, (u64, u64, u64), &str, &str)> {
+    text.lines().filter_map(|line| {
         let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 6 || cols[1..4] != ["FLOCK", "ADVISORY", "WRITE"] {
-            continue;
+        if cols.len() < 8 || cols[2] != "ADVISORY" {
+            return None;
         }
-        let Ok(pid) = cols[4].parse::<u32>() else {
-            continue;
-        };
+        let pid = cols[4].parse::<u32>().ok()?;
         let mut id = cols[5].splitn(3, ':');
-        let (Some(maj), Some(min), Some(ino)) = (id.next(), id.next(), id.next()) else {
-            continue;
-        };
-        if let (Ok(maj), Ok(min), Ok(ino)) = (
-            u64::from_str_radix(maj, 16),
-            u64::from_str_radix(min, 16),
-            ino.parse::<u64>(),
-        ) {
-            map.insert((maj, min, ino), pid);
+        let file = (
+            u64::from_str_radix(id.next()?, 16).ok()?,
+            u64::from_str_radix(id.next()?, 16).ok()?,
+            id.next()?.parse::<u64>().ok()?,
+        );
+        Some((cols[1], cols[3], pid, file, cols[6], cols[7]))
+    })
+}
+
+fn parse_proc_locks(text: &str) -> std::collections::HashMap<(u64, u64, u64), u32> {
+    proc_lock_rows(text)
+        .filter(|row| (row.0, row.1) == ("FLOCK", "WRITE"))
+        .map(|row| (row.3, row.2))
+        .collect()
+}
+
+fn parse_sqlite_wal_holders(text: &str) -> std::collections::HashMap<(u64, u64, u64), Vec<u32>> {
+    let mut map: std::collections::HashMap<_, Vec<u32>> = std::collections::HashMap::new();
+    for row in proc_lock_rows(text) {
+        if (row.0, row.1, row.4, row.5) == ("POSIX", "READ", "128", "128") {
+            map.entry(row.3).or_default().push(row.2);
         }
     }
     map
+}
+
+/// The arguments of a running process, the program first. `None` where
+/// they cannot be read.
+pub fn process_args(pid: u32) -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        Some(
+            raw.split(|b| *b == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Every process id. Empty where the process table cannot be listed.
+pub fn all_pids() -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
 }
 
 /// `(device major, device minor, inode)` of `path`, matching the key used by
@@ -1017,6 +1081,19 @@ mod tests {
                     bad line\n";
         let map = parse_proc_locks(text);
         assert_eq!(map.get(&(0x103, 0x02, 23794220)), Some(&165470));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn sqlite_wal_holders_are_the_readers_of_the_shm_file() {
+        let text = "1: POSIX  ADVISORY  READ 10 fc:00:500 128 128\n\
+                    2: POSIX  ADVISORY  READ 11 fc:00:500 128 128\n\
+                    3: POSIX  ADVISORY  READ 10 fc:00:499 1073741826 1073742335\n\
+                    4: POSIX  ADVISORY  WRITE 12 fc:00:501 128 128\n\
+                    5: FLOCK  ADVISORY  READ 13 fc:00:502 128 128\n\
+                    6: -> POSIX  ADVISORY  READ 14 fc:00:500 128 128\n";
+        let map = parse_sqlite_wal_holders(text);
+        assert_eq!(map.get(&(0xfc, 0, 500)), Some(&vec![10, 11]));
         assert_eq!(map.len(), 1);
     }
 

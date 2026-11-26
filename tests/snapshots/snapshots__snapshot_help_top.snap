@@ -40,7 +40,7 @@ Global options:
   -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
   --no-preview            Disable preview in interactive mode
   --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
-  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok, agy)
+  --running               Show only currently running sessions (Claude, Codex, Copilot, Cursor, Grok, agy, opencode, dsh)
   --no-archived           Hide sessions the agent has archived (Codex, agy, opencode)
   --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])

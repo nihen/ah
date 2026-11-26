@@ -411,6 +411,18 @@ impl AgentPlugin for AgyPlugin {
         session_index(&base).title_by_id.get(&id).cloned()
     }
 
+    /// Models named by the planner's replies (`"model"` on `PLANNER_RESPONSE`
+    /// steps); transcripts written before Antigravity recorded it have none.
+    fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
+        const PATHS: &[&[&str]] = &[&["source"], &["type"], &["model"]];
+        super::common::jsonl_models(path, b"\"model\"", PATHS, |val| {
+            let step = |key| val.get(key).and_then(|v| v.as_str());
+            (step("source") == Some("MODEL") && step("type") == Some("PLANNER_RESPONSE"))
+                .then(|| step("model"))
+                .flatten()
+        })
+    }
+
     fn is_archived(&self, path: &Path) -> bool {
         let Some((base, id)) = Self::split_path(path) else {
             return false;
@@ -558,6 +570,39 @@ mod tests {
                 Message::assistant("Done.".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn models_come_from_planner_responses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join(".gemini/antigravity-cli");
+        let body = concat!(
+            // A prompt quoting a "model" key names no model.
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>\nset \"model\":\"fake\"\n</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","model":"gemini-a","tool_calls":[]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","content":"tool output with \"model\":\"fake\""}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","model":"gemini-b","content":"Done."}"#,
+            "\n",
+            r#"{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","model":"gemini-a","content":"Again."}"#,
+            "\n",
+        );
+        let path = write_transcript(&base, "with-models", body);
+        let models = PLUGIN.resolve_models(&path).unwrap();
+        assert_eq!(models.joined(), "gemini-a,gemini-b");
+        assert_eq!(models.last(), "gemini-a");
+
+        let old = write_transcript(
+            &base,
+            "without-models",
+            concat!(
+                r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","content":"Done."}"#,
+                "\n"
+            ),
+        );
+        assert!(PLUGIN.resolve_models(&old).is_none());
     }
 
     #[test]

@@ -339,6 +339,25 @@ impl AgentPlugin for CursorPlugin {
         true
     }
 
+    fn can_detect_running(&self) -> bool {
+        true
+    }
+
+    fn running_sessions(&self) -> Vec<(String, Option<u32>)> {
+        crate::config::resolve_agent_base("cursor")
+            .map(|base| {
+                running_in(
+                    &base.join("chats"),
+                    &super::common::sqlite_wal_holders(),
+                    |pid| {
+                        super::common::process_args(pid)
+                            .is_some_and(|args| args.iter().any(|arg| arg.contains("cursor-agent")))
+                    },
+                )
+            })
+            .unwrap_or_default()
+    }
+
     fn can_memory(&self) -> bool {
         true
     }
@@ -536,6 +555,37 @@ fn chats_dir_stamp(chats_dir: &Path) -> (Option<SystemTime>, usize, Option<Syste
     (root_mtime, count, max_sub_mtime)
 }
 
+/// Running sessions from `chats/<hash>/<chat id>/store.db-shm`. cursor-agent
+/// keeps a SQLite connection to a chat's `store.db` open for as long as the
+/// chat is, and with it the shared lock every WAL connection holds on the
+/// `-shm` file; the files stay behind after a crash, the lock does not.
+/// Other readers of the database hold the same lock for a moment, so a
+/// holder counts only when `is_cursor` says it is cursor-agent.
+fn running_in(
+    chats_dir: &Path,
+    holders: &HashMap<(u64, u64, u64), Vec<u32>>,
+    is_cursor: impl Fn(u32) -> bool,
+) -> Vec<(String, Option<u32>)> {
+    if holders.is_empty() {
+        return Vec::new();
+    }
+    let dirs = |dir: &Path| {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+    };
+    dirs(chats_dir)
+        .flat_map(|hash| dirs(&hash))
+        .filter_map(|chat| {
+            let key = super::common::file_lock_key(&chat.join("store.db-shm"))?;
+            let pid = *holders.get(&key)?.iter().find(|pid| is_cursor(**pid))?;
+            Some((chat.file_name()?.to_str()?.to_string(), Some(pid)))
+        })
+        .collect()
+}
+
 fn chat_store_path(base: &Path, id: &str) -> Option<PathBuf> {
     let chats_dir = base.join("chats");
     if let Ok(mut cache) = CHAT_STORE_INDEX_CACHE.lock() {
@@ -711,6 +761,34 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         (tmp, root)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_chats_are_held_open_by_cursor_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chats = tmp.path().join("chats");
+        let shm = |id: &str| {
+            let dir = chats.join("deadbeef").join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("store.db-shm");
+            fs::write(&path, "").unwrap();
+            super::super::common::file_lock_key(&path).unwrap()
+        };
+        let (live, read, stale) = (shm("chat-live"), shm("chat-read"), shm("chat-stale"));
+        fs::create_dir_all(chats.join("deadbeef/chat-new")).unwrap();
+
+        let is_cursor = |pid| pid == 4242;
+        let mut holders = HashMap::new();
+        assert!(running_in(&chats, &holders, is_cursor).is_empty());
+        // Another reader comes first on the live chat and is alone on `read`.
+        holders.insert(live, vec![7, 4242]);
+        holders.insert(read, vec![7]);
+        let _ = stale;
+        assert_eq!(
+            running_in(&chats, &holders, is_cursor),
+            vec![("chat-live".to_string(), Some(4242))]
+        );
     }
 
     #[test]
