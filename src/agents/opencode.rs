@@ -280,6 +280,9 @@ fn immutable_stamp(db: &Path) -> Option<(SystemTime, u64)> {
     Some((meta.modified().ok()?, meta.len()))
 }
 
+/// How long a query waits for a database that is locked.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Open `db` without writing anything next to it. A WAL database whose
 /// `-wal` file is absent is fully checkpointed, so it is opened as
 /// immutable; opening it normally would create `-wal`/`-shm` files (and
@@ -295,8 +298,7 @@ fn open_read_only(db: &Path) -> Result<CachedConnection, String> {
         None => Connection::open_with_flags(db, flags),
     }
     .map_err(|e| e.to_string())?;
-    conn.busy_timeout(Duration::from_secs(5))
-        .map_err(|e| e.to_string())?;
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| e.to_string())?;
     Ok(CachedConnection {
         conn,
         immutable_stamp: stamp,
@@ -915,6 +917,101 @@ impl AgentPlugin for OpencodePlugin {
             .filter(|title| !title.is_empty() && !RE_DEFAULT_TITLE.is_match(title))
     }
 
+    fn can_detect_running(&self) -> bool {
+        // Needs the name and the start time of the service's process.
+        cfg!(any(target_os = "linux", target_os = "macos"))
+    }
+
+    /// Sessions with a turn in progress in opencode 2's background service,
+    /// and sessions a client was started on (`opencode --session <id>`). An
+    /// idle TUI that picked its session itself leaves no trace.
+    fn running_sessions(&self) -> Vec<(String, Option<u32>)> {
+        let home = super::common::canonical_home();
+        let Some(data) = crate::config::resolve_agent_base("opencode") else {
+            return Vec::new();
+        };
+        let data = data.join("opencode");
+        let dbs: Vec<PathBuf> = std::fs::read_dir(&data)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "db")
+                    && path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("opencode"))
+            })
+            .collect();
+        if dbs.is_empty() {
+            return Vec::new();
+        }
+        let state = std::env::var("XDG_STATE_HOME")
+            .ok()
+            .filter(|dir| !dir.trim().is_empty())
+            .map_or_else(|| home.join(".local/state"), PathBuf::from);
+        let clients: Vec<(u32, Vec<String>)> = super::common::all_pids()
+            .into_iter()
+            .filter(|pid| is_opencode(*pid))
+            .filter_map(|pid| Some((pid, super::common::process_args(pid)?)))
+            .collect();
+        // The services of a database are the one its channel's state file
+        // names and those clients started for themselves with
+        // `--standalone`, which write no state file. Where its open files
+        // can be listed a service must have the database open: one of
+        // another channel or of another data directory says nothing about
+        // this one's rows.
+        let serving: Vec<u32> = clients
+            .iter()
+            .filter(|(_, args)| is_service(args))
+            .map(|(pid, _)| *pid)
+            .collect();
+        let mut running = Vec::new();
+        for db in &dbs {
+            let Some(channel) = db
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("opencode")?.strip_suffix(".db"))
+            else {
+                continue;
+            };
+            let has_open = |pid: u32| super::common::process_has_open(pid, db);
+            let mut services: Vec<u32> =
+                service_pid(&state.join(format!("opencode/service{channel}.json")))
+                    .filter(|pid| has_open(*pid) != Some(false))
+                    .into_iter()
+                    .collect();
+            for pid in &serving {
+                if !services.contains(pid) && has_open(*pid) == Some(true) {
+                    services.push(*pid);
+                }
+            }
+            // A busy row counts from the start of the oldest service: a
+            // state file can outlive its service and name a pid that was
+            // reused. With several services, whose turn it is is unknown.
+            let Some(started) = services
+                .iter()
+                .map(|pid| super::common::process_start_time(*pid))
+                .collect::<Option<Vec<_>>>()
+                .and_then(|starts| starts.into_iter().min())
+            else {
+                continue;
+            };
+            let pid = (services.len() == 1).then(|| services[0]);
+            running.extend(busy_sessions(db, started).into_iter().map(|id| (id, pid)));
+        }
+        for (pid, args) in &clients {
+            if let Some(id) = client_session(args) {
+                match running.iter_mut().find(|(known, _)| known == id) {
+                    Some((_, owner)) => *owner = owner.or(Some(*pid)),
+                    None => running.push((id.to_string(), Some(*pid))),
+                }
+            }
+        }
+        running
+    }
+
     fn resolve_resume_id(&self, path: &Path, _home: &Path) -> Option<String> {
         split_virtual_path(path)
             .map(|(_, id)| id.to_string())
@@ -939,6 +1036,80 @@ impl AgentPlugin for OpencodePlugin {
     fn parent_session_id(&self, path: &Path) -> Option<String> {
         session_row(path)?.parent_id.filter(|id| !id.is_empty())
     }
+}
+
+/// The pid of opencode 2's background service, from the state file it
+/// writes on start (`{"pid": ..., "url": ..., ...}`). The file outlives a
+/// killed service, so the pid must be alive and be opencode, serving where
+/// its arguments can be read.
+fn service_pid(state_file: &Path) -> Option<u32> {
+    let state: serde_json::Value = serde_json::from_slice(&std::fs::read(state_file).ok()?).ok()?;
+    let pid = super::common::json_pid(&state, "pid")?;
+    let serving = super::common::process_args(pid).is_none_or(|args| is_service(&args));
+    (super::common::is_pid_alive(pid) && is_opencode(pid) && serving).then_some(pid)
+}
+
+/// Whether `args` start an opencode service (`opencode serve ...`).
+fn is_service(args: &[String]) -> bool {
+    args.iter().skip(1).any(|arg| arg == "serve")
+}
+
+/// Whether `pid` runs opencode, a native executable named after itself.
+fn is_opencode(pid: u32) -> bool {
+    super::common::process_name(pid).is_some_and(|name| name == "opencode")
+}
+
+/// Sessions of opencode 2 with a turn in progress: `time_busy` is set when a
+/// turn starts and `time_idle` when it ends. A row left busy by a service
+/// that died mid-turn is older than the services now running, the oldest of
+/// which began at `started`.
+fn busy_sessions(db: &Path, started: SystemTime) -> Vec<String> {
+    let started_ms = started
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    with_connection(db, |conn| {
+        // Every listing waits for this lookup, so it gives up at once on a
+        // database that is locked.
+        conn.busy_timeout(Duration::ZERO)?;
+        let busy = busy_rows(conn, started_ms);
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        busy
+    })
+    .unwrap_or_default()
+}
+
+fn busy_rows(conn: &Connection, started_ms: i64) -> rusqlite::Result<Vec<String>> {
+    let columns: i64 = conn
+        .prepare_cached(
+            "SELECT count(*) FROM pragma_table_info('session_v2') \
+             WHERE name IN ('time_busy', 'time_idle')",
+        )?
+        .query_row([], |row| row.get(0))?;
+    if columns != 2 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT id FROM session_v2 \
+         WHERE time_busy > COALESCE(time_idle, 0) AND time_busy >= ?1",
+    )?;
+    let ids = stmt.query_map([started_ms], |row| row.get::<_, String>(0))?;
+    Ok(ids.flatten().filter(|id| is_safe_cli_id(id)).collect())
+}
+
+/// The session an opencode client was started on, from its arguments
+/// (`opencode -s <id>`, `opencode --session <id>` or `--session=<id>`).
+fn client_session(args: &[String]) -> Option<&str> {
+    let mut rest = args.iter().skip(1);
+    while let Some(arg) = rest.next() {
+        let id = match arg.as_str() {
+            "-s" | "--session" => rest.next().map(String::as_str),
+            _ => arg.strip_prefix("--session="),
+        };
+        if let Some(id) = id {
+            return Some(id).filter(|id| id.starts_with("ses_") && is_safe_cli_id(id));
+        }
+    }
+    None
 }
 
 /// Search texts of an opencode 2 export line. Only `user` and `assistant`
@@ -1157,6 +1328,52 @@ mod tests {
             Some("ses_aaa")
         );
         assert!(!PLUGIN.is_subagent(&db.join("ses_aaa")));
+    }
+
+    #[test]
+    fn busy_sessions_are_mid_turn_since_the_service_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_busy INTEGER, time_idle INTEGER);
+             INSERT INTO session_v2 VALUES
+                ('ses_busy', 2000, NULL),
+                ('ses_again', 3000, 2500),
+                ('ses_idle', 2000, 2100),
+                ('ses_never', NULL, NULL),
+                ('ses_orphan', 500, NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let at = |ms| UNIX_EPOCH + Duration::from_millis(ms);
+        let mut busy = busy_sessions(&db, at(1000));
+        busy.sort();
+        assert_eq!(busy, ["ses_again", "ses_busy"]);
+        assert!(busy_sessions(&db, at(5000)).is_empty());
+
+        // opencode 1.x keeps no such state.
+        let v1 = create_db(tmp.path());
+        assert!(busy_sessions(&v1, at(0)).is_empty());
+    }
+
+    #[test]
+    fn clients_name_their_session_in_their_arguments() {
+        let session = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            client_session(&args).map(str::to_string)
+        };
+        let id = Some("ses_abc".to_string());
+        assert_eq!(session(&["/opt/bin/opencode", "-s", "ses_abc"]), id);
+        assert_eq!(
+            session(&["opencode", "--session", "ses_abc", "-m", "x"]),
+            id
+        );
+        assert_eq!(session(&["opencode", "--session=ses_abc"]), id);
+        assert_eq!(session(&["opencode", "serve", "--service"]), None);
+        assert_eq!(session(&["opencode", "-s"]), None);
+        assert_eq!(session(&["opencode", "-s", "not-a-session"]), None);
+        assert_eq!(session(&[]), None);
     }
 
     #[test]

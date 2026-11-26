@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use super::common::{
     SessionBytes, is_safe_cli_id, mmap_file, strip_home, visit_tool_call, visit_tool_output,
 };
-use super::{AgentPlugin, Message};
+use super::{AgentPlugin, MemoryKind, MemorySource, Message};
 
 pub static PLUGIN: DshPlugin = DshPlugin;
 
@@ -561,6 +561,62 @@ impl AgentPlugin for DshPlugin {
         ])
     }
 
+    fn can_detect_running(&self) -> bool {
+        // Needs the kernel lock table (`/proc/locks`).
+        cfg!(target_os = "linux")
+    }
+
+    fn running_sessions(&self) -> Vec<(String, Option<u32>)> {
+        let Some(sessions) =
+            crate::config::resolve_agent_base("dsh").map(|base| base.join("sessions"))
+        else {
+            return Vec::new();
+        };
+        if !sessions.is_dir() {
+            return Vec::new();
+        }
+        running_in(&sessions, &super::common::file_lock_holders())
+    }
+
+    fn can_memory(&self) -> bool {
+        true
+    }
+
+    fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
+        let base = crate::config::resolve_agent_base("dsh").unwrap_or_else(|| home.join(".dsh"));
+        let mut sources = vec![
+            MemorySource::new(&base, "AGENTS.md", MemoryKind::Instruction),
+            MemorySource::new(&base, "skills/*/SKILL.md", MemoryKind::Skill),
+        ];
+        // The second global directory dsh reads. The skills of the default
+        // one, `~/.agents`, are listed as shared.
+        let shared = home.join(".agents");
+        let agents_home = std::env::var("DSH_AGENTS_HOME")
+            .ok()
+            .filter(|dir| !dir.trim().is_empty())
+            .map(|dir| agents_home_path(&dir, home));
+        if let Some(dir) = agents_home.as_ref().filter(|dir| **dir != shared) {
+            sources.push(MemorySource::new(
+                dir,
+                "skills/*/SKILL.md",
+                MemoryKind::Skill,
+            ));
+        }
+        sources.push(MemorySource::new(
+            agents_home.as_deref().unwrap_or(&shared),
+            "AGENTS.md",
+            MemoryKind::Instruction,
+        ));
+        sources
+    }
+
+    fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
+        vec![
+            MemorySource::new(dir, "AGENTS.local.md", MemoryKind::Instruction),
+            MemorySource::new(dir, ".dsh/skills/*/SKILL.md", MemoryKind::Skill),
+        ]
+    }
+
     /// A subagent's header names the session that started it.
     fn parent_session_id(&self, path: &Path) -> Option<String> {
         header_str(&read_header(path)?, "parentSession")
@@ -572,6 +628,52 @@ impl AgentPlugin for DshPlugin {
                 || header_str(&header, "parentSession").is_some()
         })
     }
+}
+
+/// A configured `DSH_AGENTS_HOME`, with the leading `~` dsh expands.
+fn agents_home_path(dir: &str, home: &Path) -> PathBuf {
+    match dir.strip_prefix('~') {
+        Some("") => home.to_path_buf(),
+        Some(rest) if rest.starts_with(['/', '\\']) => {
+            home.join(rest.trim_start_matches(['/', '\\']))
+        }
+        _ => PathBuf::from(dir),
+    }
+}
+
+/// Running sessions from `sessions/--<cwd>--/<session id>/session.lock`. dsh
+/// holds an exclusive `flock` on a session's lock file for as long as a
+/// process has the session open for writing; the file stays behind
+/// afterwards. The kernel lock table is read instead of probing the lock,
+/// so `ah` never contends with dsh for it.
+fn running_in(
+    sessions_dir: &Path,
+    holders: &std::collections::HashMap<(u64, u64, u64), u32>,
+) -> Vec<(String, Option<u32>)> {
+    if holders.is_empty() {
+        return Vec::new();
+    }
+    let dirs = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+    };
+    dirs(sessions_dir)
+        .flat_map(|project| dirs(&project))
+        .filter_map(|session| {
+            let pid = *holders.get(&super::common::file_lock_key(
+                &session.join("session.lock"),
+            )?)?;
+            // The id the session is listed under: its newest log's.
+            let log = dirs(&session)
+                .filter_map(|path| Some((generation(&path)?, path)))
+                .max_by_key(|(generation, _)| *generation)
+                .map_or_else(|| session.join("session.jsonl"), |(_, path)| path);
+            Some((PLUGIN.session_id(&log, Path::new(""))?, Some(pid)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -836,6 +938,57 @@ mod tests {
         assert_eq!(messages(&path).len(), 2);
         fs::write(&path, compressed()).unwrap();
         assert_eq!(messages(&path).len(), 4);
+    }
+
+    #[test]
+    fn agents_home_expands_a_leading_tilde() {
+        let home = Path::new("/home/me");
+        assert_eq!(agents_home_path("~", home), home);
+        assert_eq!(agents_home_path("~/custom", home), home.join("custom"));
+        assert_eq!(
+            agents_home_path("/srv/agents", home),
+            Path::new("/srv/agents")
+        );
+        assert_eq!(agents_home_path("~//custom", home), home.join("custom"));
+        assert_eq!(agents_home_path("~\\custom", home), home.join("custom"));
+        assert_eq!(agents_home_path("~other/x", home), Path::new("~other/x"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_sessions_hold_their_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let lock = |project: &str, id: &str| {
+            let dir = sessions.join(project).join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("session.lock");
+            std::fs::write(&path, "").unwrap();
+            path
+        };
+        let live = lock("--work--", "session-live");
+        lock("--work--", "session-idle");
+        // A session is listed under the id in its newest log's header.
+        let renamed = lock("--work--", "session-dir");
+        let header = |id: &str| format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n");
+        std::fs::write(renamed.with_file_name("session.jsonl"), header("old-id")).unwrap();
+        std::fs::write(renamed.with_file_name("session.v2.jsonl"), header("new-id")).unwrap();
+        std::fs::create_dir_all(sessions.join("--work--/session-unlocked")).unwrap();
+        std::fs::write(sessions.join("stray-file"), "").unwrap();
+
+        let mut holders = std::collections::HashMap::new();
+        assert!(running_in(&sessions, &holders).is_empty());
+        holders.insert(super::super::common::file_lock_key(&live).unwrap(), 4242);
+        assert_eq!(
+            running_in(&sessions, &holders),
+            vec![("session-live".to_string(), Some(4242))]
+        );
+        holders.clear();
+        holders.insert(super::super::common::file_lock_key(&renamed).unwrap(), 7);
+        assert_eq!(
+            running_in(&sessions, &holders),
+            vec![("new-id".to_string(), Some(7))]
+        );
     }
 
     #[test]

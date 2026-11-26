@@ -221,6 +221,7 @@ Files listed per agent (global paths honor each agent's env var; project paths a
 | Grok | `~/.grok/AGENTS.md`, `rules/*.md`, `memory/MEMORY.md`, memory topics `memory-v2/{global,workspaces/*}/topics/*.md` | `.grok/rules/*.md` |
 | opencode | `~/.config/opencode/AGENTS.md`, `instructions` in `opencode.json(c)` | `instructions` in `opencode.json(c)` |
 | Pi | `~/.pi/agent/AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `SYSTEM.md`, `APPEND_SYSTEM.md` | `.pi/SYSTEM.md`, `.pi/APPEND_SYSTEM.md` |
+| DeepSeek Harness (dsh) | `~/.dsh/AGENTS.md`, `~/.agents/AGENTS.md` (or `DSH_AGENTS_HOME`) | `AGENTS.local.md` |
 | shared | — | `AGENTS.md` |
 
 Types: `instruction` (always-loaded files), `rule`, `memory` (or the type in a memory file's frontmatter, such as `feedback`), and `skill`. Skills (`SKILL.md` under each agent's `skills/*/` directory, anywhere under Pi's `skills/`, and `.agents/skills/*/`) are listed only with `-t skill`.
@@ -289,14 +290,14 @@ A prompt counts on the local day it was sent, and a session counts when it has a
 | Codex | ✓ | ✓ | ✓ | ✓ | ✓¹ | ✓ | ✓ |
 | Gemini | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
 | Copilot | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Cursor | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
-| Antigravity (agy) | ✓ | ✓ | ✓ | ✓ | ✓¹ | ✓ | |
+| Cursor | ✓ | ✓ | ✓ | ✓ | ✓¹ | ✓ | ✓ |
+| Antigravity (agy) | ✓ | ✓ | ✓ | ✓ | ✓¹ | ✓ | ✓ |
 | Grok | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| opencode | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
+| opencode | ✓ | ✓ | ✓ | ✓ | ✓³ | ✓ | ✓ |
 | Pi | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ |
-| DeepSeek Harness (dsh) | ✓ | ✓ | ✓ | ✓² | | | ✓ |
+| DeepSeek Harness (dsh) | ✓ | ✓ | ✓ | ✓² | ✓¹ | ✓ | ✓ |
 
-Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.json` (checking `procStart` so a reused PID is not reported), Grok's `active_sessions.json`, Copilot's `session-state/<id>/inuse.<pid>.lock`, Codex's `thread-writer-locks/<id>.lock`, and Antigravity's `presence/<id>.lock`. ¹ Codex and Antigravity are detected on Linux only, from the kernel lock table (`/proc/locks`); the PID is the lock holder (for the Codex TUI, the Codex app-server). Running detection needs a PID liveness check, which is not implemented on Windows.
+Running detection reads each agent's own bookkeeping: Claude's `sessions/<pid>.json` (checking `procStart` so a reused PID is not reported), Grok's `active_sessions.json`, Copilot's `session-state/<id>/inuse.<pid>.lock`, Codex's `thread-writer-locks/<id>.lock`, Antigravity's `presence/<id>.lock`, DeepSeek Harness's `sessions/--<cwd>--/<id>/session.lock`, and the SQLite connection cursor-agent keeps open on a chat's `store.db`. ¹ Codex, Antigravity, Cursor and DeepSeek Harness are detected on Linux only, from the kernel lock table (`/proc/locks`); the PID is the lock holder (for the Codex TUI, the Codex app-server). ³ opencode 2 only: a session counts as running while a turn is in progress in its service (`time_busy` / `time_idle` in `session_v2`, with the service alive), or, on Linux, while a client started with `--session <id>` is alive. An idle TUI that picked its session itself is not detected. Gemini and Pi leave no record of the session a live process has open, so they are not detected. Running detection needs a PID liveness check, which is not implemented on Windows.
 
 The `model` field is the model that answered last in a session, and `models` (`-o models`) lists every model that answered, comma-separated in first-use order. For Copilot these are the models that actually answered, not the `auto` selection; for older Copilot logs whose replies name no model, `model` falls back to the last model in the session's usage metrics. Both are empty when the session records no model (e.g. older Codex and Grok logs, or a session with no reply). `model` is a default column, and on a TTY `ah log` shows it as a `Model:` line, omitted when empty.
 
@@ -438,7 +439,7 @@ Global options:
   -s <CMD>                Override fuzzy selector (default: $AH_SELECTOR or fzf)
   --no-preview            Disable preview in interactive mode
   --interactive-display <FIELDS>  Override fuzzy selector display columns (log -i / show -i only)
-  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok, agy)
+  --running               Show only currently running sessions (Claude, Codex, Copilot, Cursor, Grok, agy, opencode, dsh)
   --no-archived           Hide sessions the agent has archived (Codex, agy, opencode)
   --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
@@ -556,7 +557,7 @@ Global options:
   -n, --limit N           Max session files to scan (default: 0, no limit)
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
-  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok, agy)
+  --running               Show only currently running sessions (Claude, Codex, Copilot, Cursor, Grok, agy, opencode, dsh)
   --no-archived           Hide sessions the agent has archived (Codex, agy, opencode)
   --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])
@@ -624,7 +625,7 @@ Global options:
   -n, --limit N           Max session files to scan (default: 0, no limit)
   --since <SPEC>          Show sessions newer than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
   --until <SPEC>          Show sessions older than (e.g. "2026-03-20", "3d", "1w", "2m" = ~60 days)
-  --running               Show only currently running sessions (Claude, Codex, Copilot, Grok, agy)
+  --running               Show only currently running sessions (Claude, Codex, Copilot, Cursor, Grok, agy, opencode, dsh)
   --no-archived           Hide sessions the agent has archived (Codex, agy, opencode)
   --subagents             Include subagent sessions (spawned by another session)
   --remote <NAME>         Include sessions from remote host (requires ah on remote; see ~/.ahrc [remotes.*])

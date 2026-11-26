@@ -712,7 +712,29 @@ pub fn process_start_time(pid: u32) -> Option<SystemTime> {
             + std::time::Duration::from_nanos((ticks % hz) * 1_000_000_000 / hz);
         Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(btime) + since_boot)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                i32::try_from(pid).ok()?,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        if read != size {
+            return None;
+        }
+        let micros = u32::try_from(info.pbi_start_tvusec).ok()?;
+        Some(
+            SystemTime::UNIX_EPOCH
+                + std::time::Duration::new(info.pbi_start_tvsec, micros.checked_mul(1000)?),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid;
         None
@@ -724,43 +746,163 @@ pub fn process_start_time(pid: u32) -> Option<SystemTime> {
 /// and blocked-waiter (`->`) entries are ignored. Empty where the kernel does
 /// not expose the table.
 pub fn file_lock_holders() -> std::collections::HashMap<(u64, u64, u64), u32> {
+    proc_locks()
+        .map(|table| parse_proc_locks(&table))
+        .unwrap_or_default()
+}
+
+/// Processes with a connection open to a SQLite database in WAL mode, keyed
+/// by the `(device major, device minor, inode)` of its `-shm` file. SQLite
+/// holds a shared POSIX lock on byte 128 of that file for as long as a
+/// connection is open, so any reader of the database is listed, not only
+/// its owner. Empty where the kernel does not expose the lock table.
+pub fn sqlite_wal_holders() -> std::collections::HashMap<(u64, u64, u64), Vec<u32>> {
+    proc_locks()
+        .map(|table| parse_sqlite_wal_holders(&table))
+        .unwrap_or_default()
+}
+
+fn proc_locks() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        fs::read_to_string("/proc/locks")
-            .map(|s| parse_proc_locks(&s))
-            .unwrap_or_default()
+        fs::read_to_string("/proc/locks").ok()
     }
     #[cfg(not(target_os = "linux"))]
     {
-        std::collections::HashMap::new()
+        None
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn parse_proc_locks(text: &str) -> std::collections::HashMap<(u64, u64, u64), u32> {
-    let mut map = std::collections::HashMap::new();
-    for line in text.lines() {
-        // "1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF"
+/// One held lock of `/proc/locks`: `(kind, access, pid, file, start, end)`,
+/// e.g. `1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF`. Blocked waiters
+/// (`1: -> FLOCK ...`) are skipped.
+fn proc_lock_rows(
+    text: &str,
+) -> impl Iterator<Item = (&str, &str, u32, (u64, u64, u64), &str, &str)> {
+    text.lines().filter_map(|line| {
         let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 6 || cols[1..4] != ["FLOCK", "ADVISORY", "WRITE"] {
-            continue;
+        if cols.len() < 8 || cols[2] != "ADVISORY" {
+            return None;
         }
-        let Ok(pid) = cols[4].parse::<u32>() else {
-            continue;
-        };
+        let pid = cols[4].parse::<u32>().ok()?;
         let mut id = cols[5].splitn(3, ':');
-        let (Some(maj), Some(min), Some(ino)) = (id.next(), id.next(), id.next()) else {
-            continue;
-        };
-        if let (Ok(maj), Ok(min), Ok(ino)) = (
-            u64::from_str_radix(maj, 16),
-            u64::from_str_radix(min, 16),
-            ino.parse::<u64>(),
-        ) {
-            map.insert((maj, min, ino), pid);
+        let file = (
+            u64::from_str_radix(id.next()?, 16).ok()?,
+            u64::from_str_radix(id.next()?, 16).ok()?,
+            id.next()?.parse::<u64>().ok()?,
+        );
+        Some((cols[1], cols[3], pid, file, cols[6], cols[7]))
+    })
+}
+
+fn parse_proc_locks(text: &str) -> std::collections::HashMap<(u64, u64, u64), u32> {
+    proc_lock_rows(text)
+        .filter(|row| (row.0, row.1) == ("FLOCK", "WRITE"))
+        .map(|row| (row.3, row.2))
+        .collect()
+}
+
+fn parse_sqlite_wal_holders(text: &str) -> std::collections::HashMap<(u64, u64, u64), Vec<u32>> {
+    let mut map: std::collections::HashMap<_, Vec<u32>> = std::collections::HashMap::new();
+    for row in proc_lock_rows(text) {
+        // The kernel merges this lock with the adjacent read marks the same
+        // process holds (bytes 123 to 127), so the range only has to cover
+        // byte 128.
+        let covers = row.4.parse::<u64>().is_ok_and(|start| start <= 128)
+            && (row.5 == "EOF" || row.5.parse::<u64>().is_ok_and(|end| end >= 128));
+        if (row.0, row.1) == ("POSIX", "READ") && covers {
+            let pids = map.entry(row.3).or_default();
+            if !pids.contains(&row.2) {
+                pids.push(row.2);
+            }
         }
     }
     map
+}
+
+/// The arguments of a running process, the program first. `None` where
+/// they cannot be read.
+pub fn process_args(pid: u32) -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        Some(
+            raw.split(|b| *b == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// The name of a running process: the basename of its executable, cut to 15
+/// bytes on Linux. `None` where it cannot be read.
+pub fn process_name(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        Some(comm.trim_end_matches('\n').to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut name = [0u8; 256];
+        let len = unsafe {
+            libc::proc_name(
+                i32::try_from(pid).ok()?,
+                name.as_mut_ptr().cast(),
+                name.len() as u32,
+            )
+        };
+        let len = usize::try_from(len).ok().filter(|len| *len > 0)?;
+        Some(String::from_utf8_lossy(name.get(..len)?).into_owned())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Whether a running process has `file` open. `None` where its open files
+/// cannot be listed.
+pub fn process_has_open(pid: u32, file: &Path) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let wanted = fs::metadata(file).ok()?;
+        let open = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+        Some(open.flatten().any(|fd| {
+            fs::metadata(fd.path())
+                .is_ok_and(|meta| (meta.dev(), meta.ino()) == (wanted.dev(), wanted.ino()))
+        }))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, file);
+        None
+    }
+}
+
+/// Every process id. Empty where the process table cannot be listed.
+pub fn all_pids() -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
 }
 
 /// `(device major, device minor, inode)` of `path`, matching the key used by
@@ -1018,6 +1160,56 @@ mod tests {
         let map = parse_proc_locks(text);
         assert_eq!(map.get(&(0x103, 0x02, 23794220)), Some(&165470));
         assert_eq!(map.len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_files_of_this_process_are_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (held, other) = (tmp.path().join("held"), tmp.path().join("other"));
+        std::fs::write(&held, "").unwrap();
+        std::fs::write(&other, "").unwrap();
+        let _file = std::fs::File::open(&held).unwrap();
+        let pid = std::process::id();
+        assert_eq!(process_has_open(pid, &held), Some(true));
+        assert_eq!(process_has_open(pid, &other), Some(false));
+        assert_eq!(process_has_open(pid, &tmp.path().join("missing")), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn this_process_has_a_name_and_a_start_time() {
+        let pid = std::process::id();
+        let started = process_start_time(pid).unwrap();
+        let age = std::time::SystemTime::now()
+            .duration_since(started)
+            .unwrap();
+        assert!(age < std::time::Duration::from_secs(3600), "{age:?}");
+        assert!(!process_name(pid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sqlite_wal_holders_are_the_readers_of_the_shm_file() {
+        let text = "1: POSIX  ADVISORY  READ 10 fc:00:500 128 128\n\
+                    2: POSIX  ADVISORY  READ 11 fc:00:500 128 128\n\
+                    3: POSIX  ADVISORY  READ 10 fc:00:499 1073741826 1073742335\n\
+                    4: POSIX  ADVISORY  WRITE 12 fc:00:501 128 128\n\
+                    5: FLOCK  ADVISORY  READ 13 fc:00:502 128 128\n\
+                    6: -> POSIX  ADVISORY  READ 14 fc:00:500 128 128\n";
+        let map = parse_sqlite_wal_holders(text);
+        assert_eq!(map.get(&(0xfc, 0, 500)), Some(&vec![10, 11]));
+        assert_eq!(map.len(), 1);
+
+        // Merged with the read mark next to it, and listed once per process.
+        let merged = "1: POSIX  ADVISORY  READ 20 fc:00:600 127 128\n\
+                      2: POSIX  ADVISORY  READ 20 fc:00:600 124 124\n\
+                      3: POSIX  ADVISORY  READ 21 fc:00:600 0 EOF\n\
+                      4: POSIX  ADVISORY  READ 22 fc:00:600 129 EOF\n\
+                      5: POSIX  ADVISORY  READ 23 fc:00:600 120 127\n\
+                      6: POSIX  ADVISORY  READ 0 fc:00:600 128 128\n\
+                      7: POSIX  ADVISORY  READ 0 fc:00:600 128 128\n";
+        let map = parse_sqlite_wal_holders(merged);
+        assert_eq!(map.get(&(0xfc, 0, 600)), Some(&vec![20, 21, 0]));
     }
 
     #[test]
