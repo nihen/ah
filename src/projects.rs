@@ -115,9 +115,7 @@ pub fn build_project_records(
             }
 
             let agent = config::find_agent_for_path(path);
-            let plugin = agent
-                .map(|a| a.plugin)
-                .unwrap_or_else(agents::unknown_plugin);
+            let plugin = agent.map_or_else(agents::unknown_plugin, |a| a.plugin);
             let fields =
                 resolver::resolve_fields(path, plugin, *mtime, &home, &resolve_fields, &lp_opts);
 
@@ -126,7 +124,7 @@ pub fn build_project_records(
             }
 
             if let Some(ref cwd_val) = cwd_filter {
-                let session_cwd = fields.get(&Field::Cwd).map(|v| v.as_str()).unwrap_or("");
+                let session_cwd = fields.get(&Field::Cwd).map_or("", |v| v.as_str());
                 if session_cwd != cwd_val {
                     return None;
                 }
@@ -138,9 +136,7 @@ pub fn build_project_records(
             }
 
             Some(ResolvedEntry {
-                agent_id: agent
-                    .map(|a| a.id.clone())
-                    .unwrap_or_else(|| plugin.id().to_string()),
+                agent_id: agent.map_or_else(|| plugin.id().to_string(), |a| a.id.clone()),
                 project,
                 mtime: *mtime,
                 fields,
@@ -217,7 +213,10 @@ pub fn build_project_records(
         return Err("No projects found.".to_string());
     }
 
-    let sorted: Vec<(String, ProjectInfo)> = projects.into_iter().collect();
+    // By name first: the sort below is stable, so projects that tie on the
+    // sort field keep this order instead of the hash map's.
+    let mut sorted: Vec<(String, ProjectInfo)> = projects.into_iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Build fields set including sort_field for sorting even if not in output
     let mut resolve_fields: Vec<ProjectField> = args.fields.clone();

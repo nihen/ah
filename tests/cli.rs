@@ -955,12 +955,12 @@ fn opencode_duplicate_session_keeps_newest_copy() {
     let backup = home.join(".local/share/opencode/opencode-backup.db");
     let conn = rusqlite::Connection::open(&backup).unwrap();
     conn.execute_batch(
-        r#"
+        r"
         CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
             title TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
         INSERT INTO session VALUES
             ('ses_oc1', NULL, '/nonexistent/proj', 'Old title', 1700000000000, 1600000000000);
-        "#,
+        ",
     )
     .unwrap();
     drop(conn);
@@ -1135,7 +1135,7 @@ fn copilot_title_time_and_resume() {
             .open(path)
             .unwrap()
             .set_modified(t)
-            .unwrap()
+            .unwrap();
     };
     set_mtime(&named.join("workspace.yaml"), at("2026-09-27T02:34:46Z"));
     set_mtime(&named.join("events.jsonl"), at("2026-09-27T03:10:00Z"));

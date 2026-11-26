@@ -312,7 +312,7 @@ impl FromStr for Field {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchMode {
     /// User and assistant messages plus tool calls (names, arguments) and
     /// tool output (default).
@@ -323,7 +323,7 @@ pub enum SearchMode {
     Raw,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputFormat {
     Log,
     Table,
@@ -351,7 +351,7 @@ impl OutputFormat {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SortOrder {
     Asc,
     Desc,
@@ -374,7 +374,7 @@ impl FieldFilter {
     pub fn matches_all(filters: &[FieldFilter], fields: &BTreeMap<Field, String>) -> bool {
         filters
             .iter()
-            .all(|f| fields.get(&f.field).map(|v| v.as_str()).unwrap_or("") == f.value)
+            .all(|f| fields.get(&f.field).map_or("", |v| v.as_str()) == f.value)
     }
 
     pub fn ensure_fields(filters: &[FieldFilter], resolve_fields: &mut Vec<Field>) {
@@ -659,8 +659,7 @@ impl FilterArgs {
             std::env::current_dir()
                 .ok()
                 .and_then(|p| std::fs::canonicalize(&p).ok())
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| d.to_string())
+                .map_or_else(|| d.to_string(), |p| p.to_string_lossy().to_string())
         } else {
             std::fs::canonicalize(d)
                 .ok()
@@ -673,8 +672,7 @@ impl FilterArgs {
                         None
                     }
                 })
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| d.to_string())
+                .map_or_else(|| d.to_string(), |p| p.to_string_lossy().to_string())
         }
     }
 }
@@ -773,7 +771,7 @@ impl SearchArgs {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShowFormat {
     Pretty,
     Raw,
@@ -1790,11 +1788,11 @@ const GLOBAL_OPTIONS: &str = r#"Global options:
   --no-pager              Disable automatic pager
   --debug                 Show debug info (glob expansion, scan counts, timing) on stderr"#;
 
-const DISPLAY_OPTIONS: &str = r#"Display options:
+const DISPLAY_OPTIONS: &str = r"Display options:
   --color                 Force colored output (even through pipes)
   --no-color              Disable colored output
   --no-pager              Disable automatic pager
-  --debug                 Show debug info (glob expansion, scan counts, timing) on stderr"#;
+  --debug                 Show debug info (glob expansion, scan counts, timing) on stderr";
 
 const PROJECT_GLOBAL_OPTIONS: &str = concatcp!(
     r#"Global options:
@@ -1828,14 +1826,14 @@ const MEMORY_GLOBAL_OPTIONS: &str = concatcp!(
 );
 
 const STATS_GLOBAL_OPTIONS: &str = concatcp!(
-    r#"Global options:
+    r"Global options:
   --agent <NAME>          Filter by agent name (e.g. claude, codex, gemini)
   --project <NAME>        Filter by project name
   -d, --dir <PATH>        Filter by working directory (default: all directories)
   -n, --limit N           Max session files to scan (default: 0, no limit)
   --subagents             Include subagent sessions (spawned by another session)
 
-"#,
+",
     DISPLAY_OPTIONS
 );
 
@@ -2131,7 +2129,7 @@ Interactive mode:
     MEMORY_GLOBAL_OPTIONS
 );
 
-const LIST_AGENTS_HELP_TEXT: &str = r#"List supported agents
+const LIST_AGENTS_HELP_TEXT: &str = r"List supported agents
 
 Usage:
   ah list-agents [OPTIONS]
@@ -2148,7 +2146,7 @@ Examples:
   ah list-agents
   ah list-agents --json
   ah list-agents --json | jq '.id'
-  ah list-agents --tsv | column -t -s$'\t'"#;
+  ah list-agents --tsv | column -t -s$'\t'";
 
 const MCP_HELP_TEXT: &str = r#"Serve sessions to MCP clients over stdio
 
@@ -2179,7 +2177,7 @@ Examples:
   ah mcp -a              # scope: every project
   ah mcp --agent claude  # only Claude sessions by default"#;
 
-const COMPLETION_HELP_TEXT: &str = r#"Generate shell completion script
+const COMPLETION_HELP_TEXT: &str = r"Generate shell completion script
 
 Usage:
   ah completion <SHELL>
@@ -2191,9 +2189,9 @@ Setup:
   zsh:  mkdir -p ~/.zfunc && ah completion zsh > ~/.zfunc/_ah
         # Add to .zshrc: fpath=(~/.zfunc $fpath); autoload -Uz compinit && compinit
   bash: ah completion bash > ~/.local/share/bash-completion/completions/ah
-  fish: ah completion fish > ~/.config/fish/completions/ah.fish"#;
+  fish: ah completion fish > ~/.config/fish/completions/ah.fish";
 
-const MAN_HELP_TEXT: &str = r#"Generate man page
+const MAN_HELP_TEXT: &str = r"Generate man page
 
 Usage:
   ah man [SUBCOMMAND]
@@ -2207,7 +2205,7 @@ Examples:
   ah man log                  # ah-log(1) man page to stdout
   ah man --out-dir ./man      # generate all pages into ./man/
   ah man | mandoc -man        # preview the main man page
-  # or via: make install"#;
+  # or via: make install";
 
 #[cfg(test)]
 mod tests {

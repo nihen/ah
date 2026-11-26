@@ -67,7 +67,7 @@ fn cached_cloud_sessions_use_normal_log_search_and_show_but_cannot_resume() {
             home.path().join(".ahrc"),
             format!("[cloud.codex]\nenabled = {enabled}\n"),
         )
-        .unwrap()
+        .unwrap();
     };
     let call = |args: &[&str], enabled: bool| {
         enable_cloud(enabled);

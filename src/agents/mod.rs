@@ -197,6 +197,13 @@ pub trait AgentPlugin: Sync {
         true
     }
 
+    /// Whether `resolve_cwd_from_mmap` reads the cwd from `session_bytes`,
+    /// so a cwd filter needs them loaded; otherwise they are loaded only for
+    /// the sessions the filter keeps.
+    fn cwd_in_session_bytes(&self) -> bool {
+        false
+    }
+
     /// Whether every user message from `iter_messages` is a substring of one
     /// JSON string value in `session_bytes`. Prompt-only search then skips
     /// JSON parsing for sessions whose raw bytes cannot contain the query.
@@ -342,16 +349,27 @@ pub trait AgentPlugin: Sync {
 /// UUID shared with another agent (e.g. `agy` and `cursor`) from falsely
 /// marking that other agent's session as running.
 pub fn running_session_map() -> std::collections::HashMap<(&'static str, String), Option<u32>> {
-    all_plugins()
-        .iter()
-        .filter(|p| p.can_detect_running())
-        .flat_map(|p| {
-            let plugin_id = p.id();
-            p.running_sessions()
-                .into_iter()
-                .map(move |(id, pid)| ((plugin_id, id), pid))
-        })
-        .collect()
+    // Each plugin inspects processes and lock files on its own, so they are
+    // asked at the same time.
+    std::thread::scope(|scope| {
+        let lookups: Vec<_> = all_plugins()
+            .iter()
+            .filter(|p| p.can_detect_running())
+            .map(|p| (p.id(), scope.spawn(|| p.running_sessions())))
+            .collect();
+        lookups
+            .into_iter()
+            .flat_map(|(plugin_id, lookup)| {
+                let sessions = match lookup.join() {
+                    Ok(sessions) => sessions,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                };
+                sessions
+                    .into_iter()
+                    .map(move |(id, pid)| ((plugin_id, id), pid))
+            })
+            .collect()
+    })
 }
 
 /// How `ah memory` labels a memory/instruction file.

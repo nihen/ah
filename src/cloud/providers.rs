@@ -1286,9 +1286,7 @@ pub(crate) fn url_for_path(path: &Path) -> Option<String> {
 }
 
 pub(crate) fn coverage(path: &Path) -> String {
-    read(path)
-        .map(|s| s.coverage)
-        .unwrap_or_else(|| "metadata".into())
+    read(path).map_or_else(|| "metadata".into(), |s| s.coverage)
 }
 
 fn is_uuid(id: &str) -> bool {
@@ -1533,7 +1531,7 @@ mod tests {
                 (
                     "/api/session",
                     200,
-                    json!({"data":[{"id":"not/a/session"},row.clone()]}),
+                    json!({"data":[{"id":"not/a/session"},row]}),
                 ),
                 (
                     "/api/experimental/session/ses_example/export",

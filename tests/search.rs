@@ -854,7 +854,7 @@ fn interactive_preview_roundtrips_hostile_paths_without_shell_evaluation() {
     let selector = tmp.path().join("fzf");
     fs::write(
         &selector,
-        r#"#!/usr/bin/env python3
+        r"#!/usr/bin/env python3
 import os, shlex, subprocess, sys
 rows = sys.stdin.read().splitlines()
 row = rows[0]
@@ -865,7 +865,7 @@ result = subprocess.run(['/bin/sh', '-c', preview], capture_output=True, text=Tr
 assert result.returncode == 0, result.stderr
 assert '> [user]' in result.stdout and 'needle preview' in result.stdout, result.stdout
 print(row)
-"#,
+",
     )
     .unwrap();
     fs::set_permissions(&selector, fs::Permissions::from_mode(0o755)).unwrap();

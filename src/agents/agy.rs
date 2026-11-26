@@ -699,7 +699,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO conversation_summaries VALUES (?1, ?2, ?3, ?4)",
-            ("conv-child2", "", r#"[]"#, ""),
+            ("conv-child2", "", r"[]", ""),
         )
         .unwrap();
         conn.execute(

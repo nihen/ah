@@ -40,9 +40,7 @@ impl CopilotPlugin {
     }
 
     fn workspace_path(path: &Path) -> PathBuf {
-        Self::session_dir(path)
-            .map(|d| d.join("workspace.yaml"))
-            .unwrap_or_else(|| path.to_path_buf())
+        Self::session_dir(path).map_or_else(|| path.to_path_buf(), |d| d.join("workspace.yaml"))
     }
 
     /// A `workspace.yaml` timestamp (RFC 3339, written in UTC).
@@ -688,7 +686,7 @@ paras: >\n  one\n  two\n\n  three\n";
                 .open(p)
                 .unwrap()
                 .set_modified(t)
-                .unwrap()
+                .unwrap();
         };
 
         let path = session(tmp.path(), "m", "cwd: /x\n", Some(""));

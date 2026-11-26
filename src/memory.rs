@@ -155,7 +155,7 @@ fn file_meta(path: &Path) -> (SystemTime, SystemTime, u64) {
         .as_ref()
         .and_then(|m| m.created().ok())
         .unwrap_or(mtime);
-    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let size = meta.as_ref().map_or(0, |m| m.len());
     (mtime, ctime, size)
 }
 
@@ -386,15 +386,12 @@ fn unescape_glob(s: &str) -> String {
     while let Some(i) = rest.find('[') {
         out.push_str(&rest[..i]);
         let tail = &rest[i..];
-        match tail.char_indices().nth(2) {
-            Some((end, ']')) => {
-                out.push_str(&tail[1..end]);
-                rest = &tail[end + 1..];
-            }
-            _ => {
-                out.push('[');
-                rest = &tail[1..];
-            }
+        if let Some((end, ']')) = tail.char_indices().nth(2) {
+            out.push_str(&tail[1..end]);
+            rest = &tail[end + 1..];
+        } else {
+            out.push('[');
+            rest = &tail[1..];
         }
     }
     out.push_str(rest);
@@ -709,8 +706,7 @@ pub fn build_memory_records(
                     MemoryField::Path => {
                         let p = entry.path.to_string_lossy();
                         p.strip_prefix(home_str.as_str())
-                            .map(|s| format!("~{s}"))
-                            .unwrap_or_else(|| p.to_string())
+                            .map_or_else(|| p.to_string(), |s| format!("~{s}"))
                     }
                     MemoryField::Body => entry.body.clone(),
                     MemoryField::Matched => matched_snippet.clone(),
@@ -868,7 +864,7 @@ mod tests {
         assert_eq!(unquote_scalar("plain"), "plain");
         assert_eq!(unquote_scalar(r#""unbalanced"#), r#""unbalanced"#);
         assert_eq!(unquote_scalar(r#""foo\""#), r#""foo\""#);
-        assert_eq!(unquote_scalar(r#""foo\\""#), r#"foo\"#);
+        assert_eq!(unquote_scalar(r#""foo\\""#), r"foo\");
         assert_eq!(unquote_scalar(r#"""#), r#"""#);
     }
 

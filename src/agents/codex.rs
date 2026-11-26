@@ -120,7 +120,7 @@ fn latest_thread_name_in(
 /// before JSON parsing. This matters when the title falls back to the first
 /// prompt: sessions without a real user prompt are scanned to the end.
 fn for_each_message(data: &[u8], visit: &mut dyn FnMut(Message) -> bool) {
-    for line in data.split(|&b| b == b'\n') {
+    for line in super::common::jsonl_lines(data) {
         if RESPONSE_ITEM.find(line).is_none()
             || (USER.find(line).is_none() && ASSISTANT.find(line).is_none())
         {
@@ -145,7 +145,7 @@ static ASSISTANT: LazyLock<memchr::memmem::Finder<'static>> =
 /// Visit the search texts of a rollout: messages, tool calls and tool
 /// outputs, all of which live in `response_item` lines.
 fn for_each_search_text(data: &[u8], visit: &mut dyn FnMut(&str) -> bool) {
-    for line in data.split(|&b| b == b'\n') {
+    for line in super::common::jsonl_lines(data) {
         if !may_hold_search_text(line) {
             continue;
         }
@@ -547,15 +547,24 @@ impl AgentPlugin for CodexPlugin {
     /// output in it, so a turn aborted before any reply adds nothing.
     fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
         let data = mmap_file(path)?;
-        let turn = memchr::memmem::Finder::new(b"\"turn_context\"");
-        let item = memchr::memmem::Finder::new(b"\"response_item\"");
+        let mut turns = super::common::LinesWith::new(&data, b"\"turn_context\"");
+        let mut items = super::common::LinesWith::new(&data, b"\"response_item\"");
         let mut models = super::common::ModelList::default();
         let mut pending: Option<String> = None;
-        for line in super::common::jsonl_lines(&data) {
-            let is_turn = turn.find(line).is_some();
-            if !is_turn && (pending.is_none() || item.find(line).is_none()) {
-                continue;
-            }
+        let mut from = 0;
+        loop {
+            // The next line naming a turn, or, while a turn waits for its
+            // output, the next line naming a response item if that is first.
+            let turn = turns.next_from(from);
+            let item = pending.as_ref().and_then(|_| items.next_from(from));
+            let range = match (turn, item) {
+                (Some(turn), Some(item)) if item.start < turn.start => item,
+                (Some(turn), _) => turn,
+                (None, Some(item)) => item,
+                (None, None) => break,
+            };
+            from = range.end + 1;
+            let line = &data[range];
             const PATHS: &[&[&str]] = &[
                 &["type"],
                 &["payload", "model"],

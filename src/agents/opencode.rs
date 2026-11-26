@@ -132,7 +132,7 @@ fn strip_jsonc(src: &str) -> String {
             cleaned.push(c);
         } else if c == ',' {
             let next = bytes[i + 1..].iter().find(|n| !n.is_whitespace());
-            if !matches!(next, Some('}') | Some(']')) {
+            if !matches!(next, Some('}' | ']')) {
                 cleaned.push(c);
             }
         } else {

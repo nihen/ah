@@ -147,10 +147,7 @@ fn build_resume_command_for_path(
         &Default::default(),
     );
 
-    let cmd = fields
-        .get(&Field::ResumeCmd)
-        .map(|v| v.as_str())
-        .unwrap_or("");
+    let cmd = fields.get(&Field::ResumeCmd).map_or("", |v| v.as_str());
     if cmd.is_empty() {
         return Err("No resume command available for this session.".to_string());
     }

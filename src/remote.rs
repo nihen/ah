@@ -41,48 +41,43 @@ fn build_remote_args(remote: &RemoteDef, fields: &[Field], filter: &FilterArgs) 
     args
 }
 
+/// Forward `flag value` when the option is set.
+fn push_value(args: &mut Vec<String>, flag: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        args.push(flag.to_string());
+        args.push(value.to_string());
+    }
+}
+
+/// Forward `flag` when the switch is on.
+fn push_flag(args: &mut Vec<String>, flag: &str, on: bool) {
+    if on {
+        args.push(flag.to_string());
+    }
+}
+
+/// Forward `-n` unless the limit is the default (no limit).
+fn push_limit(args: &mut Vec<String>, limit: usize) {
+    if limit > 0 {
+        args.push("-n".to_string());
+        args.push(limit.to_string());
+    }
+}
+
 /// Filters shared by remote session and occurrence search. Cwd and recursive
 /// remote selection are deliberately not forwarded.
 fn append_remote_filters(args: &mut Vec<String>, filter: &FilterArgs) {
-    if let Some(ref q) = filter.query {
-        args.push("-q".to_string());
-        args.push(q.clone());
-    }
-    if filter.prompt_only {
-        args.push("-p".to_string());
-    }
-    if filter.raw_search {
-        args.push("--raw-search".to_string());
-    }
-    if let Some(ref a) = filter.agent {
-        args.push("--agent".to_string());
-        args.push(a.clone());
-    }
-    if let Some(ref p) = filter.project {
-        args.push("--project".to_string());
-        args.push(p.clone());
-    }
-    if filter.limit > 0 {
-        args.push("-n".to_string());
-        args.push(filter.limit.to_string());
-    }
-    if let Some(ref s) = filter.since {
-        args.push("--since".to_string());
-        args.push(s.clone());
-    }
-    if let Some(ref u) = filter.until {
-        args.push("--until".to_string());
-        args.push(u.clone());
-    }
-    if filter.running {
-        args.push("--running".to_string());
-    }
-    if filter.no_archived {
-        args.push("--no-archived".to_string());
-    }
-    if filter.subagents {
-        args.push("--subagents".to_string());
-    }
+    push_value(args, "-q", filter.query.as_deref());
+    push_flag(args, "-p", filter.prompt_only);
+    push_flag(args, "--raw-search", filter.raw_search);
+    push_value(args, "--agent", filter.agent.as_deref());
+    push_value(args, "--project", filter.project.as_deref());
+    push_limit(args, filter.limit);
+    push_value(args, "--since", filter.since.as_deref());
+    push_value(args, "--until", filter.until.as_deref());
+    push_flag(args, "--running", filter.running);
+    push_flag(args, "--no-archived", filter.no_archived);
+    push_flag(args, "--subagents", filter.subagents);
 }
 
 /// Parse JSON lines from remote `ah log --json` output into Sessions.
@@ -973,36 +968,14 @@ fn forward_common_filters(args: &mut Vec<String>, filter: &FilterArgs) {
     // Project/memory: always -a on remote (local cwd doesn't apply)
     args.push("-a".to_string());
 
-    if let Some(ref q) = filter.query {
-        args.push("-q".to_string());
-        args.push(q.clone());
-    }
-    if let Some(ref a) = filter.agent {
-        args.push("--agent".to_string());
-        args.push(a.clone());
-    }
-    if let Some(ref p) = filter.project {
-        args.push("--project".to_string());
-        args.push(p.clone());
-    }
-    if filter.limit > 0 {
-        args.push("-n".to_string());
-        args.push(filter.limit.to_string());
-    }
-    if let Some(ref s) = filter.since {
-        args.push("--since".to_string());
-        args.push(s.clone());
-    }
-    if let Some(ref u) = filter.until {
-        args.push("--until".to_string());
-        args.push(u.clone());
-    }
-    if filter.no_archived {
-        args.push("--no-archived".to_string());
-    }
-    if filter.subagents {
-        args.push("--subagents".to_string());
-    }
+    push_value(args, "-q", filter.query.as_deref());
+    push_value(args, "--agent", filter.agent.as_deref());
+    push_value(args, "--project", filter.project.as_deref());
+    push_limit(args, filter.limit);
+    push_value(args, "--since", filter.since.as_deref());
+    push_value(args, "--until", filter.until.as_deref());
+    push_flag(args, "--no-archived", filter.no_archived);
+    push_flag(args, "--subagents", filter.subagents);
 }
 
 /// Join args into a single shell-quoted command string for SSH remote execution.

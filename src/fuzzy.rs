@@ -36,7 +36,7 @@ fn print_session_fields(
             crate::cli::SearchMode::Text | crate::cli::SearchMode::Prompt => {
                 regex::Regex::new(&format!("(?i){}", query))
                     .map(drop)
-                    .map_err(|e| format!("Invalid regex '{}': {}", query, e))?
+                    .map_err(|e| format!("Invalid regex '{}': {}", query, e))?;
             }
         }
     }
@@ -245,14 +245,14 @@ pub fn run_log(args: &SearchArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> 
         .collect();
     let keys: Vec<String> = sessions
         .iter()
-        .map(|s| shell_quote(s.fields.get(&Field::Path).map(|v| v.as_str()).unwrap_or("")))
+        .map(|s| shell_quote(s.fields.get(&Field::Path).map_or("", |v| v.as_str())))
         .collect();
     let rows: Vec<Vec<String>> = sessions
         .iter()
         .map(|s| {
             visible_fields
                 .iter()
-                .map(|f| sanitize_for_display(s.fields.get(f).map(|v| v.as_str()).unwrap_or("")))
+                .map(|f| sanitize_for_display(s.fields.get(f).map_or("", |v| v.as_str())))
                 .collect()
         })
         .collect();
@@ -409,8 +409,7 @@ pub fn run_project(
         .iter()
         .map(|r| {
             r.get(&ProjectField::Cwd)
-                .map(|s| s.as_str())
-                .unwrap_or("")
+                .map_or("", |s| s.as_str())
                 .to_string()
         })
         .collect();
@@ -419,7 +418,7 @@ pub fn run_project(
         .map(|r| {
             display_tail
                 .iter()
-                .map(|pf| sanitize_for_display(r.get(pf).map(|s| s.as_str()).unwrap_or("")))
+                .map(|pf| sanitize_for_display(r.get(pf).map_or("", |s| s.as_str())))
                 .collect()
         })
         .collect();
@@ -584,14 +583,14 @@ pub fn run_show(args: &ShowArgs, ia: &InteractiveArgs, filter: &FilterArgs) -> R
         .collect();
     let keys: Vec<String> = sessions
         .iter()
-        .map(|s| shell_quote(s.fields.get(&Field::Path).map(|v| v.as_str()).unwrap_or("")))
+        .map(|s| shell_quote(s.fields.get(&Field::Path).map_or("", |v| v.as_str())))
         .collect();
     let rows: Vec<Vec<String>> = sessions
         .iter()
         .map(|s| {
             visible_fields
                 .iter()
-                .map(|f| sanitize_for_display(s.fields.get(f).map(|v| v.as_str()).unwrap_or("")))
+                .map(|f| sanitize_for_display(s.fields.get(f).map_or("", |v| v.as_str())))
                 .collect()
         })
         .collect();
@@ -735,14 +734,14 @@ pub fn run_resume(
         .collect();
     let keys: Vec<String> = sessions
         .iter()
-        .map(|s| shell_quote(s.fields.get(&Field::Path).map(|v| v.as_str()).unwrap_or("")))
+        .map(|s| shell_quote(s.fields.get(&Field::Path).map_or("", |v| v.as_str())))
         .collect();
     let rows: Vec<Vec<String>> = sessions
         .iter()
         .map(|s| {
             visible_fields
                 .iter()
-                .map(|f| sanitize_for_display(s.fields.get(f).map(|v| v.as_str()).unwrap_or("")))
+                .map(|f| sanitize_for_display(s.fields.get(f).map_or("", |v| v.as_str())))
                 .collect()
         })
         .collect();
@@ -864,10 +863,7 @@ pub fn run_resume(
         &Default::default(),
     );
 
-    let cmd = fields
-        .get(&Field::ResumeCmd)
-        .map(|v| v.as_str())
-        .unwrap_or("");
+    let cmd = fields.get(&Field::ResumeCmd).map_or("", |v| v.as_str());
     if cmd.is_empty() {
         return Err("No resume command available for this session.".to_string());
     }
@@ -1023,7 +1019,7 @@ pub fn run_memory(
     let keys: Vec<String> = records
         .iter()
         .map(|r| {
-            let p = r.get(&MemoryField::Path).map(|s| s.as_str()).unwrap_or("");
+            let p = r.get(&MemoryField::Path).map_or("", |s| s.as_str());
             // Expand ~ back to absolute path for preview/cat
             if let Some(rest) = p.strip_prefix('~') {
                 format!("{}{}", home_str, rest)
@@ -1037,7 +1033,7 @@ pub fn run_memory(
         .map(|r| {
             display_fields
                 .iter()
-                .map(|f| sanitize_for_display(r.get(f).map(|s| s.as_str()).unwrap_or("")))
+                .map(|f| sanitize_for_display(r.get(f).map_or("", |s| s.as_str())))
                 .collect()
         })
         .collect();
@@ -1107,7 +1103,7 @@ fn run_selector(selector: &str, args: &[String], input: &str) -> Result<Option<S
         // fzf: 1 = no match, 130 = cancelled (Ctrl-C). Treat as user cancellation.
         // Other non-zero codes indicate genuine errors.
         match result.status.code() {
-            Some(1) | Some(130) => return Ok(None),
+            Some(1 | 130) => return Ok(None),
             Some(code) => return Err(format!("{} exited with status {}", selector, code)),
             None => return Err(format!("{} terminated by signal", selector)),
         }

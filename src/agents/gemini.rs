@@ -135,12 +135,11 @@ impl JsonlSession {
         let Some(id) = message.get("id").and_then(|v| v.as_str()) else {
             return;
         };
-        match self.index.get(id) {
-            Some(&i) => self.messages[i] = message,
-            None => {
-                self.index.insert(id.to_string(), self.messages.len());
-                self.messages.push(message);
-            }
+        if let Some(&i) = self.index.get(id) {
+            self.messages[i] = message
+        } else {
+            self.index.insert(id.to_string(), self.messages.len());
+            self.messages.push(message);
         }
     }
 
@@ -151,7 +150,7 @@ impl JsonlSession {
 
     fn replay(data: &[u8]) -> Self {
         let mut session = JsonlSession::default();
-        for line in data.split(|&b| b == b'\n') {
+        for line in super::common::jsonl_lines(data) {
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
@@ -188,7 +187,7 @@ impl JsonlSession {
 /// Whether a `session-*.jsonl` file has a session metadata line with a
 /// non-empty id. Stops at the first one (normally the first line).
 fn has_metadata_line(data: &[u8]) -> bool {
-    data.split(|&b| b == b'\n')
+    super::common::jsonl_lines(data)
         .filter(|line| memchr::memmem::find(line, b"\"sessionId\"").is_some())
         .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
         .any(|record| {
@@ -206,7 +205,7 @@ fn has_metadata_line(data: &[u8]) -> bool {
 /// `"sessionId"` are parsed, so large message records are skipped cheaply.
 fn jsonl_session_id(data: &[u8]) -> Option<String> {
     let mut session_id = None;
-    for line in data.split(|&b| b == b'\n') {
+    for line in super::common::jsonl_lines(data) {
         if memchr::memmem::find(line, b"\"sessionId\"").is_none() {
             continue;
         }
@@ -454,7 +453,7 @@ where
 /// of replaying large logs.
 fn jsonl_first_prompt(data: &[u8]) -> Option<String> {
     let mut first = None;
-    for line in data.split(|&b| b == b'\n') {
+    for line in super::common::jsonl_lines(data) {
         if memchr::memmem::find(line, b"\"user\"").is_none() {
             continue;
         }

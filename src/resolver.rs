@@ -34,8 +34,7 @@ const HEAVY_MESSAGE_FIELDS: &[Field] = &[
 fn default_project(path: &Path) -> String {
     path.parent()
         .and_then(|p| p.file_name())
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_else(|| "?".to_string())
+        .map_or_else(|| "?".to_string(), |f| f.to_string_lossy().to_string())
 }
 
 fn project_name(value: &str) -> String {
@@ -54,8 +53,7 @@ fn project_name(value: &str) -> String {
 fn resolve_project_fallback(path: &Path, plugin: &dyn AgentPlugin, home: &Path) -> String {
     plugin
         .resolve_project(path, home)
-        .map(|value| project_name(&value))
-        .unwrap_or_else(|| default_project(path))
+        .map_or_else(|| default_project(path), |value| project_name(&value))
 }
 
 fn resolve_date(path: &Path, plugin: &dyn AgentPlugin, mtime: SystemTime) -> String {
@@ -67,8 +65,7 @@ fn resolve_date(path: &Path, plugin: &dyn AgentPlugin, mtime: SystemTime) -> Str
 fn resolve_created(path: &Path, plugin: &dyn AgentPlugin, mtime: SystemTime) -> String {
     plugin
         .session_created(path)
-        .map(format_mtime)
-        .unwrap_or_else(|| format_mtime(mtime))
+        .map_or_else(|| format_mtime(mtime), format_mtime)
 }
 
 fn truncate_chars(s: &str, limit: usize) -> String {
@@ -299,16 +296,14 @@ pub(crate) fn extract_match_context(
             .char_indices()
             .rev()
             .nth(before_chars - 1)
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+            .map_or(0, |(i, _)| i)
     };
 
     // Walk forward from end to find ctx_end_byte (after_chars chars forward)
     let ctx_end_byte = text[end..]
         .char_indices()
         .nth(after_chars)
-        .map(|(i, _)| end + i)
-        .unwrap_or(text.len());
+        .map_or(text.len(), |(i, _)| end + i);
 
     let mut result = String::new();
     if ctx_start_byte > 0 {
@@ -647,7 +642,7 @@ pub fn resolve_fields_with_mmap(
                     prompt_times.push(message.time);
                 }
                 if first_prompt.is_none() && needs_first_prompt {
-                    first_prompt = Some(message.text.clone());
+                    first_prompt = Some(message.text);
                     if !needs_turns {
                         return false;
                     }
@@ -697,8 +692,7 @@ pub fn resolve_fields_with_mmap(
 
         let value = match field {
             Field::Agent => crate::config::find_agent_for_path(path)
-                .map(|a| a.id.clone())
-                .unwrap_or_else(|| plugin.id().to_string()),
+                .map_or_else(|| plugin.id().to_string(), |a| a.id.clone()),
             Field::Origin => if cloud { "cloud" } else { "local" }.into(),
             Field::Coverage if other_cloud => crate::cloud::providers::coverage(path),
             Field::Coverage if cloud => "latest-turn".into(),
