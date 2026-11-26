@@ -1269,7 +1269,11 @@ fn fetch_source(
         {
             Ok(published) => Ok(Some(published)),
             Err(err) if cached.is_some() && source_for_path(&path).is_some() => {
-                eprintln!("Cloud history not refreshed: {}: {err}", source.name());
+                eprintln!(
+                    "Cloud history not refreshed: {}: {}",
+                    source.name(),
+                    crate::output::sanitize_multiline(err)
+                );
                 Ok(Some(path.clone()))
             }
             Err(err) => Err(err),

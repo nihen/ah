@@ -352,7 +352,8 @@ fn output_log(sessions: &[Session], query: &str) {
         }
 
         // Title (like git commit subject line, first line only)
-        let title_line = &sanitize_for_display(title.lines().next().unwrap_or(title));
+        let raw_title_line = title.lines().next().unwrap_or(title);
+        let title_line = &sanitize_title_line(raw_title_line);
         if !title_line.is_empty() {
             println!();
             println!("    {}", title_line);
@@ -360,14 +361,9 @@ fn output_log(sessions: &[Session], query: &str) {
 
         // First prompt (like git commit body, up to 5 lines)
         // Skip if prompt adds nothing beyond the title
-        let prompt_first_line = prompt.lines().next().unwrap_or("");
-        let title_base = title_line.strip_suffix("..").unwrap_or(title_line.as_str());
-        let prompt_redundant = prompt.is_empty()
-            || prompt == title_line.as_str()
-            || prompt_first_line.starts_with(title_base);
-        if !prompt_redundant {
+        let prompt_text = sanitize_multiline(prompt);
+        if !prompt_is_redundant(&prompt_text, raw_title_line) {
             println!();
-            let prompt_text = sanitize_multiline(prompt);
             let lines: Vec<&str> = prompt_text.lines().collect();
             let truncated = lines.len() > 5;
             for line in lines.iter().take(5) {
@@ -401,6 +397,32 @@ fn output_log(sessions: &[Session], query: &str) {
             }
         }
     }
+}
+
+/// A title line for display. A title truncated with `..` can end inside an
+/// escape sequence, so the marker is put back after sanitizing.
+fn sanitize_title_line(raw: &str) -> String {
+    match raw.strip_suffix("..") {
+        Some(base) => format!("{}..", sanitize_for_display(base)),
+        None => sanitize_for_display(raw),
+    }
+}
+
+/// Whether the first prompt (already sanitized for display) adds nothing to
+/// the title line shown above it. Both sides are compared in the title's
+/// single-line form; the `..` of a truncated title is removed before
+/// sanitizing, since truncation can cut an escape sequence in half. A title
+/// that sanitizes to nothing does not hide the prompt.
+fn prompt_is_redundant(prompt: &str, raw_title_line: &str) -> bool {
+    if prompt.is_empty() {
+        return true;
+    }
+    let title = sanitize_for_display(raw_title_line);
+    let title_base =
+        sanitize_for_display(raw_title_line.strip_suffix("..").unwrap_or(raw_title_line));
+    let first_line = sanitize_for_display(prompt.lines().next().unwrap_or(""));
+    sanitize_for_display(prompt) == title
+        || (!title_base.is_empty() && first_line.starts_with(&title_base))
 }
 
 /// Highlight matching portions in text with ANSI bold yellow.
@@ -1173,6 +1195,29 @@ mod tests {
         assert_eq!(tsv_value("a\u{202E}b", true, escape_tsv), "ab");
         // Values used again, such as session references, keep them.
         assert_eq!(strip_ansi("bidi-\u{202E}.jsonl"), "bidi-\u{202E}.jsonl");
+    }
+
+    #[test]
+    fn test_prompt_is_redundant_compares_sanitized_text() {
+        assert!(prompt_is_redundant(
+            "fix the bug",
+            "\x1b[31mfix the bug\x1b[0m"
+        ));
+        // A TAB is a space in the title.
+        assert!(prompt_is_redundant("col1\tcol2 and more", "col1 col2.."));
+        // Truncation right after an ESC must not eat the `..` marker.
+        assert!(prompt_is_redundant("fix the bug now", "fix the bug\x1b.."));
+        assert_eq!(sanitize_title_line("fix the bug\x1b.."), "fix the bug..");
+        assert_eq!(sanitize_title_line("fix\x1b]8;;http.."), "fix..");
+        assert_eq!(sanitize_title_line("\x1b[1mfix\x1b[0m"), "fix");
+        assert!(prompt_is_redundant(
+            "fix the bug in parser\nmore",
+            "fix the bug.."
+        ));
+        // An empty title (e.g. only escape sequences) does not hide the prompt.
+        assert!(!prompt_is_redundant("real prompt", ""));
+        assert!(!prompt_is_redundant("real prompt", ".."));
+        assert!(prompt_is_redundant("", "title"));
     }
 
     #[test]

@@ -54,7 +54,7 @@ fn main() {
         color::init_color(false, true);
         color::init_debug(cli.filter.debug);
         if let Err(e) = mcp::serve(cli.filter, &cli.ia) {
-            eprintln!("{}", e);
+            eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
             process::exit(1);
         }
         return;
@@ -105,7 +105,7 @@ fn main() {
     // picker uses display-only resolve opts), show = true (query-aware).
     let allow_matched_here = matches!(&cli.command, Commands::Show(_));
     if let Err(e) = ia.parse_display_fields(allow_matched_here) {
-        eprintln!("{}", e);
+        eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
         process::exit(1);
     }
 
@@ -152,7 +152,7 @@ fn main() {
     match cli.command {
         Commands::Search(args) => {
             if let Err(e) = search_hits::run(args, filter, &ia) {
-                eprintln!("{}", e);
+                eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                 process::exit(1);
             }
         }
@@ -168,19 +168,19 @@ fn main() {
             }
             if ia.interactive {
                 if let Err(e) = fuzzy::run_log(&search_args, &ia, &filter) {
-                    eprintln!("{}", e);
+                    eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                     process::exit(1);
                 }
             } else {
                 let args = match Args::from_search_args(search_args, &filter) {
                     Ok(a) => a,
                     Err(e) => {
-                        eprintln!("{}", e);
+                        eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                         process::exit(1);
                     }
                 };
                 if let Err(e) = run_search(args, &filter) {
-                    eprintln!("{}", e);
+                    eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                     process::exit(1);
                 }
             }
@@ -188,22 +188,22 @@ fn main() {
         Commands::Show(args) => {
             if ia.interactive {
                 if let Err(e) = fuzzy::run_show(&args, &ia, &filter) {
-                    eprintln!("{}", e);
+                    eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                     process::exit(1);
                 }
             } else if let Err(e) = show::run(args, &filter) {
-                eprintln!("{}", e);
+                eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                 process::exit(1);
             }
         }
         Commands::Resume(args) => {
             if ia.interactive {
                 if let Err(e) = fuzzy::run_resume(&args, &ia, &filter) {
-                    eprintln!("{}", e);
+                    eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                     process::exit(1);
                 }
             } else if let Err(e) = resume::run(args, &filter) {
-                eprintln!("{}", e);
+                eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                 process::exit(1);
             }
         }
@@ -231,19 +231,19 @@ fn main() {
             }
             if ia.interactive {
                 if let Err(e) = fuzzy::run_project(&args, &ia, &filter) {
-                    eprintln!("{}", e);
+                    eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                     process::exit(1);
                 }
             } else {
                 let resolved = match ListProjectsResolvedArgs::from_args(args) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("{}", e);
+                        eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                         process::exit(1);
                     }
                 };
                 if let Err(e) = run_list_projects(resolved, &filter) {
-                    eprintln!("{}", e);
+                    eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                     process::exit(1);
                 }
             }
@@ -260,32 +260,32 @@ fn main() {
             }
             if ia.interactive {
                 if let Err(e) = fuzzy::run_memory(&args, &ia, &filter) {
-                    eprintln!("{}", e);
+                    eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                     process::exit(1);
                 }
             } else {
                 let resolved = match cli::MemoryResolvedArgs::from_args(args) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("{}", e);
+                        eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                         process::exit(1);
                     }
                 };
                 if let Err(e) = memory::run(resolved, &filter) {
-                    eprintln!("{}", e);
+                    eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                     process::exit(1);
                 }
             }
         }
         Commands::Stats(args) => {
             if let Err(e) = stats::run(&args, &filter) {
-                eprintln!("{}", e);
+                eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                 process::exit(1);
             }
         }
         Commands::Agent(agent_args) => {
             if let Err(e) = agent_stats::run(&filter, agent_args.output_format()) {
-                eprintln!("{}", e);
+                eprintln!("{}", crate::output::sanitize_multiline(&e.to_string()));
                 process::exit(1);
             }
         }

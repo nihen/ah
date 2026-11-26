@@ -230,8 +230,8 @@ fn warn_once(db: &Path, err: &str) {
         let _ = writeln!(
             std::io::stderr(),
             "ah: opencode: cannot read {}: {}",
-            db.display(),
-            err
+            crate::output::sanitize_for_display(&db.to_string_lossy()),
+            crate::output::sanitize_for_display(err)
         );
     }
 }
