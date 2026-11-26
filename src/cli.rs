@@ -76,10 +76,11 @@ fn parse_time_spec(s: &str) -> Result<SystemTime, String> {
 /// Seconds before now of a relative spec (`12h`, `3d`, `1w`, `2m` = 60 days).
 fn parse_relative(s: &str) -> Option<i64> {
     let s = s.trim();
-    if s.len() < 2 {
+    let (last, _) = s.char_indices().next_back()?;
+    let (num_str, unit) = s.split_at(last);
+    if num_str.is_empty() {
         return None;
     }
-    let (num_str, unit) = s.split_at(s.len() - 1);
     let n: i64 = num_str.parse().ok()?;
     let unit_secs: i64 = match unit {
         "h" => 3600,
@@ -2253,6 +2254,8 @@ mod tests {
             "9223372036854775807w",
             "",
             "d",
+            "1日",
+            "日",
         ] {
             assert!(parse_time_spec(bad).is_err(), "{bad}");
         }

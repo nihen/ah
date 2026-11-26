@@ -7,15 +7,47 @@ use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
 
 /// The local time zone (`TZ`, else the system setting), read once per run.
-static LOCAL: LazyLock<TimeZone> = LazyLock::new(TimeZone::system);
+static LOCAL: LazyLock<TimeZone> = LazyLock::new(|| {
+    TimeZone::try_system()
+        .ok()
+        .or_else(etc_localtime)
+        .unwrap_or(TimeZone::UTC)
+});
+
+/// `/etc/localtime`, which applies when `TZ` names no usable zone (jiff
+/// would otherwise fall back to UTC, unlike the C library and chrono).
+fn etc_localtime() -> Option<TimeZone> {
+    const PATH: &str = "/etc/localtime";
+    if let Ok(target) = std::fs::read_link(PATH)
+        && let Some((_, name)) = target.to_str().and_then(|t| t.split_once("zoneinfo/"))
+        && let Ok(tz) = TimeZone::get(name)
+    {
+        return Some(tz);
+    }
+    TimeZone::tzif("Local", &std::fs::read(PATH).ok()?).ok()
+}
 
 pub fn local_tz() -> &'static TimeZone {
     &LOCAL
 }
 
-/// Parse an RFC 3339 timestamp such as `2026-09-27T02:34:43.613+00:00`.
+/// Parse a timestamp with an offset, such as RFC 3339
+/// `2026-09-27T02:34:43.613+00:00`. jiff's Temporal parser also takes a few
+/// related ISO 8601 forms (`+0900`, `[Asia/Tokyo]`). Fractional seconds past
+/// nanoseconds are truncated, as chrono did.
 pub fn parse_rfc3339(s: &str) -> Option<Timestamp> {
-    s.parse().ok()
+    if let Ok(ts) = s.parse() {
+        return Some(ts);
+    }
+    let dot = s.find('.')?;
+    let digits = s[dot + 1..].bytes().take_while(u8::is_ascii_digit).count();
+    if digits <= 9 {
+        return None;
+    }
+    let mut truncated = String::with_capacity(s.len());
+    truncated.push_str(&s[..dot + 10]);
+    truncated.push_str(&s[dot + 1 + digits..]);
+    truncated.parse().ok()
 }
 
 /// Local date and time of Unix seconds; `None` when out of range.
@@ -59,7 +91,22 @@ mod tests {
             parse_rfc3339("2026-09-27 02:34:43Z").map(|t| t.as_second()),
             Some(utc.as_second())
         );
-        for bad in ["", "2026-09-27", "2026-09-27T02:34:43", "not a time"] {
+        assert_eq!(
+            parse_rfc3339("2026-09-27T02:34:43.6130000001234Z"),
+            parse_rfc3339("2026-09-27T02:34:43.613Z")
+        );
+        assert_eq!(
+            parse_rfc3339("2026-09-27T11:34:43.613000000999+09:00"),
+            Some(utc)
+        );
+        for bad in [
+            "",
+            "2026-09-27",
+            "2026-09-27T02:34:43",
+            "not a time",
+            "2026-09-27T02:34:43.1234567890",
+            "1.2345678901",
+        ] {
             assert_eq!(parse_rfc3339(bad), None, "{bad}");
         }
     }
