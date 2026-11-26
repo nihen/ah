@@ -76,13 +76,14 @@ impl ClaudePlugin {
     /// The cwd as `extract_cwd_from_bytes` finds it, read from the first
     /// `CWD_HEAD_BYTES` of the file without mapping it. `None` when those
     /// bytes do not decide it: the file is longer and its complete lines
-    /// among them name no cwd, or it is not a regular file.
+    /// among them name no cwd.
     fn cwd_from_head(path: &Path) -> Option<Option<String>> {
         use std::io::Read;
         let file = std::fs::File::open(path).ok()?;
-        // Reading a FIFO or a device could block; the mapping path skips them.
+        // Reading a FIFO or a device could block, and so could opening it
+        // again to map it: such a path has no cwd.
         if !file.metadata().ok()?.is_file() {
-            return None;
+            return Some(None);
         }
         let mut head = Vec::with_capacity(CWD_HEAD_BYTES);
         file.take(CWD_HEAD_BYTES as u64)
