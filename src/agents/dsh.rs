@@ -594,7 +594,7 @@ impl AgentPlugin for DshPlugin {
         let agents_home = std::env::var("DSH_AGENTS_HOME")
             .ok()
             .filter(|dir| !dir.trim().is_empty())
-            .map(PathBuf::from);
+            .map(|dir| agents_home_path(&dir, home));
         if let Some(dir) = agents_home.as_ref().filter(|dir| **dir != shared) {
             sources.push(MemorySource::new(
                 dir,
@@ -627,6 +627,17 @@ impl AgentPlugin for DshPlugin {
             header.get("origin").and_then(|v| v.as_str()) == Some("subagent")
                 || header_str(&header, "parentSession").is_some()
         })
+    }
+}
+
+/// A configured `DSH_AGENTS_HOME`, with the leading `~` dsh expands.
+fn agents_home_path(dir: &str, home: &Path) -> PathBuf {
+    match dir.strip_prefix('~') {
+        Some("") => home.to_path_buf(),
+        Some(rest) if rest.starts_with(['/', '\\']) => {
+            home.join(rest.trim_start_matches(['/', '\\']))
+        }
+        _ => PathBuf::from(dir),
     }
 }
 
@@ -927,6 +938,20 @@ mod tests {
         assert_eq!(messages(&path).len(), 2);
         fs::write(&path, compressed()).unwrap();
         assert_eq!(messages(&path).len(), 4);
+    }
+
+    #[test]
+    fn agents_home_expands_a_leading_tilde() {
+        let home = Path::new("/home/me");
+        assert_eq!(agents_home_path("~", home), home);
+        assert_eq!(agents_home_path("~/custom", home), home.join("custom"));
+        assert_eq!(
+            agents_home_path("/srv/agents", home),
+            Path::new("/srv/agents")
+        );
+        assert_eq!(agents_home_path("~//custom", home), home.join("custom"));
+        assert_eq!(agents_home_path("~\\custom", home), home.join("custom"));
+        assert_eq!(agents_home_path("~other/x", home), Path::new("~other/x"));
     }
 
     #[cfg(unix)]
