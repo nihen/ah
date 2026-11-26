@@ -955,23 +955,17 @@ impl AgentPlugin for OpencodePlugin {
             .collect();
         // The service a client of opencode 2 shares, or else one a client
         // started for itself with `--standalone`, which writes no state
-        // file. A busy row counts from the start of the service, or, where
-        // that cannot be read, from when it wrote its state file.
-        let state_file = state.join("opencode/service.json");
-        let service = service_pid(&state_file)
-            .map(|pid| {
-                let started = super::common::process_start_time(pid)
-                    .or_else(|| std::fs::metadata(&state_file).ok()?.modified().ok());
-                (pid, started)
-            })
-            .or_else(|| {
-                let (pid, _) = clients
-                    .iter()
-                    .find(|(_, args)| args.iter().any(|arg| arg == "serve"))?;
-                Some((*pid, super::common::process_start_time(*pid)))
-            });
+        // file. A busy row counts from the start of the service: a state
+        // file can outlive its service and name a pid that was reused.
+        let service = service_pid(&state.join("opencode/service.json")).or_else(|| {
+            clients
+                .iter()
+                .find(|(_, args)| is_service(args))
+                .map(|(pid, _)| *pid)
+        });
+        let started = service.and_then(super::common::process_start_time);
         let mut running = Vec::new();
-        if let Some((pid, Some(started))) = service {
+        if let (Some(pid), Some(started)) = (service, started) {
             for db in &dbs {
                 running.extend(
                     busy_sessions(db, started)
@@ -1018,11 +1012,18 @@ impl AgentPlugin for OpencodePlugin {
 
 /// The pid of opencode 2's background service, from the state file it
 /// writes on start (`{"pid": ..., "url": ..., ...}`). The file outlives a
-/// killed service, so the pid must be alive and be opencode.
+/// killed service, so the pid must be alive and be opencode, serving where
+/// its arguments can be read.
 fn service_pid(state_file: &Path) -> Option<u32> {
     let state: serde_json::Value = serde_json::from_slice(&std::fs::read(state_file).ok()?).ok()?;
     let pid = super::common::json_pid(&state, "pid")?;
-    (super::common::is_pid_alive(pid) && is_opencode(pid)).then_some(pid)
+    let serving = super::common::process_args(pid).is_none_or(|args| is_service(&args));
+    (super::common::is_pid_alive(pid) && is_opencode(pid) && serving).then_some(pid)
+}
+
+/// Whether `args` start an opencode service (`opencode serve ...`).
+fn is_service(args: &[String]) -> bool {
+    args.iter().skip(1).any(|arg| arg == "serve")
 }
 
 /// Whether `pid` runs opencode, a native executable named after itself.

@@ -712,7 +712,29 @@ pub fn process_start_time(pid: u32) -> Option<SystemTime> {
             + std::time::Duration::from_nanos((ticks % hz) * 1_000_000_000 / hz);
         Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(btime) + since_boot)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                i32::try_from(pid).ok()?,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        if read != size {
+            return None;
+        }
+        let micros = u32::try_from(info.pbi_start_tvusec).ok()?;
+        Some(
+            SystemTime::UNIX_EPOCH
+                + std::time::Duration::new(info.pbi_start_tvsec, micros.checked_mul(1000)?),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid;
         None
@@ -1110,6 +1132,18 @@ mod tests {
         let map = parse_proc_locks(text);
         assert_eq!(map.get(&(0x103, 0x02, 23794220)), Some(&165470));
         assert_eq!(map.len(), 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn this_process_has_a_name_and_a_start_time() {
+        let pid = std::process::id();
+        let started = process_start_time(pid).unwrap();
+        let age = std::time::SystemTime::now()
+            .duration_since(started)
+            .unwrap();
+        assert!(age < std::time::Duration::from_secs(3600), "{age:?}");
+        assert!(!process_name(pid).unwrap().is_empty());
     }
 
     #[test]
