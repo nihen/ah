@@ -280,6 +280,9 @@ fn immutable_stamp(db: &Path) -> Option<(SystemTime, u64)> {
     Some((meta.modified().ok()?, meta.len()))
 }
 
+/// How long a query waits for a database that is locked.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Open `db` without writing anything next to it. A WAL database whose
 /// `-wal` file is absent is fully checkpointed, so it is opened as
 /// immutable; opening it normally would create `-wal`/`-shm` files (and
@@ -295,8 +298,7 @@ fn open_read_only(db: &Path) -> Result<CachedConnection, String> {
         None => Connection::open_with_flags(db, flags),
     }
     .map_err(|e| e.to_string())?;
-    conn.busy_timeout(Duration::from_secs(5))
-        .map_err(|e| e.to_string())?;
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| e.to_string())?;
     Ok(CachedConnection {
         conn,
         immutable_stamp: stamp,
@@ -954,11 +956,12 @@ impl AgentPlugin for OpencodePlugin {
             .filter(|pid| is_opencode(*pid))
             .filter_map(|pid| Some((pid, super::common::process_args(pid)?)))
             .collect();
-        // The service of a database is the one its channel's state file
-        // names, or one a client started for itself with `--standalone`,
-        // which writes no state file. Where its open files can be listed it
-        // must have the database open: a service of another channel or of
-        // another data directory says nothing about this one's rows.
+        // The services of a database are the one its channel's state file
+        // names and those clients started for themselves with
+        // `--standalone`, which write no state file. Where its open files
+        // can be listed a service must have the database open: one of
+        // another channel or of another data directory says nothing about
+        // this one's rows.
         let serving: Vec<u32> = clients
             .iter()
             .filter(|(_, args)| is_service(args))
@@ -974,31 +977,35 @@ impl AgentPlugin for OpencodePlugin {
                 continue;
             };
             let has_open = |pid: u32| super::common::process_has_open(pid, db);
-            let service = service_pid(&state.join(format!("opencode/service{channel}.json")))
-                .filter(|pid| has_open(*pid) != Some(false))
-                .or_else(|| {
-                    serving
-                        .iter()
-                        .copied()
-                        .find(|pid| has_open(*pid) == Some(true))
-                });
-            // A busy row counts from the start of the service: a state file
-            // can outlive its service and name a pid that was reused.
-            let Some((pid, started)) =
-                service.and_then(|pid| Some((pid, super::common::process_start_time(pid)?)))
+            let mut services: Vec<u32> =
+                service_pid(&state.join(format!("opencode/service{channel}.json")))
+                    .filter(|pid| has_open(*pid) != Some(false))
+                    .into_iter()
+                    .collect();
+            for pid in &serving {
+                if !services.contains(pid) && has_open(*pid) == Some(true) {
+                    services.push(*pid);
+                }
+            }
+            // A busy row counts from the start of the oldest service: a
+            // state file can outlive its service and name a pid that was
+            // reused. With several services, whose turn it is is unknown.
+            let Some(started) = services
+                .iter()
+                .map(|pid| super::common::process_start_time(*pid))
+                .collect::<Option<Vec<_>>>()
+                .and_then(|starts| starts.into_iter().min())
             else {
                 continue;
             };
-            running.extend(
-                busy_sessions(db, started)
-                    .into_iter()
-                    .map(|id| (id, Some(pid))),
-            );
+            let pid = (services.len() == 1).then(|| services[0]);
+            running.extend(busy_sessions(db, started).into_iter().map(|id| (id, pid)));
         }
         for (pid, args) in &clients {
             if let Some(id) = client_session(args) {
-                if !running.iter().any(|(known, _)| known == id) {
-                    running.push((id.to_string(), Some(*pid)));
+                match running.iter_mut().find(|(known, _)| known == id) {
+                    Some((_, owner)) => *owner = owner.or(Some(*pid)),
+                    None => running.push((id.to_string(), Some(*pid))),
                 }
             }
         }
@@ -1054,29 +1061,39 @@ fn is_opencode(pid: u32) -> bool {
 
 /// Sessions of opencode 2 with a turn in progress: `time_busy` is set when a
 /// turn starts and `time_idle` when it ends. A row left busy by a service
-/// that died mid-turn is older than the service now running (`started`).
+/// that died mid-turn is older than the services now running, the oldest of
+/// which began at `started`.
 fn busy_sessions(db: &Path, started: SystemTime) -> Vec<String> {
     let started_ms = started
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
     with_connection(db, |conn| {
-        let columns: i64 = conn
-            .prepare_cached(
-                "SELECT count(*) FROM pragma_table_info('session_v2') \
-                 WHERE name IN ('time_busy', 'time_idle')",
-            )?
-            .query_row([], |row| row.get(0))?;
-        if columns != 2 {
-            return Ok(Vec::new());
-        }
-        let mut stmt = conn.prepare_cached(
-            "SELECT id FROM session_v2 \
-             WHERE time_busy > COALESCE(time_idle, 0) AND time_busy >= ?1",
-        )?;
-        let ids = stmt.query_map([started_ms], |row| row.get::<_, String>(0))?;
-        Ok(ids.flatten().filter(|id| is_safe_cli_id(id)).collect())
+        // Every listing waits for this lookup, so it gives up at once on a
+        // database that is locked.
+        conn.busy_timeout(Duration::ZERO)?;
+        let busy = busy_rows(conn, started_ms);
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        busy
     })
     .unwrap_or_default()
+}
+
+fn busy_rows(conn: &Connection, started_ms: i64) -> rusqlite::Result<Vec<String>> {
+    let columns: i64 = conn
+        .prepare_cached(
+            "SELECT count(*) FROM pragma_table_info('session_v2') \
+             WHERE name IN ('time_busy', 'time_idle')",
+        )?
+        .query_row([], |row| row.get(0))?;
+    if columns != 2 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT id FROM session_v2 \
+         WHERE time_busy > COALESCE(time_idle, 0) AND time_busy >= ?1",
+    )?;
+    let ids = stmt.query_map([started_ms], |row| row.get::<_, String>(0))?;
+    Ok(ids.flatten().filter(|id| is_safe_cli_id(id)).collect())
 }
 
 /// The session an opencode client was started on, from its arguments
