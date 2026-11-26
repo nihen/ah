@@ -58,7 +58,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
       - run: chmod +x ah-*/ah-*
       - uses: softprops/action-gh-release@v3
         with:
