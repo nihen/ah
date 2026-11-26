@@ -441,7 +441,9 @@ fn store(
     write(&mut f, header)?;
     let mut has_user = false;
     for (items, role, kind, stamp) in rows {
-        let timestamp = epoch(stamp).map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+        let timestamp = epoch(stamp)
+            .and_then(|t| jiff::Timestamp::try_from(t).ok())
+            .map(|t| t.display_with_offset(jiff::tz::Offset::UTC).to_string());
         for item in items.into_iter().flatten() {
             if item.get("type").and_then(Value::as_str) != Some("message")
                 || item.get("role").and_then(Value::as_str) != Some(role)

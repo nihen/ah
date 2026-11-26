@@ -1125,9 +1125,11 @@ fn copilot_title_time_and_resume() {
     .unwrap();
     // workspace.yaml stops changing early; events.jsonl carries the last activity.
     let at = |rfc3339: &str| -> std::time::SystemTime {
-        chrono::DateTime::parse_from_rfc3339(rfc3339)
+        rfc3339
+            .parse::<jiff::Timestamp>()
             .unwrap()
-            .into()
+            .try_into()
+            .unwrap()
     };
     let set_mtime = |path: &Path, t| {
         fs::File::options()

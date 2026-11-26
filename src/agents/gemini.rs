@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
-use chrono::{Local, NaiveDateTime, TimeZone, Utc};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
@@ -434,17 +433,10 @@ fn assistant_text(content: &serde_json::Value) -> Option<String> {
 }
 
 /// Local time of a session file name's UTC start time (`2026-06-11T02-44`).
-fn file_time_in<Tz: TimeZone>(utc: &str, tz: &Tz) -> Option<String>
-where
-    Tz::Offset: std::fmt::Display,
-{
-    let utc = NaiveDateTime::parse_from_str(utc, "%Y-%m-%dT%H-%M").ok()?;
-    Some(
-        Utc.from_utc_datetime(&utc)
-            .with_timezone(tz)
-            .format("%Y-%m-%d %H:%M")
-            .to_string(),
-    )
+fn file_time_in(utc: &str, tz: &jiff::tz::TimeZone) -> Option<String> {
+    let utc = jiff::civil::DateTime::strptime("%Y-%m-%dT%H-%M", utc).ok()?;
+    let ts = jiff::tz::TimeZone::UTC.to_timestamp(utc).ok()?;
+    Some(tz.to_datetime(ts).strftime("%Y-%m-%d %H:%M").to_string())
 }
 
 /// Title of a `session-*.jsonl` file: the first user prompt as Gemini CLI
@@ -701,7 +693,7 @@ impl AgentPlugin for GeminiPlugin {
     fn resolve_date(&self, path: &Path, mtime: SystemTime) -> Option<String> {
         RE_GEMINI_DATE
             .captures(&path.to_string_lossy())
-            .and_then(|caps| file_time_in(&caps[1], &Local))
+            .and_then(|caps| file_time_in(&caps[1], crate::datetime::local_tz()))
             .or_else(|| Some(format_mtime(mtime)))
     }
 
@@ -1006,14 +998,14 @@ mod tests {
 
     #[test]
     fn file_name_time_is_utc() {
-        let jst = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+        let jst = jiff::tz::TimeZone::fixed(jiff::tz::offset(9));
         assert_eq!(
             file_time_in("2026-06-11T20-44", &jst).as_deref(),
             Some("2026-06-12 05:44")
         );
         assert_eq!(file_time_in("2026-13-01T00-00", &jst), None);
 
-        let expected = file_time_in("2026-06-11T02-44", &Local).unwrap();
+        let expected = file_time_in("2026-06-11T02-44", crate::datetime::local_tz()).unwrap();
         for name in [
             "session-2026-06-11T02-44-acc93477.jsonl",
             "session-2026-06-11T02-44-1-acc93477.jsonl",
