@@ -70,7 +70,7 @@ impl<'a> RecordVisitor<'a> {
             self.prefix.update([0]);
             self.prefix.update((text.len() as u64).to_le_bytes());
             self.prefix.update(text.as_bytes());
-            let fingerprint = format!("{:x}", self.prefix.clone().finalize());
+            let fingerprint = super::common::hex(&self.prefix.clone().finalize());
             (self.visit)(self.record, fragment, kind, text, &fingerprint)
         })
     }
