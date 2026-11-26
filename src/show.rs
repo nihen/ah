@@ -502,11 +502,14 @@ fn run_follow(
         eprintln!(
             "{}--- following {} (Ctrl-C to stop) ---{}",
             DIM,
-            path.display(),
+            crate::output::sanitize_for_display(&path.to_string_lossy()),
             RESET
         );
     } else {
-        eprintln!("--- following {} (Ctrl-C to stop) ---", path.display());
+        eprintln!(
+            "--- following {} (Ctrl-C to stop) ---",
+            crate::output::sanitize_for_display(&path.to_string_lossy())
+        );
     }
 
     // Buffer for incomplete trailing lines across iterations

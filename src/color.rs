@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 // 0 = not initialized, 1 = no color, 2 = color
 static COLOR_MODE: AtomicU8 = AtomicU8::new(0);
 static DEBUG_MODE: AtomicBool = AtomicBool::new(false);
+static COLOR_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Initialize color mode based on flags, env vars, and TTY detection.
 ///
@@ -14,6 +15,7 @@ static DEBUG_MODE: AtomicBool = AtomicBool::new(false);
 pub fn init_color(force_color: bool, no_color: bool) {
     let env_no_color = std::env::var_os("NO_COLOR").is_some();
     let env_force_color = std::env::var("AH_COLOR").is_ok_and(|v| v == "1");
+    COLOR_REQUESTED.store(force_color || env_force_color, Ordering::Relaxed);
 
     let mode = if no_color || env_no_color {
         1
@@ -28,6 +30,12 @@ pub fn init_color(force_color: bool, no_color: bool) {
 /// Check whether colored output should be used.
 pub fn use_color() -> bool {
     COLOR_MODE.load(Ordering::Relaxed) == 2
+}
+
+/// Whether `--color` or `AH_COLOR=1` asked for terminal output, even when
+/// `NO_COLOR` turns the colors off (e.g. an fzf preview under `NO_COLOR`).
+pub fn color_requested() -> bool {
+    COLOR_REQUESTED.load(Ordering::Relaxed)
 }
 
 /// Enable or disable debug mode.

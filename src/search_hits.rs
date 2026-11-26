@@ -429,7 +429,7 @@ fn highlighted_snippet(text: &str, span: Option<[usize; 2]>, colored: bool) -> S
 pub(crate) fn display_text(s: &str) -> String {
     s.chars()
         .flat_map(|c| {
-            if c.is_control() {
+            if c.is_control() || crate::output::is_bidi_control(c) {
                 c.escape_default().collect::<Vec<_>>()
             } else {
                 vec![c]

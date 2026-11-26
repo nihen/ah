@@ -552,7 +552,7 @@ pub fn run_remote_show_meta(
     run_ssh_streaming(remote, &ah_args, |line| {
         let out = retag_remote_show_meta_line(line, &path_idxs, &resume_idxs, remote);
         if terminal {
-            println!("{}", crate::output::strip_ansi(&out));
+            println!("{}", crate::output::strip_ansi_tsv_line(&out));
         } else {
             println!("{}", out);
         }
