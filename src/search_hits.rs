@@ -295,6 +295,7 @@ fn snippet(text: &str, start: usize, end: usize, limit: usize) -> (String, Optio
 fn print_hits(hits: &[SearchHit], args: &MatchSearchArgs) {
     let pretty =
         !args.json && !args.tsv && (crate::pager::is_active() || std::io::stdout().is_terminal());
+    let terminal = !args.json && !pretty && crate::output::terminal_bound();
     let mut previous_path = None;
     for hit in hits {
         if args.json {
@@ -334,7 +335,7 @@ fn print_hits(hits: &[SearchHit], args: &MatchSearchArgs) {
                     hit.position.clone()
                 ]
                 .iter()
-                .map(|v| escape_tsv_lossless(v))
+                .map(|v| crate::output::tsv_value(v, terminal, escape_tsv_lossless))
                 .collect::<Vec<_>>()
                 .join("\t")
             );

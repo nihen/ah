@@ -4,7 +4,7 @@ use crate::agents::common::canonical_home;
 use crate::agents::{self, MessageRole};
 use crate::cli::{FilterArgs, ShowArgs, ShowFormat};
 use crate::color::{self, BOLD, DIM, RESET};
-use crate::output::{strip_ansi, strip_quotes};
+use crate::output::{sanitize_multiline, strip_quotes};
 use crate::remote;
 use crate::resolver;
 use crate::subcmd;
@@ -293,9 +293,18 @@ pub(crate) fn emit_session_meta_tsv(
     // non-path fields stay readable. Paths with literal tabs/newlines (rare
     // but legal on Unix) round-trip via `subcmd::resolve_session_ref`'s
     // raw-first / `unescape_tsv`-fallback ordering.
+    // On a terminal, escape sequences and control characters from session
+    // data are stripped as well; pipes get the values unchanged.
+    let terminal = crate::output::terminal_bound();
     let values: Vec<String> = fields
         .iter()
-        .map(|f| crate::output::escape_tsv(resolved.get(f).map_or("", |s| s.as_str())))
+        .map(|f| {
+            crate::output::tsv_value(
+                resolved.get(f).map_or("", |s| s.as_str()),
+                terminal,
+                crate::output::escape_tsv,
+            )
+        })
         .collect();
     println!("{}", values.join("\t"));
     Ok(())
@@ -353,7 +362,7 @@ fn run_pretty(path: &std::path::Path, head: Option<usize>, hl_re: Option<&regex:
         }
         first = false;
 
-        let text = strip_ansi(&message.text);
+        let text = sanitize_multiline(&message.text);
         let text = if is_tty {
             if let Some(re) = hl_re {
                 highlight_text(&text, re)
@@ -386,8 +395,9 @@ fn run_pretty(path: &std::path::Path, head: Option<usize>, hl_re: Option<&regex:
     if first {
         eprintln!("(only metadata — no conversation messages)");
         eprintln!();
+        // Session data is untrusted: only `--raw` prints it verbatim.
         if let Some(content) = agents::find_plugin_for_path(path).raw_content(path) {
-            print!("{}", content);
+            print!("{}", sanitize_multiline(&content));
         }
     }
 }
@@ -448,7 +458,7 @@ fn md_section(first: bool, role: &str, text: &str) -> String {
         "{}{}\n\n{}\n",
         if first { "" } else { "\n---\n\n" },
         heading,
-        strip_ansi(text)
+        sanitize_multiline(text)
     )
 }
 
@@ -560,7 +570,7 @@ fn run_follow(
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                 for message in plugin.messages_from_value(&val) {
                     println!();
-                    let text = strip_ansi(&message.text);
+                    let text = sanitize_multiline(&message.text);
                     let text = if is_tty {
                         if let Some(re) = hl_re {
                             highlight_text(&text, re)

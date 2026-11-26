@@ -547,9 +547,15 @@ pub fn run_remote_show_meta(
         .enumerate()
         .filter_map(|(i, f)| (*f == Field::ResumeCmd).then_some(i))
         .collect();
+    // The remote writes to a pipe, so strip terminal controls here.
+    let terminal = crate::output::terminal_bound();
     run_ssh_streaming(remote, &ah_args, |line| {
         let out = retag_remote_show_meta_line(line, &path_idxs, &resume_idxs, remote);
-        println!("{}", out);
+        if terminal {
+            println!("{}", crate::output::strip_ansi(&out));
+        } else {
+            println!("{}", out);
+        }
     })
 }
 

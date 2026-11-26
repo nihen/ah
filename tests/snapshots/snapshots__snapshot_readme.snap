@@ -400,6 +400,15 @@ Useful as a shell function — pick a project, browse its sessions, resume:
 ahr() { local d; d="$(ah project -i)" && ah resume -i -d "$d"; }
 ```
 
+### Control characters in session data
+
+Session files can contain terminal escape sequences (colors, hyperlinks, clipboard writes) copied from tool output. `ah` never sends them to the terminal unless asked:
+
+- Human-readable output (the default `log` format, `--table`, `ah show` pretty and `--md`, `--follow`, the `-i` picker) removes escape sequences and control characters, keeping newlines and tabs. A carriage return is dropped unless it ends a line (CRLF becomes LF). `search` and `ah show --at` show control characters as visible escapes such as `\u{1b}` instead.
+- TSV and LTSV (including `ah show -o`) keep their escaping of `\t`, `\n`, `\r` (and `\\` where documented). When stdout is a terminal, the pager, or forced with `--color` (such as an fzf preview), other control characters are removed as well; piped output is unchanged.
+- JSON escapes control characters as JSON requires and keeps the original text.
+- `ah show --raw` prints the session file exactly as stored.
+
 ## Command-line options
 
 ### `ah -h`

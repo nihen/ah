@@ -552,7 +552,11 @@ pub fn render(stats: &Stats, ascii: bool, color: bool) -> Vec<String> {
                     month_name(era.to)
                 )
             };
-            let model = fit(&era.model, MODEL_NAME_WIDTH).replace('…', glyphs.ellipsis);
+            let model = fit(
+                &crate::output::sanitize_for_display(&era.model),
+                MODEL_NAME_WIDTH,
+            )
+            .replace('…', glyphs.ellipsis);
             out.push(format!("   {months:<9} {model}"));
         }
     }
