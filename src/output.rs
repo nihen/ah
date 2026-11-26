@@ -128,8 +128,8 @@ pub fn strip_ansi(s: &str) -> String {
             }
             continue;
         }
-        // C0 controls (except \n \r \t) and DEL
-        if (c as u32 <= 0x1f && c != '\n' && c != '\r' && c != '\t') || c == '\x7f' {
+        // C0 controls (except \n \r \t)
+        if c as u32 <= 0x1f && c != '\n' && c != '\r' && c != '\t' {
             continue;
         }
         // C1 controls
@@ -141,12 +141,13 @@ pub fn strip_ansi(s: &str) -> String {
     result
 }
 
-/// [`strip_ansi`] for display: also drops Unicode bidirectional controls.
+/// [`strip_ansi`] for display: also drops DEL and Unicode bidirectional
+/// controls.
 /// Not for values that are used again, such as session references, where
 /// those characters can be part of a real path.
 pub fn strip_for_display(s: &str) -> String {
     let mut out = strip_ansi(s);
-    out.retain(|c| !is_bidi_control(c));
+    out.retain(|c| c != '\x7f' && !is_bidi_control(c));
     out
 }
 
@@ -1124,7 +1125,10 @@ mod tests {
     fn test_strip_ansi_c0_controls() {
         // NUL, BEL, BS should be stripped; \n \r \t preserved
         assert_eq!(strip_ansi("a\x00b\x07c\x08d"), "abcd");
-        assert_eq!(strip_ansi("left\x7fright"), "leftright");
+        // DEL can be part of a session reference; display helpers drop it.
+        assert_eq!(strip_ansi("left\x7fright"), "left\x7fright");
+        assert_eq!(strip_for_display("left\x7fright"), "leftright");
+        assert_eq!(sanitize_multiline("left\x7fright"), "leftright");
         assert_eq!(strip_ansi("a\nb\rc\td"), "a\nb\rc\td");
     }
 

@@ -3259,6 +3259,13 @@ fn show_opens_session_path_with_bidi_control() {
     write("rollout-2026-03-24T20-43-12-bidi-.jsonl", "the other one");
     let out = stdout_of(&["show", "--json", &bidi]);
     assert!(out.contains("the bidi one"), "{out:?}");
+    let del = write(
+        "rollout-2026-03-24T20-43-12-del-\u{7f}.jsonl",
+        "the del one",
+    );
+    write("rollout-2026-03-24T20-43-12-del-.jsonl", "another one");
+    let out = stdout_of(&["show", "--json", &del]);
+    assert!(out.contains("the del one"), "{out:?}");
 }
 
 #[test]
