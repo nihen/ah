@@ -2,7 +2,7 @@
 name = "ah-cli"
 version = "0.8.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.100"
 license = "MIT"
 repository = "https://github.com/nihen/ah"
 description = "Agent History Search - cross-agent session full-text search CLI"
@@ -27,7 +27,7 @@ regex-syntax = "0.8"
 memchr = "2"
 rayon = "1"
 chrono = "0.4"
-memmap2 = "0.9"
+memmap2 = "0.9.12"
 dirs = "6"
 libc = "0.2"
 sha2 = "0.10"
@@ -35,9 +35,9 @@ hmac = "0.12"
 base64 = "0.23"
 unicode-width = "0.2.2"
 clap_mangen = "0.2.33"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 zstd = { version = "0.14.4", default-features = false }
-ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 tempfile = "3"
 
 [profile.release]
