@@ -3242,6 +3242,28 @@ fn show_meta_tsv_is_unchanged_in_pipes_and_stripped_for_terminals() {
 }
 
 #[test]
+fn show_opens_session_path_with_bidi_control() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join(".codex/sessions/2026/03/24");
+    fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, prompt: &str| {
+        let path = dir.join(name);
+        let session = fs::read_to_string(fixture_path("codex_session.jsonl"))
+            .unwrap()
+            .replace("add redis caching", prompt);
+        fs::write(&path, session).unwrap();
+        path.display().to_string()
+    };
+    let bidi = write(
+        "rollout-2026-03-24T20-43-12-bidi-\u{202E}.jsonl",
+        "the bidi one",
+    );
+    write("rollout-2026-03-24T20-43-12-bidi-.jsonl", "the other one");
+    let out = stdout_of(&["show", "--json", &bidi]);
+    assert!(out.contains("the bidi one"), "{out:?}");
+}
+
+#[test]
 fn log_table_strips_terminal_controls() {
     let (tmp, _path) = hostile_codex_session();
     let assert = ah()

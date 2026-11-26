@@ -136,12 +136,18 @@ pub fn strip_ansi(s: &str) -> String {
         if (0x80..=0x9f).contains(&(c as u32)) {
             continue;
         }
-        if is_bidi_control(c) {
-            continue;
-        }
         result.push(c);
     }
     result
+}
+
+/// [`strip_ansi`] for display: also drops Unicode bidirectional controls.
+/// Not for values that are used again, such as session references, where
+/// those characters can be part of a real path.
+pub fn strip_for_display(s: &str) -> String {
+    let mut out = strip_ansi(s);
+    out.retain(|c| !is_bidi_control(c));
+    out
 }
 
 /// Unicode bidirectional formatting characters (`Bidi_Control`). They
@@ -159,7 +165,7 @@ pub fn is_bidi_control(c: char) -> bool {
 /// so a line cannot rewind the cursor and overwrite what precedes it.
 /// LF and TAB are kept.
 pub fn sanitize_multiline(s: &str) -> String {
-    let stripped = strip_ansi(s);
+    let stripped = strip_for_display(s);
     if !stripped.contains('\r') {
         return stripped;
     }
@@ -181,7 +187,7 @@ pub fn terminal_bound() -> bool {
 /// control characters first when `terminal` is set.
 pub fn tsv_value(s: &str, terminal: bool, escape: fn(&str) -> String) -> String {
     if terminal {
-        escape(&strip_ansi(s))
+        escape(&strip_for_display(s))
     } else {
         escape(s)
     }
@@ -191,7 +197,7 @@ pub fn tsv_value(s: &str, terminal: bool, escape: fn(&str) -> String) -> String 
 /// so an unterminated sequence cannot swallow the tabs after it.
 pub fn strip_ansi_tsv_line(line: &str) -> String {
     line.split('\t')
-        .map(strip_ansi)
+        .map(strip_for_display)
         .collect::<Vec<_>>()
         .join("\t")
 }
@@ -209,7 +215,7 @@ pub fn strip_quotes(s: &str) -> &str {
 /// Sanitize a value for single-line display: strip control sequences,
 /// then replace newlines/tabs with space.
 pub fn sanitize_for_display(s: &str) -> String {
-    let stripped = strip_ansi(s);
+    let stripped = strip_for_display(s);
     stripped
         .replace('\n', " ")
         .replace('\r', "")
@@ -1158,10 +1164,15 @@ mod tests {
     #[test]
     fn test_strip_ansi_bidi_controls() {
         assert_eq!(
-            strip_ansi("run \u{202E}txt.exe\u{202C} \u{2066}x\u{2069}\u{200F}\u{061C}"),
+            strip_for_display("run \u{202E}txt.exe\u{202C} \u{2066}x\u{2069}\u{200F}\u{061C}"),
             "run txt.exe x"
         );
-        assert_eq!(strip_ansi("שלום مرحبا"), "שלום مرحبا");
+        assert_eq!(strip_for_display("שלום مرحبا"), "שלום مرحبا");
+        assert_eq!(sanitize_multiline("a\u{202E}b"), "ab");
+        assert_eq!(sanitize_for_display("a\u{2066}b"), "ab");
+        assert_eq!(tsv_value("a\u{202E}b", true, escape_tsv), "ab");
+        // Values used again, such as session references, keep them.
+        assert_eq!(strip_ansi("bidi-\u{202E}.jsonl"), "bidi-\u{202E}.jsonl");
     }
 
     #[test]

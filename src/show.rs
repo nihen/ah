@@ -212,7 +212,10 @@ fn run_inner(args: ShowArgs, filter: &FilterArgs, check_account: bool) -> Result
             if let Some(content) = plugin.raw_content(&path) {
                 print!("{}", content);
             } else {
-                return Err(format!("Failed to read: {}", path.display()));
+                return Err(format!(
+                    "Failed to read: {}",
+                    crate::output::sanitize_for_display(&path.to_string_lossy())
+                ));
             }
         }
         ShowFormat::Pretty => {
@@ -266,9 +269,12 @@ pub(crate) fn emit_session_meta_tsv(
     let plugin = agents::find_plugin_for_path(path);
     // Fail fast if the file is unreadable so scripts get a non-zero exit
     // instead of plausible-but-empty TSV values.
-    let mtime = plugin
-        .session_mtime(path)
-        .ok_or_else(|| format!("Failed to read session metadata: {}", path.display()))?;
+    let mtime = plugin.session_mtime(path).ok_or_else(|| {
+        format!(
+            "Failed to read session metadata: {}",
+            crate::output::sanitize_for_display(&path.to_string_lossy())
+        )
+    })?;
     // Pass query through to ResolveOpts so the `matched` field can populate
     // for `ah show -q QUERY -o matched`. transcript_limit/title_limit = 0 to
     // avoid truncating fields like `transcript`/`first_prompt`/`title` —
