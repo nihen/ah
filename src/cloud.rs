@@ -88,7 +88,7 @@ fn read_source() -> Result<Source, &'static str> {
         .chain_update(t.account_id.as_bytes())
         .finalize();
     let root = home.join(".ah-codex-cloud");
-    let cache = root.join(format!("{namespace:x}"));
+    let cache = root.join(crate::agents::common::hex(&namespace));
     Ok(Source {
         access_token: t.access_token,
         account: t.account_id,

@@ -16,6 +16,18 @@ pub fn format_mtime(mtime: SystemTime) -> String {
     crate::datetime::format_local_minutes(mtime)
 }
 
+/// Lowercase hex of a digest, as `{:x}` printed it before sha2 0.11. Hashes
+/// end up in search positions and cache paths, so the format must not change.
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
 /// Unix seconds of a timestamp as agents write it: an RFC 3339 string, or a
 /// number of seconds or milliseconds since the epoch.
 pub fn unix_time(val: &serde_json::Value) -> Option<i64> {
@@ -966,6 +978,17 @@ mod tests {
         assert_eq!((list.joined().as_str(), list.last()), ("A,B", "A"));
     }
     use super::*;
+
+    #[test]
+    fn hex_matches_lower_hex_digest_format() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            hex(&Sha256::digest(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(hex(&[0x00, 0x0f, 0xff]), "000fff");
+        assert_eq!(hex(&[]), "");
+    }
 
     #[test]
     fn parse_json_paths_keeps_only_the_paths() {

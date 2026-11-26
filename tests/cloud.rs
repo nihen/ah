@@ -43,7 +43,8 @@ fn cached_cloud_sessions_use_normal_log_search_and_show_but_cannot_resume() {
     auth("owner");
     let key = Sha256::digest(b"owner\0workspace");
     let root = home.path().join(".ah-codex-cloud");
-    let cache = root.join(format!("{key:x}"));
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    let cache = root.join(hex);
     for dir in [&root, &cache] {
         std::fs::DirBuilder::new().mode(0o700).create(dir).unwrap();
     }

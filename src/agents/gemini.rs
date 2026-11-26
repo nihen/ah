@@ -256,7 +256,7 @@ fn resolve_hash_to_path(hash: &str, home: &Path) -> Option<String> {
     fn sha256_hex(s: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(s.as_bytes());
-        format!("{:x}", hasher.finalize())
+        super::common::hex(&hasher.finalize())
     }
 
     // Check home directory itself

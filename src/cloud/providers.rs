@@ -7,7 +7,7 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
@@ -218,14 +218,14 @@ fn sources() -> &'static [Source] {
                     Hmac::<Sha256>::new_from_slice(&key).expect("HMAC accepts 32-byte keys");
                 mac.update(b"claude\0");
                 mac.update(account.to_string().as_bytes());
-                let namespace = mac.finalize().into_bytes();
+                let namespace = crate::agents::common::hex(&mac.finalize().into_bytes());
                 sources.push(Source {
                     kind: Kind::Claude,
                     endpoint: repo.to_string_lossy().into_owned(),
                     authorization: String::new(),
                     helper: Some(helper.clone()),
                     root: root.clone(),
-                    cache: root.join(format!("claude-{namespace:x}")),
+                    cache: root.join(format!("claude-{namespace}")),
                 });
                 continue;
             }
@@ -290,7 +290,7 @@ fn sources() -> &'static [Source] {
             mac.update(endpoint.as_bytes());
             mac.update(&[0]);
             mac.update(value.as_bytes());
-            let namespace = mac.finalize().into_bytes();
+            let namespace = crate::agents::common::hex(&mac.finalize().into_bytes());
             sources.push(Source {
                 kind,
                 endpoint,
@@ -301,7 +301,7 @@ fn sources() -> &'static [Source] {
                 },
                 helper: None,
                 root: root.clone(),
-                cache: root.join(format!("{name}-{namespace:x}")),
+                cache: root.join(format!("{name}-{namespace}")),
             });
         }
         sources.sort_by_key(Source::name);
