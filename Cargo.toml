@@ -34,7 +34,7 @@ sha2 = "0.10"
 hmac = "0.12"
 base64 = "0.23"
 unicode-width = "0.2.2"
-clap_mangen = "0.2.33"
+clap_mangen = "0.3.4"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 zstd = { version = "0.14.4", default-features = false }
 ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
