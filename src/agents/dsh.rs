@@ -562,7 +562,8 @@ impl AgentPlugin for DshPlugin {
     }
 
     fn can_detect_running(&self) -> bool {
-        true
+        // Needs the kernel lock table (`/proc/locks`).
+        cfg!(target_os = "linux")
     }
 
     fn running_sessions(&self) -> Vec<(String, Option<u32>)> {
@@ -654,8 +655,12 @@ fn running_in(
             let pid = *holders.get(&super::common::file_lock_key(
                 &session.join("session.lock"),
             )?)?;
-            let id = session.file_name()?.to_str()?;
-            is_safe_cli_id(id).then(|| (id.to_string(), Some(pid)))
+            // The id the session is listed under: its newest log's.
+            let log = dirs(&session)
+                .filter_map(|path| Some((generation(&path)?, path)))
+                .max_by_key(|(generation, _)| *generation)
+                .map_or_else(|| session.join("session.jsonl"), |(_, path)| path);
+            Some((PLUGIN.session_id(&log, Path::new(""))?, Some(pid)))
         })
         .collect()
 }
@@ -938,6 +943,11 @@ mod tests {
         };
         let live = lock("--work--", "session-live");
         lock("--work--", "session-idle");
+        // A session is listed under the id in its newest log's header.
+        let renamed = lock("--work--", "session-dir");
+        let header = |id: &str| format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n");
+        std::fs::write(renamed.with_file_name("session.jsonl"), header("old-id")).unwrap();
+        std::fs::write(renamed.with_file_name("session.v2.jsonl"), header("new-id")).unwrap();
         std::fs::create_dir_all(sessions.join("--work--/session-unlocked")).unwrap();
         std::fs::write(sessions.join("stray-file"), "").unwrap();
 
@@ -947,6 +957,12 @@ mod tests {
         assert_eq!(
             running_in(&sessions, &holders),
             vec![("session-live".to_string(), Some(4242))]
+        );
+        holders.clear();
+        holders.insert(super::super::common::file_lock_key(&renamed).unwrap(), 7);
+        assert_eq!(
+            running_in(&sessions, &holders),
+            vec![("new-id".to_string(), Some(7))]
         );
     }
 

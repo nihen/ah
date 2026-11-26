@@ -340,7 +340,8 @@ impl AgentPlugin for CursorPlugin {
     }
 
     fn can_detect_running(&self) -> bool {
-        true
+        // Needs the kernel lock table (`/proc/locks`).
+        cfg!(target_os = "linux")
     }
 
     fn running_sessions(&self) -> Vec<(String, Option<u32>)> {

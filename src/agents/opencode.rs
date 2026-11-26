@@ -916,7 +916,8 @@ impl AgentPlugin for OpencodePlugin {
     }
 
     fn can_detect_running(&self) -> bool {
-        true
+        // Needs the name and the start time of the service's process.
+        cfg!(any(target_os = "linux", target_os = "macos"))
     }
 
     /// Sessions with a turn in progress in opencode 2's background service,
