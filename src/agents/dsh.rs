@@ -561,15 +561,20 @@ impl AgentPlugin for DshPlugin {
         ])
     }
 
-    /// A subagent's header names the session that started it.
     fn can_detect_running(&self) -> bool {
         true
     }
 
     fn running_sessions(&self) -> Vec<(String, Option<u32>)> {
-        crate::config::resolve_agent_base("dsh")
-            .map(|base| running_in(&base.join("sessions"), &super::common::file_lock_holders()))
-            .unwrap_or_default()
+        let Some(sessions) =
+            crate::config::resolve_agent_base("dsh").map(|base| base.join("sessions"))
+        else {
+            return Vec::new();
+        };
+        if !sessions.is_dir() {
+            return Vec::new();
+        }
+        running_in(&sessions, &super::common::file_lock_holders())
     }
 
     fn can_memory(&self) -> bool {
@@ -578,17 +583,30 @@ impl AgentPlugin for DshPlugin {
 
     fn global_memory_sources(&self, home: &Path) -> Vec<MemorySource> {
         let base = crate::config::resolve_agent_base("dsh").unwrap_or_else(|| home.join(".dsh"));
-        // The second global directory dsh reads (`DSH_AGENTS_HOME`); its
-        // skills are listed as shared ones.
+        let mut sources = vec![
+            MemorySource::new(&base, "AGENTS.md", MemoryKind::Instruction),
+            MemorySource::new(&base, "skills/*/SKILL.md", MemoryKind::Skill),
+        ];
+        // The second global directory dsh reads. The skills of the default
+        // one, `~/.agents`, are listed as shared.
+        let shared = home.join(".agents");
         let agents_home = std::env::var("DSH_AGENTS_HOME")
             .ok()
             .filter(|dir| !dir.trim().is_empty())
-            .map_or_else(|| home.join(".agents"), PathBuf::from);
-        vec![
-            MemorySource::new(&base, "AGENTS.md", MemoryKind::Instruction),
-            MemorySource::new(&agents_home, "AGENTS.md", MemoryKind::Instruction),
-            MemorySource::new(&base, "skills/*/SKILL.md", MemoryKind::Skill),
-        ]
+            .map(PathBuf::from);
+        if let Some(dir) = agents_home.as_ref().filter(|dir| **dir != shared) {
+            sources.push(MemorySource::new(
+                dir,
+                "skills/*/SKILL.md",
+                MemoryKind::Skill,
+            ));
+        }
+        sources.push(MemorySource::new(
+            agents_home.as_deref().unwrap_or(&shared),
+            "AGENTS.md",
+            MemoryKind::Instruction,
+        ));
+        sources
     }
 
     fn project_memory_sources(&self, dir: &Path) -> Vec<MemorySource> {
@@ -598,6 +616,7 @@ impl AgentPlugin for DshPlugin {
         ]
     }
 
+    /// A subagent's header names the session that started it.
     fn parent_session_id(&self, path: &Path) -> Option<String> {
         header_str(&read_header(path)?, "parentSession")
     }

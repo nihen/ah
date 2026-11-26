@@ -810,6 +810,34 @@ pub fn process_args(pid: u32) -> Option<Vec<String>> {
     }
 }
 
+/// The name of a running process: the basename of its executable, cut to 15
+/// bytes on Linux. `None` where it cannot be read.
+pub fn process_name(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        Some(comm.trim_end_matches('\n').to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut name = [0u8; 256];
+        let len = unsafe {
+            libc::proc_name(
+                i32::try_from(pid).ok()?,
+                name.as_mut_ptr().cast(),
+                name.len() as u32,
+            )
+        };
+        let len = usize::try_from(len).ok().filter(|len| *len > 0)?;
+        Some(String::from_utf8_lossy(name.get(..len)?).into_owned())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Every process id. Empty where the process table cannot be listed.
 pub fn all_pids() -> Vec<u32> {
     #[cfg(target_os = "linux")]

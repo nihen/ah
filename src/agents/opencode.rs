@@ -950,20 +950,28 @@ impl AgentPlugin for OpencodePlugin {
             .map_or_else(|| home.join(".local/state"), PathBuf::from);
         let clients: Vec<(u32, Vec<String>)> = super::common::all_pids()
             .into_iter()
+            .filter(|pid| is_opencode(*pid))
             .filter_map(|pid| Some((pid, super::common::process_args(pid)?)))
-            .filter(|(_, args)| is_opencode(args))
             .collect();
-        // A client started with `--standalone` runs a service of its own
-        // that writes no state file.
-        let service = service_pid(&state.join("opencode/service.json")).or_else(|| {
-            clients
-                .iter()
-                .find(|(_, args)| args.iter().any(|arg| arg == "serve"))
-                .map(|(pid, _)| *pid)
-        });
+        // The service a client of opencode 2 shares, or else one a client
+        // started for itself with `--standalone`, which writes no state
+        // file. A busy row counts from the start of the service, or, where
+        // that cannot be read, from when it wrote its state file.
+        let state_file = state.join("opencode/service.json");
+        let service = service_pid(&state_file)
+            .map(|pid| {
+                let started = super::common::process_start_time(pid)
+                    .or_else(|| std::fs::metadata(&state_file).ok()?.modified().ok());
+                (pid, started)
+            })
+            .or_else(|| {
+                let (pid, _) = clients
+                    .iter()
+                    .find(|(_, args)| args.iter().any(|arg| arg == "serve"))?;
+                Some((*pid, super::common::process_start_time(*pid)))
+            });
         let mut running = Vec::new();
-        if let Some(pid) = service {
-            let started = super::common::process_start_time(pid);
+        if let Some((pid, Some(started))) = service {
             for db in &dbs {
                 running.extend(
                     busy_sessions(db, started)
@@ -1008,28 +1016,26 @@ impl AgentPlugin for OpencodePlugin {
     }
 }
 
-/// Search texts of an opencode 2 export line. Only `user` and `assistant`
-/// rows are conversation; reasoning is not searched, as in 1.x. A tool's
-/// output is the text items of `state.content` (the others are files, e.g.
-/// an image as a data URI) and the `message` of `state.error`.
 /// The pid of opencode 2's background service, from the state file it
 /// writes on start (`{"pid": ..., "url": ..., ...}`). The file outlives a
-/// killed service, so the pid must be alive and, where the process can be
-/// inspected, be opencode.
+/// killed service, so the pid must be alive and be opencode.
 fn service_pid(state_file: &Path) -> Option<u32> {
     let state: serde_json::Value = serde_json::from_slice(&std::fs::read(state_file).ok()?).ok()?;
     let pid = super::common::json_pid(&state, "pid")?;
-    let is_opencode = super::common::process_args(pid)
-        .is_none_or(|args| args.iter().any(|arg| arg.contains("opencode")));
-    (super::common::is_pid_alive(pid) && is_opencode).then_some(pid)
+    (super::common::is_pid_alive(pid) && is_opencode(pid)).then_some(pid)
+}
+
+/// Whether `pid` runs opencode, a native executable named after itself.
+fn is_opencode(pid: u32) -> bool {
+    super::common::process_name(pid).is_some_and(|name| name == "opencode")
 }
 
 /// Sessions of opencode 2 with a turn in progress: `time_busy` is set when a
 /// turn starts and `time_idle` when it ends. A row left busy by a service
 /// that died mid-turn is older than the service now running (`started`).
-fn busy_sessions(db: &Path, started: Option<SystemTime>) -> Vec<String> {
+fn busy_sessions(db: &Path, started: SystemTime) -> Vec<String> {
     let started_ms = started
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
     with_connection(db, |conn| {
         let columns: i64 = conn
@@ -1051,21 +1057,10 @@ fn busy_sessions(db: &Path, started: Option<SystemTime>) -> Vec<String> {
     .unwrap_or_default()
 }
 
-/// Whether `args` are those of an opencode process (a native executable, so
-/// the program name is its own).
-fn is_opencode(args: &[String]) -> bool {
-    args.first()
-        .and_then(|program| Path::new(program).file_name())
-        .is_some_and(|name| name == "opencode")
-}
-
 /// The session an opencode client was started on, from its arguments
 /// (`opencode -s <id>`, `opencode --session <id>` or `--session=<id>`).
 fn client_session(args: &[String]) -> Option<&str> {
-    if !is_opencode(args) {
-        return None;
-    }
-    let mut rest = args[1..].iter();
+    let mut rest = args.iter().skip(1);
     while let Some(arg) = rest.next() {
         let id = match arg.as_str() {
             "-s" | "--session" => rest.next().map(String::as_str),
@@ -1078,6 +1073,10 @@ fn client_session(args: &[String]) -> Option<&str> {
     None
 }
 
+/// Search texts of an opencode 2 export line. Only `user` and `assistant`
+/// rows are conversation; reasoning is not searched, as in 1.x. A tool's
+/// output is the text items of `state.content` (the others are files, e.g.
+/// an image as a data URI) and the `message` of `state.error`.
 fn visit_search_record_v2(
     kind: Option<&str>,
     data: &serde_json::Value,
@@ -1308,16 +1307,15 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        let at = |ms| Some(UNIX_EPOCH + Duration::from_millis(ms));
+        let at = |ms| UNIX_EPOCH + Duration::from_millis(ms);
         let mut busy = busy_sessions(&db, at(1000));
         busy.sort();
         assert_eq!(busy, ["ses_again", "ses_busy"]);
-        // Without a start time nothing tells an orphaned row apart.
-        assert_eq!(busy_sessions(&db, None).len(), 3);
+        assert!(busy_sessions(&db, at(5000)).is_empty());
 
         // opencode 1.x keeps no such state.
         let v1 = create_db(tmp.path());
-        assert!(busy_sessions(&v1, None).is_empty());
+        assert!(busy_sessions(&v1, at(0)).is_empty());
     }
 
     #[test]
@@ -1336,7 +1334,6 @@ mod tests {
         assert_eq!(session(&["opencode", "serve", "--service"]), None);
         assert_eq!(session(&["opencode", "-s"]), None);
         assert_eq!(session(&["opencode", "-s", "not-a-session"]), None);
-        assert_eq!(session(&["vim", "-s", "ses_abc"]), None);
         assert_eq!(session(&[]), None);
     }
 

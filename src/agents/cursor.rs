@@ -344,18 +344,17 @@ impl AgentPlugin for CursorPlugin {
     }
 
     fn running_sessions(&self) -> Vec<(String, Option<u32>)> {
-        crate::config::resolve_agent_base("cursor")
-            .map(|base| {
-                running_in(
-                    &base.join("chats"),
-                    &super::common::sqlite_wal_holders(),
-                    |pid| {
-                        super::common::process_args(pid)
-                            .is_some_and(|args| args.iter().any(|arg| arg.contains("cursor-agent")))
-                    },
-                )
-            })
-            .unwrap_or_default()
+        let Some(chats) =
+            crate::config::resolve_agent_base("cursor").map(|base| base.join("chats"))
+        else {
+            return Vec::new();
+        };
+        if !chats.is_dir() {
+            return Vec::new();
+        }
+        running_in(&chats, &super::common::sqlite_wal_holders(), |pid| {
+            super::common::process_args(pid).is_some_and(|args| is_cursor_agent(&args))
+        })
     }
 
     fn can_memory(&self) -> bool {
@@ -555,6 +554,23 @@ fn chats_dir_stamp(chats_dir: &Path) -> (Option<SystemTime>, usize, Option<Syste
     (root_mtime, count, max_sub_mtime)
 }
 
+/// Whether `args` are those of cursor-agent: the program itself, or the
+/// runtime it starts on `.../cursor-agent/versions/<version>/index.js`.
+fn is_cursor_agent(args: &[String]) -> bool {
+    let named = |arg: &String, name: &str| Path::new(arg).file_name().is_some_and(|n| n == name);
+    let Some(program) = args.first() else {
+        return false;
+    };
+    named(program, "cursor-agent")
+        || (named(program, "node")
+            && args[1..].iter().any(|arg| {
+                named(arg, "index.js")
+                    && Path::new(arg)
+                        .components()
+                        .any(|part| part.as_os_str() == "cursor-agent")
+            }))
+}
+
 /// Running sessions from `chats/<hash>/<chat id>/store.db-shm`. cursor-agent
 /// keeps a SQLite connection to a chat's `store.db` open for as long as the
 /// chat is, and with it the shared lock every WAL connection holds on the
@@ -566,7 +582,19 @@ fn running_in(
     holders: &HashMap<(u64, u64, u64), Vec<u32>>,
     is_cursor: impl Fn(u32) -> bool,
 ) -> Vec<(String, Option<u32>)> {
-    if holders.is_empty() {
+    // The files cursor-agent holds open; most hosts have other SQLite
+    // users, and none of their files is a chat.
+    let mut known: HashMap<u32, bool> = HashMap::new();
+    let held: HashMap<(u64, u64, u64), u32> = holders
+        .iter()
+        .filter_map(|(file, pids)| {
+            let pid = pids
+                .iter()
+                .find(|pid| *known.entry(**pid).or_insert_with(|| is_cursor(**pid)))?;
+            Some((*file, *pid))
+        })
+        .collect();
+    if held.is_empty() {
         return Vec::new();
     }
     let dirs = |dir: &Path| {
@@ -579,9 +607,9 @@ fn running_in(
     dirs(chats_dir)
         .flat_map(|hash| dirs(&hash))
         .filter_map(|chat| {
-            let key = super::common::file_lock_key(&chat.join("store.db-shm"))?;
-            let pid = *holders.get(&key)?.iter().find(|pid| is_cursor(**pid))?;
-            Some((chat.file_name()?.to_str()?.to_string(), Some(pid)))
+            let pid = *held.get(&super::common::file_lock_key(&chat.join("store.db-shm"))?)?;
+            let id = chat.file_name()?.to_str()?;
+            is_safe_cli_id(id).then(|| (id.to_string(), Some(pid)))
         })
         .collect()
 }
@@ -777,6 +805,29 @@ mod tests {
         };
         let (live, read, stale) = (shm("chat-live"), shm("chat-read"), shm("chat-stale"));
         fs::create_dir_all(chats.join("deadbeef/chat-new")).unwrap();
+
+        let args = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert!(is_cursor_agent(&args(&[
+            "/home/me/.local/bin/cursor-agent",
+            "--resume",
+            "x"
+        ])));
+        assert!(is_cursor_agent(&args(&[
+            "/opt/node",
+            "--use-system-ca",
+            "/home/me/.local/share/cursor-agent/versions/1/index.js",
+        ])));
+        assert!(!is_cursor_agent(&args(&[
+            "python3",
+            "probe.py",
+            "cursor-agent"
+        ])));
+        assert!(!is_cursor_agent(&args(&[
+            "sqlite3",
+            "/x/cursor-agent/store.db"
+        ])));
+        assert!(!is_cursor_agent(&args(&["node", "/srv/app/index.js"])));
+        assert!(!is_cursor_agent(&[]));
 
         let is_cursor = |pid| pid == 4242;
         let mut holders = HashMap::new();
