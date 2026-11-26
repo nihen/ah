@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
-use chrono::DateTime;
 use regex::Regex;
 
 use super::AgentPlugin;
@@ -46,7 +45,7 @@ impl CopilotPlugin {
     /// A `workspace.yaml` timestamp (RFC 3339, written in UTC).
     fn workspace_time(path: &Path, field: &str) -> Option<SystemTime> {
         let ts = Self::read_workspace_field(path, field)?;
-        DateTime::parse_from_rfc3339(&ts).ok().map(SystemTime::from)
+        crate::datetime::parse_rfc3339(&ts).and_then(|t| SystemTime::try_from(t).ok())
     }
 }
 
@@ -736,9 +735,7 @@ paras: >\n  one\n  two\n\n  three\n";
         let tmp = tempfile::TempDir::new().unwrap();
         let path = session(tmp.path(), "f", WORKSPACE, None);
         let created = PLUGIN.session_created(&path).unwrap();
-        let expected: SystemTime = DateTime::parse_from_rfc3339("2026-09-27T02:34:43.613+00:00")
-            .unwrap()
-            .into();
+        let expected = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1_790_476_483_613);
         assert_eq!(created, expected);
     }
 

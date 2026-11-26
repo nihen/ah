@@ -1125,9 +1125,11 @@ fn copilot_title_time_and_resume() {
     .unwrap();
     // workspace.yaml stops changing early; events.jsonl carries the last activity.
     let at = |rfc3339: &str| -> std::time::SystemTime {
-        chrono::DateTime::parse_from_rfc3339(rfc3339)
+        rfc3339
+            .parse::<jiff::Timestamp>()
             .unwrap()
-            .into()
+            .try_into()
+            .unwrap()
     };
     let set_mtime = |path: &Path, t| {
         fs::File::options()
@@ -3284,4 +3286,24 @@ fn log_table_strips_terminal_controls() {
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert_no_terminal_controls(&out);
     assert!(out.contains("codex-sess-ctl"), "{out:?}");
+}
+
+#[test]
+fn invalid_tz_falls_back_to_system_zone() {
+    let (_tmp, path) = codex_session_copy();
+    let run = |tz: Option<&str>| {
+        let mut cmd = ah();
+        match tz {
+            Some(tz) => cmd.env("TZ", tz),
+            None => cmd.env_remove("TZ"),
+        };
+        let assert = cmd
+            .args(["show", &path, "-o", "modified_at"])
+            .assert()
+            .success();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    };
+    let system = run(None);
+    assert_eq!(run(Some("NoSuch/Zone")), system);
+    assert_eq!(run(Some(":NoSuch/Zone")), system);
 }

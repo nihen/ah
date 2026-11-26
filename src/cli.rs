@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::SystemTime;
 
-use chrono::{Local, NaiveDate, NaiveDateTime, TimeDelta};
 use clap::{Parser, Subcommand};
 use const_format::concatcp;
 
@@ -40,26 +39,32 @@ fn parse_field_list<F: FromStr<Err = String>>(s: &str) -> Result<Vec<F>, String>
 /// Parse a time spec: "2026-03-20", "2026-03-20 15:00", "3d", "1w", "12h"
 fn parse_time_spec(s: &str) -> Result<SystemTime, String> {
     // Try relative: Nd, Nw, Nh, Nm
-    if let Some(delta) = parse_relative(s) {
-        let dt = Local::now() - delta;
-        return Ok(SystemTime::from(dt));
+    if let Some(secs) = parse_relative(s) {
+        let now = SystemTime::now();
+        let delta = std::time::Duration::from_secs(secs.unsigned_abs());
+        let at = if secs >= 0 {
+            now.checked_sub(delta)
+        } else {
+            now.checked_add(delta)
+        };
+        if let Some(at) = at {
+            return Ok(at);
+        }
     }
 
     // Try date-time: "2026-03-20 15:00"
-    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
-        let local = ndt.and_local_timezone(Local).single();
-        if let Some(dt) = local {
-            return Ok(SystemTime::from(dt));
-        }
+    if let Ok(dt) = jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M", s)
+        && let Some(at) = crate::datetime::local_instant(dt)
+    {
+        return Ok(at);
     }
 
     // Try date: "2026-03-20"
-    if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let ndt = nd.and_hms_opt(0, 0, 0).unwrap();
-        let local = ndt.and_local_timezone(Local).single();
-        if let Some(dt) = local {
-            return Ok(SystemTime::from(dt));
-        }
+    if let Ok(date) = jiff::civil::Date::strptime("%Y-%m-%d", s)
+        && let Some(at) =
+            crate::datetime::local_instant(date.to_datetime(jiff::civil::Time::midnight()))
+    {
+        return Ok(at);
     }
 
     Err(format!(
@@ -68,20 +73,23 @@ fn parse_time_spec(s: &str) -> Result<SystemTime, String> {
     ))
 }
 
-fn parse_relative(s: &str) -> Option<TimeDelta> {
+/// Seconds before now of a relative spec (`12h`, `3d`, `1w`, `2m` = 60 days).
+fn parse_relative(s: &str) -> Option<i64> {
     let s = s.trim();
-    if s.len() < 2 {
+    let (last, _) = s.char_indices().next_back()?;
+    let (num_str, unit) = s.split_at(last);
+    if num_str.is_empty() {
         return None;
     }
-    let (num_str, unit) = s.split_at(s.len() - 1);
     let n: i64 = num_str.parse().ok()?;
-    match unit {
-        "h" => TimeDelta::try_hours(n),
-        "d" => TimeDelta::try_days(n),
-        "w" => TimeDelta::try_weeks(n),
-        "m" => n.checked_mul(30).and_then(TimeDelta::try_days),
-        _ => None,
-    }
+    let unit_secs: i64 = match unit {
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        "m" => 30 * 86_400,
+        _ => return None,
+    };
+    n.checked_mul(unit_secs)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -2210,6 +2218,48 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_spec_relative_and_absolute() {
+        let now = SystemTime::now();
+        let ago = |s: &str| now.duration_since(parse_time_spec(s).unwrap()).unwrap();
+        let close = |d: std::time::Duration, secs: u64| d.as_secs().abs_diff(secs) <= 5;
+        assert!(close(ago("12h"), 12 * 3600));
+        assert!(close(ago("3d"), 3 * 86_400));
+        assert!(close(ago("1w"), 7 * 86_400));
+        assert!(close(ago("2m"), 60 * 86_400));
+        assert_eq!(parse_relative("-1d"), Some(-86_400));
+        assert!(parse_time_spec("-1d").unwrap() > now);
+
+        let local = |s: &str| {
+            crate::datetime::local_instant(s.parse::<jiff::civil::DateTime>().unwrap()).unwrap()
+        };
+        assert_eq!(
+            parse_time_spec("2026-03-20").unwrap(),
+            local("2026-03-20T00:00")
+        );
+        assert_eq!(
+            parse_time_spec("2026-03-20 15:00").unwrap(),
+            local("2026-03-20T15:00")
+        );
+        assert_eq!(
+            parse_time_spec("2026-12-31 23:59").unwrap(),
+            local("2026-12-31T23:59")
+        );
+
+        for bad in [
+            "99y",
+            "2026-02-30",
+            "2026-03-20 25:00",
+            "9223372036854775807w",
+            "",
+            "d",
+            "1日",
+            "日",
+        ] {
+            assert!(parse_time_spec(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn test_field_from_str() {

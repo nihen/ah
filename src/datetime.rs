@@ -1,0 +1,167 @@
+//! Date and time helpers shared by parsers and output, on top of `jiff`.
+use std::sync::LazyLock;
+use std::time::SystemTime;
+
+use jiff::Timestamp;
+use jiff::civil::DateTime;
+use jiff::tz::TimeZone;
+
+/// The local time zone (`TZ`, else the system setting), read once per run.
+static LOCAL: LazyLock<TimeZone> = LazyLock::new(|| {
+    TimeZone::try_system()
+        .ok()
+        .or_else(etc_localtime)
+        .unwrap_or(TimeZone::UTC)
+});
+
+/// `/etc/localtime`, which applies when `TZ` names no usable zone (jiff
+/// would otherwise fall back to UTC, unlike the C library and chrono).
+fn etc_localtime() -> Option<TimeZone> {
+    const PATH: &str = "/etc/localtime";
+    if let Ok(target) = std::fs::read_link(PATH)
+        && let Some((_, name)) = target.to_str().and_then(|t| t.split_once("zoneinfo/"))
+        && let Ok(tz) = TimeZone::get(name)
+    {
+        return Some(tz);
+    }
+    TimeZone::tzif("Local", &std::fs::read(PATH).ok()?).ok()
+}
+
+pub fn local_tz() -> &'static TimeZone {
+    &LOCAL
+}
+
+/// Parse a timestamp with an offset, such as RFC 3339
+/// `2026-09-27T02:34:43.613+00:00`. jiff's Temporal parser also takes a few
+/// related ISO 8601 forms (`+0900`, `[Asia/Tokyo]`). Fractional seconds past
+/// nanoseconds are truncated, as chrono did.
+pub fn parse_rfc3339(s: &str) -> Option<Timestamp> {
+    if let Ok(ts) = s.parse() {
+        return Some(ts);
+    }
+    let dot = s.find('.')?;
+    let digits = s[dot + 1..].bytes().take_while(u8::is_ascii_digit).count();
+    if digits <= 9 {
+        return None;
+    }
+    let mut truncated = String::with_capacity(s.len());
+    truncated.push_str(&s[..dot + 10]);
+    truncated.push_str(&s[dot + 1 + digits..]);
+    truncated.parse().ok()
+}
+
+/// Local date and time of Unix seconds; `None` when out of range.
+pub fn local_datetime(unix: i64) -> Option<DateTime> {
+    Timestamp::from_second(unix)
+        .ok()
+        .map(|ts| local_tz().to_datetime(ts))
+}
+
+/// The instant of a local date and time, or `None` when it falls in a DST
+/// gap or repeats in a DST fold.
+pub fn local_instant(dt: DateTime) -> Option<SystemTime> {
+    instant_in(dt, local_tz())
+}
+
+fn instant_in(dt: DateTime, tz: &TimeZone) -> Option<SystemTime> {
+    let ts = tz.to_ambiguous_timestamp(dt).unambiguous().ok()?;
+    SystemTime::try_from(ts).ok()
+}
+
+/// Whole Unix seconds, rounded down like chrono's `timestamp()` (jiff's
+/// `as_second` rounds toward zero, which matters before 1970).
+pub fn unix_seconds(ts: Timestamp) -> i64 {
+    ts.as_second() - i64::from(ts.subsec_nanosecond() < 0)
+}
+
+/// `YYYY-MM-DD HH:MM` in local time. A time outside jiff's range (which ends
+/// at 9999-12-30T22:00Z) shows as its nearest end, not as some other date.
+pub fn format_local_minutes(time: SystemTime) -> String {
+    let ts = Timestamp::try_from(time).unwrap_or(if time > SystemTime::UNIX_EPOCH {
+        Timestamp::MAX
+    } else {
+        Timestamp::MIN
+    });
+    local_tz()
+        .to_datetime(ts)
+        .strftime("%Y-%m-%d %H:%M")
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rfc3339_forms() {
+        let utc = parse_rfc3339("2026-09-27T02:34:43.613+00:00").unwrap();
+        assert_eq!(utc.as_millisecond(), 1_790_476_483_613);
+        assert_eq!(parse_rfc3339("2026-09-27T02:34:43.613Z"), Some(utc));
+        assert_eq!(parse_rfc3339("2026-09-27T11:34:43.613+09:00"), Some(utc));
+        assert_eq!(
+            parse_rfc3339("2026-09-27 02:34:43Z").map(|t| t.as_second()),
+            Some(utc.as_second())
+        );
+        assert_eq!(
+            parse_rfc3339("2026-09-27T02:34:43.6130000001234Z"),
+            parse_rfc3339("2026-09-27T02:34:43.613Z")
+        );
+        assert_eq!(
+            parse_rfc3339("2026-09-27T11:34:43.613000000999+09:00"),
+            Some(utc)
+        );
+        for bad in [
+            "",
+            "2026-09-27",
+            "2026-09-27T02:34:43",
+            "not a time",
+            "2026-09-27T02:34:43.1234567890",
+            "1.2345678901",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn local_times_across_dst() {
+        let ny = TimeZone::get("America/New_York").unwrap();
+        let at = |s: &str| instant_in(s.parse().unwrap(), &ny);
+        let secs = |t: SystemTime| Timestamp::try_from(t).unwrap().as_second();
+        // EST (-05:00) before the March change, EDT (-04:00) after it.
+        assert_eq!(at("2026-03-07T12:00").map(secs), Some(1_772_902_800));
+        assert_eq!(at("2026-03-09T12:00").map(secs), Some(1_773_072_000));
+        // 02:30 is skipped in March and occurs twice in November.
+        assert_eq!(at("2026-03-08T02:30"), None);
+        assert_eq!(at("2026-11-01T01:30"), None);
+        let fall = Timestamp::from_second(1_793_511_000).unwrap();
+        assert_eq!(ny.to_datetime(fall).to_string(), "2026-11-01T01:30:00");
+    }
+
+    #[test]
+    fn unix_seconds_round_down() {
+        let at = |s: &str| unix_seconds(parse_rfc3339(s).unwrap());
+        assert_eq!(at("1969-12-31T23:59:59.500Z"), -1);
+        assert_eq!(at("1970-01-01T00:00:00.500Z"), 0);
+        assert_eq!(at("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(at("1969-12-31T23:59:59Z"), -1);
+    }
+
+    #[test]
+    fn out_of_range_times_format_as_range_ends() {
+        let far = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(300_000_000_000);
+        assert!(format_local_minutes(far).starts_with("9999-12-"));
+        let early = SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(400_000_000_000);
+        assert!(
+            format_local_minutes(early).starts_with("-9999-01-"),
+            "{}",
+            format_local_minutes(early)
+        );
+    }
+
+    #[test]
+    fn out_of_range_seconds_do_not_panic() {
+        assert_eq!(local_datetime(i64::MAX), None);
+        assert_eq!(local_datetime(i64::MIN), None);
+        assert!(local_datetime(0).is_some());
+    }
+}

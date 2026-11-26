@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
-use chrono::{DateTime, Local};
 use memmap2::Mmap;
 use regex::Regex;
 
@@ -14,8 +13,7 @@ pub fn canonical_home() -> PathBuf {
 }
 
 pub fn format_mtime(mtime: SystemTime) -> String {
-    let dt: DateTime<Local> = mtime.into();
-    dt.format("%Y-%m-%d %H:%M").to_string()
+    crate::datetime::format_local_minutes(mtime)
 }
 
 /// Unix seconds of a timestamp as agents write it: an RFC 3339 string, or a
@@ -25,9 +23,9 @@ pub fn unix_time(val: &serde_json::Value) -> Option<i64> {
     // in 1973.
     const MILLIS_FROM: f64 = 1e11;
     match val {
-        serde_json::Value::String(s) => DateTime::parse_from_rfc3339(s)
-            .ok()
-            .map(|dt| dt.timestamp()),
+        serde_json::Value::String(s) => {
+            crate::datetime::parse_rfc3339(s).map(crate::datetime::unix_seconds)
+        }
         serde_json::Value::Number(n) => {
             let n = n.as_f64().filter(|n| n.is_finite() && *n > 0.0)?;
             Some(if n >= MILLIS_FROM { n / 1000.0 } else { n } as i64)

@@ -1,7 +1,8 @@
 //! `ah stats`: one screen that sums up a year of agent sessions.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
+use jiff::ToSpan;
+use jiff::civil::{Date, DateTime};
 use serde::Serialize;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -56,9 +57,9 @@ pub struct Stats {
     pub year: i32,
     /// First and last day with a prompt.
     #[serde(serialize_with = "iso_date")]
-    pub first_day: NaiveDate,
+    pub first_day: Date,
     #[serde(serialize_with = "iso_date")]
-    pub last_day: NaiveDate,
+    pub last_day: Date,
     pub prompts: usize,
     pub sessions: usize,
     pub active_days: usize,
@@ -82,15 +83,15 @@ pub struct Stats {
     pub undated_prompts: usize,
     /// Prompts per day.
     #[serde(serialize_with = "iso_date_keys")]
-    pub days: BTreeMap<NaiveDate, Day>,
+    pub days: BTreeMap<Date, Day>,
 }
 
-fn iso_date<S: serde::Serializer>(date: &NaiveDate, serializer: S) -> Result<S::Ok, S::Error> {
+fn iso_date<S: serde::Serializer>(date: &Date, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.collect_str(date)
 }
 
 fn iso_date_keys<S: serde::Serializer>(
-    days: &BTreeMap<NaiveDate, Day>,
+    days: &BTreeMap<Date, Day>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serializer.collect_map(days.iter().map(|(date, day)| (date.to_string(), day)))
@@ -134,14 +135,11 @@ pub struct SessionInput {
     /// One entry per user prompt (Unix seconds; `None` if not recorded).
     pub prompt_times: Vec<Option<i64>>,
     /// Stands in for the prompts without a time.
-    pub modified: Option<NaiveDateTime>,
+    pub modified: Option<DateTime>,
 }
 
-fn local_time(unix: i64) -> Option<NaiveDateTime> {
-    Local
-        .timestamp_opt(unix, 0)
-        .single()
-        .map(|t| t.naive_local())
+fn local_time(unix: i64) -> Option<DateTime> {
+    crate::datetime::local_datetime(unix)
 }
 
 /// The agent or model with the highest count; ties go to the name that
@@ -169,7 +167,7 @@ pub fn build(year: i32, now: i64, sessions: &[SessionInput]) -> Option<Stats> {
     let mut timed_prompts = 0;
     let mut models: BTreeSet<&str> = BTreeSet::new();
     let mut by_agent: HashMap<&str, (usize, usize)> = HashMap::new();
-    let mut by_day: BTreeMap<NaiveDate, HashMap<&str, usize>> = BTreeMap::new();
+    let mut by_day: BTreeMap<Date, HashMap<&str, usize>> = BTreeMap::new();
     let mut by_month: BTreeMap<u32, HashMap<&str, usize>> = BTreeMap::new();
 
     for session in sessions {
@@ -180,7 +178,10 @@ pub fn build(year: i32, now: i64, sessions: &[SessionInput]) -> Option<Stats> {
             }
             let dated = time.and_then(local_time);
             let stand_in = || session.modified.filter(|at| Some(*at) <= now_local);
-            let Some(at) = dated.or_else(stand_in).filter(|at| at.year() == year) else {
+            let Some(at) = dated
+                .or_else(stand_in)
+                .filter(|at| i32::from(at.year()) == year)
+            else {
                 continue;
             };
             in_year += 1;
@@ -200,7 +201,7 @@ pub fn build(year: i32, now: i64, sessions: &[SessionInput]) -> Option<Stats> {
                 .or_default() += 1;
             if !session.model.is_empty() {
                 *by_month
-                    .entry(at.month())
+                    .entry(at.month() as u32)
                     .or_default()
                     .entry(&session.model)
                     .or_default() += 1;
@@ -221,9 +222,9 @@ pub fn build(year: i32, now: i64, sessions: &[SessionInput]) -> Option<Stats> {
 
     let mut streak = 0;
     let mut run = 0;
-    let mut previous: Option<NaiveDate> = None;
+    let mut previous: Option<Date> = None;
     for day in by_day.keys() {
-        run = if previous.and_then(|p| p.succ_opt()) == Some(*day) {
+        run = if previous.and_then(|p| p.tomorrow().ok()) == Some(*day) {
             run + 1
         } else {
             1
@@ -470,10 +471,10 @@ pub fn render(stats: &Stats, ascii: bool, color: bool) -> Vec<String> {
     let title = format!(" ah wrapped {}", stats.year);
     let range = format!(
         "{} {} {} {} {}",
-        month_name(stats.first_day.month()),
+        month_name(stats.first_day.month() as u32),
         stats.first_day.day(),
         glyphs.dash,
-        month_name(stats.last_day.month()),
+        month_name(stats.last_day.month() as u32),
         stats.last_day.day()
     );
     out.push(format!(
@@ -606,11 +607,16 @@ pub fn render(stats: &Stats, ascii: bool, color: bool) -> Vec<String> {
 /// The year as a grid: one column per week (Monday first), one row per
 /// weekday, shaded by prompts and colored by the day's lead agent.
 fn render_calendar(stats: &Stats, glyphs: &Glyphs, p: &Painter) -> Vec<String> {
-    let Some(jan1) = NaiveDate::from_ymd_opt(stats.year, 1, 1) else {
+    let Some(jan1) = i16::try_from(stats.year)
+        .ok()
+        .and_then(|year| Date::new(year, 1, 1).ok())
+    else {
         return Vec::new();
     };
-    let start = jan1 - Duration::days(jan1.weekday().num_days_from_monday() as i64);
-    let week_of = |day: NaiveDate| ((day - start).num_days() / 7) as usize;
+    // The Monday on or before January 1, as a day offset from it.
+    let start = -i32::from(jan1.weekday().to_monday_zero_offset());
+    let offset = |day: Date| i32::from(day.day_of_year()) - 1;
+    let week_of = |day: Date| ((offset(day) - start) / 7) as usize;
     let weeks = week_of(stats.last_day) + 1;
 
     // Shade by quartile among the active days.
@@ -623,7 +629,7 @@ fn render_calendar(stats: &Stats, glyphs: &Glyphs, p: &Painter) -> Vec<String> {
 
     let mut labels = vec![' '; weeks];
     for month in 1..=12 {
-        let Some(first) = NaiveDate::from_ymd_opt(stats.year, month, 1) else {
+        let Ok(first) = Date::new(jan1.year(), month as i8, 1) else {
             continue;
         };
         let col = week_of(first);
@@ -641,8 +647,11 @@ fn render_calendar(stats: &Stats, glyphs: &Glyphs, p: &Painter) -> Vec<String> {
     for (weekday, label) in ["Mon", "", "Wed", "", "Fri", "", "Sun"].iter().enumerate() {
         let mut row = String::new();
         for week in 0..weeks {
-            let day = start + Duration::days((week * 7 + weekday) as i64);
-            if day.year() != stats.year || day > stats.last_day {
+            let Ok(day) = jan1.checked_add((start + (week * 7 + weekday) as i32).days()) else {
+                row.push(' ');
+                continue;
+            };
+            if day.year() != jan1.year() || day > stats.last_day {
                 row.push(' ');
                 continue;
             }
@@ -664,8 +673,8 @@ fn render_calendar(stats: &Stats, glyphs: &Glyphs, p: &Painter) -> Vec<String> {
     out
 }
 
-fn parse_modified(value: &str) -> Option<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M").ok()
+fn parse_modified(value: &str) -> Option<DateTime> {
+    DateTime::strptime("%Y-%m-%d %H:%M", value).ok()
 }
 
 /// Every session, read through the same pipeline as `ah log` (filters, one
@@ -736,10 +745,12 @@ pub fn run(args: &cli::StatsArgs, filter: &cli::FilterArgs) -> Result<(), String
     if filter.running || filter.prompt_only || filter.raw_search {
         return Err("ah stats does not take --running, -p or --raw-search.".into());
     }
-    let now = Local::now();
-    let year = args.year.unwrap_or_else(|| now.year());
+    let now = jiff::Timestamp::now();
+    let year = args
+        .year
+        .unwrap_or_else(|| i32::from(crate::datetime::local_tz().to_datetime(now).year()));
     let sessions = collect(filter)?;
-    let Some(stats) = build(year, now.timestamp(), &sessions) else {
+    let Some(stats) = build(year, now.as_second(), &sessions) else {
         return Err(format!("No prompts found in {year}."));
     };
     if args.json {
@@ -758,14 +769,14 @@ mod tests {
     use super::*;
 
     fn unix(date: &str, hour: u32) -> Option<i64> {
-        let day = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
-        let at = day.and_hms_opt(hour, 0, 0).unwrap();
+        let day = Date::strptime("%Y-%m-%d", date).unwrap();
+        let at = day.at(hour as i8, 0, 0, 0);
         Some(
-            Local
-                .from_local_datetime(&at)
-                .earliest()
+            crate::datetime::local_tz()
+                .to_ambiguous_timestamp(at)
+                .earlier()
                 .unwrap()
-                .timestamp(),
+                .as_second(),
         )
     }
 
@@ -815,10 +826,7 @@ mod tests {
             .map(|a| (a.agent.as_str(), a.prompts, a.sessions))
             .collect();
         assert_eq!(agents, [("claude", 3, 1), ("codex", 2, 1)]);
-        assert_eq!(
-            stats.days[&NaiveDate::from_ymd_opt(2026, 1, 3).unwrap()].agent,
-            "claude"
-        );
+        assert_eq!(stats.days[&Date::new(2026, 1, 3).unwrap()].agent, "claude");
         assert!(build(2024, later(), &sessions).is_none());
     }
 
@@ -829,10 +837,7 @@ mod tests {
         let stats = build(2026, later(), &[undated]).unwrap();
         assert_eq!(stats.prompts, 2);
         assert_eq!(stats.undated_prompts, 2);
-        assert_eq!(
-            stats.first_day,
-            NaiveDate::from_ymd_opt(2026, 3, 5).unwrap()
-        );
+        assert_eq!(stats.first_day, Date::new(2026, 3, 5).unwrap());
         // No recorded time, no peak hour.
         assert_eq!(stats.peak_hour, None);
         assert!(stats.eras.is_empty());
@@ -971,7 +976,7 @@ mod tests {
         let now = unix("2026-06-01", 0).unwrap();
         let stats = build(2026, now, &sessions).unwrap();
         assert_eq!(stats.prompts, 1);
-        assert_eq!(stats.last_day, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+        assert_eq!(stats.last_day, Date::new(2026, 3, 1).unwrap());
     }
 
     #[test]

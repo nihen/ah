@@ -6,6 +6,7 @@ mod cloud;
 mod collector;
 mod color;
 mod config;
+mod datetime;
 mod fuzzy;
 mod list_agents;
 mod location;

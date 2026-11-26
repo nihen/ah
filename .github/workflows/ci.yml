@@ -37,5 +37,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit@0.23.0
-      # Fails on any RustSec vulnerability in Cargo.lock.
-      - run: cargo audit
+      # Fails on any RustSec vulnerability or warning (unmaintained, yanked,
+      # unsound) in Cargo.lock.
+      - run: cargo audit --deny warnings
