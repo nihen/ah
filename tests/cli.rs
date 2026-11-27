@@ -2111,10 +2111,12 @@ fn memory_keeps_project_attribution_for_symlinked_files() {
     // Project CLAUDE.md is a symlink to the global one.
     fs::write(claude.join("CLAUDE.md"), "global rules\n").unwrap();
     std::os::unix::fs::symlink(claude.join("CLAUDE.md"), a.join("CLAUDE.md")).unwrap();
-    // Two projects share one real AGENTS.md.
-    fs::write(home.join("AGENTS.md"), "shared rules\n").unwrap();
-    std::os::unix::fs::symlink(home.join("AGENTS.md"), a.join("AGENTS.md")).unwrap();
-    std::os::unix::fs::symlink(home.join("AGENTS.md"), b.join("AGENTS.md")).unwrap();
+    // Two projects share one real AGENTS.md: a global rule of the agent.
+    let shared = claude.join("rules/shared.md");
+    fs::create_dir_all(shared.parent().unwrap()).unwrap();
+    fs::write(&shared, "shared rules\n").unwrap();
+    std::os::unix::fs::symlink(&shared, a.join("AGENTS.md")).unwrap();
+    std::os::unix::fs::symlink(&shared, b.join("AGENTS.md")).unwrap();
     // Sessions so that -a discovers both projects.
     for (i, p) in [&a, &b].into_iter().enumerate() {
         let dir = claude.join(format!("projects/p{i}"));
@@ -2155,6 +2157,7 @@ fn memory_keeps_project_attribution_for_symlinked_files() {
     assert_eq!(
         rows,
         vec![
+            "claude\t(global)\tshared.md",
             "claude\tproject_a\tCLAUDE.md",
             "shared\tproject_a\tAGENTS.md"
         ]
@@ -2177,6 +2180,144 @@ fn memory_keeps_project_attribution_for_symlinked_files() {
             "AGENTS.md\n"
         );
     }
+}
+
+#[test]
+fn memory_does_not_follow_project_links_out_of_the_project() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let claude = home.join(".claude");
+    let project = home.join("work/evil");
+    fs::create_dir_all(project.join(".git")).unwrap();
+    fs::write(project.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::create_dir_all(&claude).unwrap();
+    let outside = home.join("secret");
+    fs::create_dir_all(outside.join("skills/s")).unwrap();
+    fs::write(outside.join("env"), "TOKEN=leaked\n").unwrap();
+    fs::write(outside.join("skills/s/SKILL.md"), "TOKEN=leaked-skill\n").unwrap();
+    fs::write(outside.join("o.md"), "TOKEN=leaked-opencode\n").unwrap();
+    // Credentials next to an agent's memory files, and a secret inside the
+    // repository itself, are not memory either.
+    fs::write(
+        claude.join(".credentials.json"),
+        "TOKEN=leaked-credentials\n",
+    )
+    .unwrap();
+    fs::write(project.join(".env"), "TOKEN=leaked-dotenv\n").unwrap();
+    fs::create_dir_all(project.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(
+        claude.join(".credentials.json"),
+        project.join(".claude/CLAUDE.md"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(project.join(".env"), project.join("CLAUDE.local.md")).unwrap();
+    // Links and configuration that point out of the repository.
+    std::os::unix::fs::symlink(outside.join("env"), project.join("AGENTS.md")).unwrap();
+    fs::create_dir_all(project.join(".agents")).unwrap();
+    std::os::unix::fs::symlink(outside.join("skills"), project.join(".agents/skills")).unwrap();
+    std::os::unix::fs::symlink(outside.join("env"), project.join("CLAUDE.md")).unwrap();
+    fs::write(
+        project.join("opencode.json"),
+        format!(
+            r#"{{"instructions":["{}","~/secret/o.md","../../secret/o.md","docs/ok.md"]}}"#,
+            outside.join("o.md").display()
+        ),
+    )
+    .unwrap();
+    // In-repository files are still read, also through a link.
+    fs::create_dir_all(project.join("docs")).unwrap();
+    fs::write(project.join("docs/ok.md"), "inside\n").unwrap();
+    fs::write(project.join("GEMINI.md"), "gemini rules\n").unwrap();
+
+    // A subdirectory may link to a file higher up in the repository.
+    fs::create_dir_all(project.join("sub")).unwrap();
+    fs::write(project.join("parent-rules.md"), "parent rules\n").unwrap();
+    std::os::unix::fs::symlink("../parent-rules.md", project.join("sub/AGENTS.md")).unwrap();
+
+    let run_in = |cwd: &Path, extra: &[&str]| {
+        let assert = ah()
+            .current_dir(cwd)
+            .env("HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("CODEX_HOME", "/nonexistent")
+            .env("GEMINI_CLI_HOME", "/nonexistent")
+            .env("COPILOT_HOME", "/nonexistent")
+            .env("CURSOR_CONFIG_DIR", "/nonexistent")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .args(["memory", "--json", "-o", "agent,name,path,body"])
+            .args(extra)
+            .write_stdin("")
+            .assert();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    };
+    let run = |extra: &[&str]| run_in(&project, extra);
+    let out = run(&[]);
+    assert!(!out.contains("leaked"), "{out}");
+    assert!(out.contains("inside"), "{out}");
+    assert!(out.contains("gemini rules"), "{out}");
+    let skills = run(&["-t", "skill"]);
+    assert!(!skills.contains("leaked"), "{skills}");
+    let sub = run_in(&project.join("sub"), &[]);
+    assert!(sub.contains("parent rules"), "{sub}");
+    assert!(!sub.contains("leaked"), "{sub}");
+}
+
+#[test]
+fn memory_follows_project_links_to_global_rules_kept_elsewhere() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let claude = home.join(".claude");
+    // ~/.claude/rules lives in a dotfiles checkout, and a project links to it.
+    fs::create_dir_all(home.join("dotfiles/rules")).unwrap();
+    fs::write(home.join("dotfiles/rules/style.md"), "style rules\n").unwrap();
+    // A global rule behind a directory link inside the rules.
+    fs::create_dir_all(home.join("shared")).unwrap();
+    fs::write(home.join("shared/linked.md"), "linked rule\n").unwrap();
+    std::os::unix::fs::symlink(home.join("shared"), home.join("dotfiles/rules/dir")).unwrap();
+    // A global rule that is itself a link, in a subdirectory.
+    fs::create_dir_all(home.join("dotfiles/rules/nested")).unwrap();
+    fs::write(home.join("dotfiles/shared.md"), "shared rule\n").unwrap();
+    std::os::unix::fs::symlink(
+        home.join("dotfiles/shared.md"),
+        home.join("dotfiles/rules/nested/alias.md"),
+    )
+    .unwrap();
+    fs::create_dir_all(&claude).unwrap();
+    std::os::unix::fs::symlink(home.join("dotfiles/rules"), claude.join("rules")).unwrap();
+    let project = home.join("work/app");
+    fs::create_dir_all(project.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(claude.join("rules"), project.join(".claude/rules")).unwrap();
+
+    let assert = ah()
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("CLAUDE_CONFIG_DIR", &claude)
+        .env("CODEX_HOME", "/nonexistent")
+        .env("GEMINI_CLI_HOME", "/nonexistent")
+        .env("COPILOT_HOME", "/nonexistent")
+        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["memory", "--tsv", "-o", "agent,project,name"])
+        .write_stdin("")
+        .assert()
+        .success();
+    let mut rows: Vec<String> = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    rows.sort();
+    // Each real file is listed once, under the project that links to it.
+    assert_eq!(
+        rows,
+        [
+            "claude\tapp\talias.md",
+            "claude\tapp\tlinked.md",
+            "claude\tapp\tstyle.md"
+        ]
+    );
 }
 
 #[test]
@@ -2419,6 +2560,7 @@ fn memory_all_scans_repository_root_of_known_cwds() {
     let sub = home.join("repo/sub");
     fs::create_dir_all(&sub).unwrap();
     fs::create_dir_all(home.join("repo/.git")).unwrap();
+    fs::write(home.join("repo/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
     fs::write(home.join("repo/AGENTS.md"), "root rules\n").unwrap();
     // The only known session was started in the subdirectory.
     let project_dir = home.join(".claude/projects/-sub");
@@ -3178,7 +3320,7 @@ fn show_md_strips_terminal_controls() {
     let (_tmp, path) = hostile_codex_session();
     let out = stdout_of(&["show", "--md", &path]);
     assert_no_terminal_controls(&out);
-    assert!(out.contains("## User\n\nRED link"), "{out:?}");
+    assert!(out.contains("## User\n\n```\nRED link"), "{out:?}");
     assert!(out.contains("日本語 **md**"), "{out:?}");
 }
 

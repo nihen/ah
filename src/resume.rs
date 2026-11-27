@@ -301,27 +301,43 @@ mod tests {
         );
     }
 
-    #[test]
-    fn format_remote_resume_command_basic() {
-        let remote = crate::config::RemoteDef {
-            name: "mydev".to_string(),
-            host: "mydev.example.com".to_string(),
-            ah_path: "/usr/local/bin/ah".to_string(),
-        };
-        let cmd = remote::format_remote_resume_command(&remote, "abc123", &[], None);
-        assert_eq!(
-            cmd,
-            "ssh -t -- 'mydev.example.com' '/usr/local/bin/ah' resume 'abc123'"
+    /// Runs a printed command with `ssh` replaced by a stand-in that, like
+    /// OpenSSH, checks the host and hands the joined remaining arguments to
+    /// a shell. The remote `ah` is a script that prints one argument per line.
+    fn run_printed(cmd: &str, dir: &std::path::Path) -> String {
+        let script = format!(
+            "ssh() {{ [ \"$1 $2 $3\" = '-t -- mydev.example.com' ] || exit 9; shift 3; sh -c \"$*\"; }}; {cmd}"
         );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{cmd}");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    fn argv_printer(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("remote ah");
+        std::fs::write(&path, "#!/bin/sh\nfor a; do printf '%s\\n' \"$a\"; done\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
     }
 
     #[test]
-    fn format_remote_resume_command_with_extra_args() {
+    fn format_remote_resume_command_passes_arguments_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
         let remote = crate::config::RemoteDef {
             name: "mydev".to_string(),
             host: "mydev.example.com".to_string(),
-            ah_path: "ah".to_string(),
+            ah_path: argv_printer(tmp.path()),
         };
+        let cmd = remote::format_remote_resume_command(&remote, "abc123", &[], None);
+        assert!(cmd.starts_with("ssh -t -- 'mydev.example.com' "), "{cmd}");
+        assert_eq!(run_printed(&cmd, tmp.path()), "resume\nabc123\n");
+
         let cmd = remote::format_remote_resume_command(
             &remote,
             "abc123",
@@ -329,8 +345,25 @@ mod tests {
             Some("codex"),
         );
         assert_eq!(
-            cmd,
-            "ssh -t -- 'mydev.example.com' 'ah' resume --agent 'codex' 'abc123' -- '--model' 'opus'"
+            run_printed(&cmd, tmp.path()),
+            "resume\n--agent\ncodex\nabc123\n--\n--model\nopus\n"
         );
+    }
+
+    #[test]
+    fn format_remote_resume_command_survives_the_remote_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = crate::config::RemoteDef {
+            name: "mydev".to_string(),
+            host: "mydev.example.com".to_string(),
+            ah_path: argv_printer(tmp.path()),
+        };
+        let hostile = "a b;touch pwned1 $(touch pwned2) `touch pwned3` 'q\" -x\n|touch pwned4";
+        let cmd = remote::format_remote_resume_command(&remote, hostile, &[], None);
+        let out = run_printed(&cmd, tmp.path());
+        for marker in ["pwned1", "pwned2", "pwned3", "pwned4"] {
+            assert!(!tmp.path().join(marker).exists(), "{marker}: {cmd}");
+        }
+        assert_eq!(out, format!("resume\n{hostile}\n"));
     }
 }

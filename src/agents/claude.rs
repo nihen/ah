@@ -471,7 +471,10 @@ impl AgentPlugin for ClaudePlugin {
     }
 
     fn resume_args(&self, path: &Path, home: &Path) -> Option<Vec<String>> {
-        let id = self.resolve_resume_id(path, home)?;
+        // An id starting with `-` would be read as an option by the CLI.
+        let id = self
+            .resolve_resume_id(path, home)
+            .filter(|id| super::common::is_safe_cli_id(id))?;
         Some(vec!["claude".to_string(), "--resume".to_string(), id])
     }
 
@@ -660,6 +663,18 @@ fn running_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn option_like_ids_are_not_resumed() {
+        let home = Path::new("/h");
+        let hostile = Path::new("/h/.claude/projects/-tmp-p/--dangerously-skip-permissions.jsonl");
+        assert_eq!(PLUGIN.resume_args(hostile, home), None);
+        let normal = Path::new("/h/.claude/projects/-tmp-p/sess-1.jsonl");
+        assert_eq!(
+            PLUGIN.resume_args(normal, home),
+            Some(vec!["claude".into(), "--resume".into(), "sess-1".into()])
+        );
+    }
 
     #[test]
     fn subagent_transcripts_are_recognized_by_layout() {

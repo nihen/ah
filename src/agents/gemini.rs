@@ -804,7 +804,10 @@ impl AgentPlugin for GeminiPlugin {
     }
 
     fn resume_args(&self, path: &Path, home: &Path) -> Option<Vec<String>> {
-        let id = self.resolve_resume_id(path, home)?;
+        // An id starting with `-` would be read as an option by the CLI.
+        let id = self
+            .resolve_resume_id(path, home)
+            .filter(|id| super::common::is_safe_cli_id(id))?;
         Some(vec!["gemini".to_string(), "--resume".to_string(), id])
     }
 }
@@ -812,6 +815,24 @@ impl AgentPlugin for GeminiPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn option_like_ids_are_not_resumed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chats = tmp.path().join(".gemini/tmp/proj/chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let hostile = chats.join("session-2026-06-11T02-44-acc93477.jsonl");
+        std::fs::write(
+            &hostile,
+            "{\"sessionId\":\"--yolo\",\"projectHash\":\"h\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            PLUGIN.session_id(&hostile, tmp.path()).as_deref(),
+            Some("--yolo")
+        );
+        assert_eq!(PLUGIN.resume_args(&hostile, tmp.path()), None);
+    }
 
     #[test]
     fn subagent_logs_name_their_parent_and_are_not_resumable() {

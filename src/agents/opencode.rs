@@ -33,8 +33,13 @@ fn opencode_config_dir(home: &Path) -> PathBuf {
 
 /// Files listed in the `instructions` array of `opencode.json` /
 /// `opencode.jsonc` in `dir`. Entries may be globs; relative ones resolve
-/// against `dir`, `~/` against the home directory. URLs are skipped.
-fn configured_instructions(dir: &Path, home: &Path) -> Vec<MemorySource> {
+/// against `dir`, `~/` against the home directory. URLs are skipped. A
+/// project's configuration comes with the repository, so for it (`external`
+/// false) an absolute, `~/` or `..` entry is taken only as a literal path,
+/// not a glob; `ah memory` then reads it only if it resolves inside the
+/// project (or to a global memory file), and a glob cannot make it walk the
+/// rest of the file system.
+fn configured_instructions(dir: &Path, home: &Path, external: bool) -> Vec<MemorySource> {
     let mut sources = Vec::new();
     for name in ["opencode.json", "opencode.jsonc"] {
         let Ok(content) = std::fs::read_to_string(dir.join(name)) else {
@@ -51,6 +56,14 @@ fn configured_instructions(dir: &Path, home: &Path) -> Vec<MemorySource> {
             .filter_map(|v| v.as_str());
         for entry in entries {
             if entry.is_empty() || entry.contains("://") {
+                continue;
+            }
+            if !external
+                && (entry.starts_with("~/")
+                    || Path::new(entry).is_absolute()
+                    || entry.split('/').any(|c| c == ".."))
+                && entry.contains(['*', '?', '['])
+            {
                 continue;
             }
             let source = if let Some(rest) = entry.strip_prefix("~/") {
@@ -739,7 +752,7 @@ impl AgentPlugin for OpencodePlugin {
             MemorySource::new(&config, "AGENTS.md", MemoryKind::Instruction),
             MemorySource::new(&config, "skills/*/SKILL.md", MemoryKind::Skill),
         ];
-        sources.extend(configured_instructions(&config, home));
+        sources.extend(configured_instructions(&config, home, true));
         sources
     }
 
@@ -752,6 +765,7 @@ impl AgentPlugin for OpencodePlugin {
         sources.extend(configured_instructions(
             dir,
             &super::common::canonical_home(),
+            false,
         ));
         sources
     }
@@ -1231,22 +1245,34 @@ mod tests {
         let dir = tmp.path();
         std::fs::write(
             dir.join("opencode.json"),
-            r#"{"instructions":["docs/*.md","~/g.md","/abs/x.md","https://e.com/r.md"]}"#,
+            r#"{"instructions":["docs/*.md","~/g.md","/abs/x.md","https://e.com/r.md","../up.md","a/../../b.md","/etc/**/*.md","~/*.md","../*/x.md"]}"#,
         )
         .unwrap();
         let home = Path::new("/home/u");
-        let patterns: Vec<String> = configured_instructions(dir, home)
-            .iter()
-            .map(MemorySource::pattern)
-            .collect();
-        assert_eq!(
-            patterns,
-            vec![
-                format!("{}/docs/*.md", dir.display()),
-                "/home/u/g.md".to_string(),
-                "/abs/x.md".to_string(),
-            ]
-        );
+        let patterns = |external| -> Vec<String> {
+            configured_instructions(dir, home, external)
+                .iter()
+                .map(MemorySource::pattern)
+                .collect()
+        };
+        let literal = vec![
+            format!("{}/docs/*.md", dir.display()),
+            "/home/u/g.md".to_string(),
+            "/abs/x.md".to_string(),
+            format!("{}/../up.md", dir.display()),
+            format!("{}/a/../../b.md", dir.display()),
+        ];
+        // The user's own (global) configuration may point anywhere.
+        let mut global = literal.clone();
+        global.extend([
+            "/etc/**/*.md".to_string(),
+            "/home/u/*.md".to_string(),
+            format!("{}/../*/x.md", dir.display()),
+        ]);
+        assert_eq!(patterns(true), global);
+        // A project's configuration has no globs outside the project; its
+        // literal paths are checked against the project when read.
+        assert_eq!(patterns(false), literal);
     }
 
     /// Create a minimal opencode database (WAL mode, like opencode itself).

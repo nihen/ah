@@ -28,8 +28,42 @@ fn is_compressed(path: &Path) -> bool {
 }
 
 /// Largest log that is decoded. A log is a few megabytes; the limit keeps a
-/// damaged or hostile file from exhausting memory.
-const MAX_LOG_BYTES: u64 = 1 << 30;
+/// damaged or hostile file (Zstandard compresses a run of one byte about
+/// 30000:1) from exhausting memory, also when threads decode in parallel.
+const MAX_LOG_BYTES: u64 = 64 << 20;
+/// Largest decoded log kept for the next field of the same session. Larger
+/// ones are freed once read, so idle threads (e.g. of `ah mcp`) hold little.
+const MAX_CACHED_BYTES: usize = 8 << 20;
+/// Whole logs decoded at the same time, across threads: with
+/// `MAX_LOG_BYTES` this bounds the text being decoded at once.
+const MAX_PARALLEL_DECODES: usize = 4;
+
+/// Holds one of the `MAX_PARALLEL_DECODES` slots while alive.
+struct DecodeSlot;
+
+static DECODES: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static DECODE_FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+impl DecodeSlot {
+    fn acquire() -> Self {
+        let mut busy = DECODES.lock().unwrap_or_else(|e| e.into_inner());
+        while *busy >= MAX_PARALLEL_DECODES {
+            busy = DECODE_FREED.wait(busy).unwrap_or_else(|e| e.into_inner());
+        }
+        *busy += 1;
+        DecodeSlot
+    }
+}
+
+impl Drop for DecodeSlot {
+    fn drop(&mut self) {
+        *DECODES.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        DECODE_FREED.notify_one();
+    }
+}
+/// How much text listing decodes to find the first prompt, which is in the
+/// first batch of events. Listing visits every log, so this stays small.
+const MAX_PROMPT_SCAN_BYTES: u64 = 16 << 20;
 /// Largest header line that is decoded; a header is a few hundred bytes.
 const MAX_HEADER_BYTES: u64 = 1 << 20;
 
@@ -147,8 +181,13 @@ fn read_log(path: &Path) -> Option<Log> {
     if let Some(bytes) = cached {
         return Some(Log::Decoded(bytes));
     }
-    let bytes = Rc::new(decode_frames(&mmap_file(path)?, usize::MAX, MAX_LOG_BYTES));
-    LAST_DECODED.with_borrow_mut(|last| *last = Some((source, Rc::clone(&bytes))));
+    let data = mmap_file(path)?;
+    let slot = DecodeSlot::acquire();
+    let bytes = Rc::new(decode_frames(&data, usize::MAX, MAX_LOG_BYTES));
+    drop(slot);
+    LAST_DECODED.with_borrow_mut(|last| {
+        *last = (bytes.len() <= MAX_CACHED_BYTES).then(|| (source, Rc::clone(&bytes)));
+    });
     Some(Log::Decoded(bytes))
 }
 
@@ -183,7 +222,7 @@ fn has_prompt(path: &Path) -> bool {
         return holds_prompt(&data);
     }
     let mut found = false;
-    for_each_frame(&data, MAX_LOG_BYTES, |text| {
+    for_each_frame(&data, MAX_PROMPT_SCAN_BYTES, |text| {
         found = holds_prompt(&text);
         !found
     });
@@ -844,6 +883,25 @@ mod tests {
         // One byte short of the second frame: only the header is kept.
         assert_eq!(lines(header_len + turn_1_len - 1), 1);
         assert_eq!(lines(header_len - 1), 0);
+    }
+
+    #[test]
+    fn listing_decodes_a_bounded_prefix_to_find_the_prompt() {
+        assert!(has_prompt(
+            &write_log("session.v4.jsonl.zstd", &compressed()).1
+        ));
+        // A small file that decodes to more than the prompt budget before the
+        // first prompt is not listed, and is not decoded past the budget.
+        let filler = " ".repeat(MAX_PROMPT_SCAN_BYTES as usize + 1);
+        let padding = format!(r#"{{"type":"assistant/attempt","pad":"{filler}"}}"#);
+        let bytes = [frame(&[HEADER]), frame(&[&padding]), frame(TURN_1)].concat();
+        assert!(
+            bytes.len() < 1 << 16,
+            "the test log should be small: {}",
+            bytes.len()
+        );
+        let (_tmp, path) = write_log("session.v4.jsonl.zstd", &bytes);
+        assert!(!has_prompt(&path));
     }
 
     #[test]

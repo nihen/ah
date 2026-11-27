@@ -11,6 +11,13 @@ fi
 
 DEMO_ROOT="/tmp/ah-demo"
 rm -rf "$DEMO_ROOT"
+# The path is fixed because the recordings show it. Create it atomically and
+# private to us: if anyone else created it (or a symlink) after the rm, mkdir
+# fails and the demo stops before anything is written into it.
+if ! mkdir -m 700 "$DEMO_ROOT" || [ -L "$DEMO_ROOT" ] || [ ! -O "$DEMO_ROOT" ]; then
+  echo "setup.sh: cannot create a private $DEMO_ROOT; remove it and retry" >&2
+  return 1 2>/dev/null || exit 1
+fi
 
 # ── Environment variables ──
 export CLAUDE_CONFIG_DIR="$DEMO_ROOT/.claude"
