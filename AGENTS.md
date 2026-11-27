@@ -25,6 +25,10 @@ Keep search and parsing in-process. Remote aggregation uses SSH to run `ah` on t
 
 To reuse an existing parser through configuration, use `[agents.<name>]` in `~/.ahrc`. For a new format, add a parser under `src/agents/` and register it in `src/agents/mod.rs`. Follow the existing plugins and the `AgentPlugin` trait.
 
+## Pull requests
+
+Merge pull requests into `main` with squash (`gh pr merge --squash`), so `main` keeps one commit per pull request, titled `<PR title> (#N)`. This includes release and Dependabot pull requests.
+
 ## Release
 
 Only perform release work when explicitly requested. Create a `release/vX.Y.Z` branch from the latest `origin/main`, update the version in `Cargo.toml`, and open a PR targeting `main`. After the PR is merged into `main`, the workflows create the tag and GitHub Release, publish to crates.io (trusted publishing), and update the Homebrew tap. The publishing jobs run in the `release` environment and wait for the maintainer's approval in GitHub.
