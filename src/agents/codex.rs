@@ -614,7 +614,10 @@ impl AgentPlugin for CodexPlugin {
     }
 
     fn resume_args(&self, path: &Path, home: &Path) -> Option<Vec<String>> {
-        let id = self.resolve_resume_id(path, home)?;
+        // An id starting with `-` would be read as an option by the CLI.
+        let id = self
+            .resolve_resume_id(path, home)
+            .filter(|id| super::common::is_safe_cli_id(id))?;
         Some(vec!["codex".to_string(), "resume".to_string(), id])
     }
 
@@ -774,6 +777,20 @@ mod tests {
             PLUGIN.resolve_title(&session, Path::new("/nonexistent")),
             Some("real".to_string())
         );
+    }
+
+    #[test]
+    fn option_like_ids_are_not_resumed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".codex/sessions/2026/09/27");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-2026-09-27T10-00-00-{ID}.jsonl"));
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"--yolo\",\"cwd\":\"/tmp/p\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(PLUGIN.resume_args(&path, tmp.path()), None);
     }
 
     #[test]
