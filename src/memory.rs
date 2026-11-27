@@ -531,10 +531,7 @@ fn collect_project_files(
     };
     let root = dir_real
         .ancestors()
-        .find(|d| {
-            let git = d.join(".git");
-            git.is_file() || git.join("HEAD").is_file()
-        })
+        .find(|d| is_repository(d))
         .filter(|top| !home.starts_with(top))
         .unwrap_or(&dir_real)
         .to_path_buf();
@@ -604,9 +601,16 @@ fn location_key(path: &Path) -> PathBuf {
 /// Directories whose project files apply to `cwd`: inside a git repository,
 /// every level from `cwd` up to the repository root (agents load
 /// instructions from each of them); otherwise `cwd` alone.
+/// Whether `dir` is the top of a git repository or worktree: an empty
+/// `.git` directory (as can sit in `/tmp`) does not make one.
+fn is_repository(dir: &Path) -> bool {
+    let git = dir.join(".git");
+    git.is_file() || git.join("HEAD").is_file()
+}
+
 fn current_project_dirs(cwd: &str) -> Vec<PathBuf> {
     let dir = PathBuf::from(cwd);
-    match dir.ancestors().position(|d| d.join(".git").exists()) {
+    match dir.ancestors().position(is_repository) {
         // Every level from the directory up to the repository root.
         Some(root) => dir
             .ancestors()
@@ -987,6 +991,24 @@ pub fn run(args: MemoryResolvedArgs, filter: &FilterArgs) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_real_git_directory_makes_a_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join("empty/.git")).unwrap();
+        assert!(!is_repository(&dir.join("empty")));
+        fs::create_dir_all(dir.join("repo/.git")).unwrap();
+        fs::write(dir.join("repo/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert!(is_repository(&dir.join("repo")));
+        fs::create_dir_all(dir.join("worktree")).unwrap();
+        fs::write(dir.join("worktree/.git"), "gitdir: /x\n").unwrap();
+        assert!(is_repository(&dir.join("worktree")));
+        // A directory under an empty `.git` is not part of that "repository".
+        fs::create_dir_all(dir.join("empty/sub")).unwrap();
+        let sub = dir.join("empty/sub");
+        assert_eq!(current_project_dirs(&sub.to_string_lossy()), [sub]);
+    }
 
     #[test]
     fn walk_limits_every_pattern_to_the_boundary() {

@@ -2541,6 +2541,7 @@ fn memory_all_scans_repository_root_of_known_cwds() {
     let sub = home.join("repo/sub");
     fs::create_dir_all(&sub).unwrap();
     fs::create_dir_all(home.join("repo/.git")).unwrap();
+    fs::write(home.join("repo/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
     fs::write(home.join("repo/AGENTS.md"), "root rules\n").unwrap();
     // The only known session was started in the subdirectory.
     let project_dir = home.join(".claude/projects/-sub");
