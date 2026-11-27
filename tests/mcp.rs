@@ -756,7 +756,7 @@ fn show_formats_and_truncation() {
             call(
                 3,
                 "show",
-                json!({"session": JP_SESSION_ID, "max_chars": 12}),
+                json!({"session": JP_SESSION_ID, "max_chars": 16}),
             ),
             call(
                 4,
@@ -777,8 +777,11 @@ fn show_formats_and_truncation() {
     );
     let r1 = by_id(&out, 1);
     let md = r1["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(md.starts_with("## User\n\nfix the auth bug"), "{md}");
-    assert!(md.contains("\n---\n\n## Assistant\n\n"));
+    assert!(
+        md.starts_with("## User\n\n```\nfix the auth bug\n```\n"),
+        "{md}"
+    );
+    assert!(md.contains("\n---\n\n## Assistant\n\n```\n"));
     assert_eq!(r1["result"]["structuredContent"]["markdown"], json!(md));
     assert_eq!(r1["result"]["structuredContent"]["truncated"], json!(false));
 
@@ -793,8 +796,8 @@ fn show_formats_and_truncation() {
     let r3 = by_id(&out, 3);
     let s3 = &r3["result"]["structuredContent"];
     assert_eq!(s3["truncated"], json!(true));
-    assert_eq!(s3["markdown"].as_str().unwrap().chars().count(), 12);
-    assert_eq!(s3["markdown"], json!("## User\n\n日本語"));
+    assert_eq!(s3["markdown"].as_str().unwrap().chars().count(), 16);
+    assert_eq!(s3["markdown"], json!("## User\n\n```\n日本語"));
     assert!(
         r3["result"]["content"][1]["text"]
             .as_str()

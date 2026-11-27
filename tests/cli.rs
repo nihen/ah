@@ -3178,7 +3178,7 @@ fn show_md_strips_terminal_controls() {
     let (_tmp, path) = hostile_codex_session();
     let out = stdout_of(&["show", "--md", &path]);
     assert_no_terminal_controls(&out);
-    assert!(out.contains("## User\n\nRED link"), "{out:?}");
+    assert!(out.contains("## User\n\n```\nRED link"), "{out:?}");
     assert!(out.contains("日本語 **md**"), "{out:?}");
 }
 
