@@ -27,4 +27,4 @@ To reuse an existing parser through configuration, use `[agents.<name>]` in `~/.
 
 ## Release
 
-Only perform release work when explicitly requested. Create a `release/vX.Y.Z` branch from the latest `origin/main`, update the version in `Cargo.toml`, and open a PR targeting `main`. After the PR is merged into `main`, the workflows create the tag and GitHub Release, publish to crates.io, and update the Homebrew tap.
+Only perform release work when explicitly requested. Create a `release/vX.Y.Z` branch from the latest `origin/main`, update the version in `Cargo.toml`, and open a PR targeting `main`. After the PR is merged into `main`, the workflows create the tag and GitHub Release, publish to crates.io (trusted publishing), and update the Homebrew tap. The publishing jobs run in the `release` environment and wait for the maintainer's approval in GitHub.
