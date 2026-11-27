@@ -380,99 +380,9 @@ esac
     );
 }
 
-#[test]
-fn long_untitled_codex_threads_are_fetched_over_refreshes() {
-    const THREAD: &str = "33333333-3333-3333-3333-333333333333";
-    let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path();
-    let codex = home.join(".codex");
-    std::fs::create_dir(&codex).unwrap();
-    let auth = codex.join("auth.json");
-    std::fs::write(
-        &auth,
-        json!({"auth_mode":"chatgpt","tokens":{
-            "access_token":"fixture-only", "account_id":"first","login_owner_id":"owner"
-        }})
-        .to_string(),
-    )
-    .unwrap();
-    std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
-    // An untitled thread whose transcript spans 40 pages (a browser run is
-    // mostly non-message items): one message on the first page, and one on
-    // the last. Cursors are page numbers.
-    let helper = home.join("bridge");
-    std::fs::write(&helper, format!(r#"#!/bin/sh
-req=$(cat)
-case "$req" in
-  *'"id":null'*)
-    printf '%s' '{{"data":[{{"id":"{THREAD}","name":"","created":1700000000,"updated":1700000100}}],"nextCursor":null}}'
-    ;;
-  *'"cursor":null'*)
-    printf '%s' '{{"id":"{THREAD}","messages":[{{"role":"user","text":"\nbrowse the admin page"}}],"nextCursor":"1"}}'
-    ;;
-  *'"cursor":"39"'*)
-    printf '%s' '{{"id":"{THREAD}","messages":[{{"role":"assistant","text":"final browsing report"}}],"nextCursor":null}}'
-    ;;
-  *)
-    n=$(printf '%s' "$req" | sed 's/.*"cursor":"\([0-9]*\)".*/\1/')
-    printf '{{"id":"{THREAD}","messages":[],"nextCursor":"%s"}}' $((n + 1))
-    ;;
-esac
-"#)).unwrap();
-    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::write(
-        home.join(".ahrc"),
-        format!("[cloud.codex_conversations]\nenabled = true\nhelper = {helper:?}\n"),
-    )
-    .unwrap();
-    let log = || {
-        let out = Command::new(env!("CARGO_BIN_EXE_ah"))
-            .env("HOME", home)
-            .env("CODEX_HOME", &codex)
-            .env_remove("AH_NO_CLOUD_SYNC")
-            .current_dir(home)
-            .args([
-                "-a",
-                "log",
-                "--refresh",
-                "--json",
-                "-o",
-                "id,coverage,title,transcript",
-            ])
-            .output()
-            .unwrap();
-        let row: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(row["id"], THREAD);
-        row
-    };
-    // The first refresh reads 32 pages and keeps them; the title is the
-    // first prompt, not empty.
-    let first = log();
-    assert_eq!(first["coverage"], "messages-partial");
-    assert_eq!(
-        first["title"],
-        "[cloud:messages-partial] browse the admin page"
-    );
-    assert!(
-        !first["transcript"]
-            .as_str()
-            .unwrap()
-            .contains("final browsing report")
-    );
-    // The next refresh continues where it stopped instead of failing again.
-    let second = log();
-    assert_eq!(second["coverage"], "messages");
-    let transcript = second["transcript"].as_str().unwrap();
-    assert!(transcript.contains("browse the admin page"), "{transcript}");
-    assert!(transcript.contains("final browsing report"), "{transcript}");
-}
-
-#[test]
-fn codex_app_ids_and_titles_find_cloud_threads() {
-    const THREAD: &str = "44444444-4444-4444-4444-444444444444";
-    const APP_ID: &str = "55555555-5555-5555-5555-555555555555";
-    let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path();
+/// A home with a Codex Cloud login for account `first` and the bridge
+/// `script`, enabled for `codex_conversations`. Returns the Codex home.
+fn codex_cloud_home(home: &std::path::Path, script: &str) -> std::path::PathBuf {
     let codex = home.join(".codex");
     std::fs::create_dir_all(codex.join("sqlite")).unwrap();
     let auth = codex.join("auth.json");
@@ -485,20 +395,140 @@ fn codex_app_ids_and_titles_find_cloud_threads() {
     )
     .unwrap();
     std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
-    // The desktop app lists the thread under its own id, with a title, and
-    // a creation time a fraction of a second off.
-    let conn = rusqlite::Connection::open(codex.join("sqlite/codex.db")).unwrap();
-    conn.execute_batch(&format!(
-        "CREATE TABLE local_thread_catalog (host_id TEXT, thread_id TEXT, display_title TEXT,
-           source_created_at REAL, source_kind TEXT, missing_candidate INTEGER);
-         INSERT INTO local_thread_catalog VALUES
-           ('chatgpt:x', '{APP_ID}', 'Tally settings survey', 1700000000.6, 'chatgpt', 0),
-           ('local', '66666666-6666-6666-6666-666666666666', 'Local', 1700000000.2, 'cli', 0);"
-    ))
-    .unwrap();
-    drop(conn);
     let helper = home.join("bridge");
-    std::fs::write(&helper, format!(r#"#!/bin/sh
+    std::fs::write(&helper, script).unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        home.join(".ahrc"),
+        format!("[cloud.codex_conversations]\nenabled = true\nhelper = {helper:?}\n"),
+    )
+    .unwrap();
+    codex
+}
+
+fn ah_in(home: &std::path::Path, codex: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_ah"))
+        .env("HOME", home)
+        .env("CODEX_HOME", codex)
+        .env_remove("AH_NO_CLOUD_SYNC")
+        .current_dir(home)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn long_untitled_codex_threads_are_fetched_over_refreshes() {
+    const THREAD: &str = "33333333-3333-3333-3333-333333333333";
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    // An untitled thread whose transcript spans 40 pages (a browser run is
+    // mostly non-message items): one message on the first page and one on
+    // the last; cursors are page numbers. Files switch the bridge's
+    // behavior: `expired` rejects every saved cursor, `updated` moves the
+    // thread's update time.
+    let expired = home.join("expired");
+    let updated = home.join("updated");
+    let script = format!(
+        r#"#!/bin/sh
+req=$(cat)
+case "$req" in
+  *'"id":null'*)
+    when=1700000100; [ -e '{updated}' ] && when=1700000200
+    printf '{{"data":[{{"id":"{THREAD}","name":"","created":1700000000,"updated":%s}}],"nextCursor":null}}' $when
+    ;;
+  *'"cursor":null'*)
+    printf '%s' '{{"id":"{THREAD}","messages":[{{"role":"user","text":"\nbrowse the admin page"}}],"nextCursor":"1"}}'
+    ;;
+  *)
+    [ -e '{expired}' ] && exit 1
+    n=$(printf '%s' "$req" | sed 's/.*"cursor":"\([0-9]*\)".*/\1/')
+    if [ "$n" = 39 ]; then
+      printf '%s' '{{"id":"{THREAD}","messages":[{{"role":"assistant","text":"final browsing report"}}],"nextCursor":null}}'
+    else
+      printf '{{"id":"{THREAD}","messages":[],"nextCursor":"%s"}}' $((n + 1))
+    fi
+    ;;
+esac
+"#,
+        updated = updated.display(),
+        expired = expired.display(),
+    );
+    let codex = codex_cloud_home(home, &script);
+    let log = || {
+        let out = ah_in(
+            home,
+            &codex,
+            &[
+                "-a",
+                "log",
+                "--refresh",
+                "--json",
+                "-o",
+                "id,coverage,title,transcript,path",
+            ],
+        );
+        let row: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(row["id"], THREAD);
+        row
+    };
+    let checkpoint = |row: &Value| {
+        let path = std::path::Path::new(row["path"].as_str().unwrap());
+        path.with_file_name(format!(".{THREAD}.partial"))
+    };
+    // The first refresh reads 32 pages and publishes what it has; the title
+    // is the first prompt, not empty.
+    let first = log();
+    assert_eq!(first["coverage"], "messages-partial");
+    assert_eq!(
+        first["title"],
+        "[cloud:messages-partial] browse the admin page"
+    );
+    assert!(
+        !first["transcript"]
+            .as_str()
+            .unwrap()
+            .contains("final browsing report")
+    );
+    assert!(checkpoint(&first).exists());
+    // A saved position that stops working is dropped, not retried forever.
+    std::fs::write(&expired, "").unwrap();
+    let failed = log();
+    assert_eq!(failed["coverage"], "messages-partial");
+    assert!(!checkpoint(&failed).exists());
+    std::fs::remove_file(&expired).unwrap();
+    // Then the fetch starts over and finishes over the next refreshes.
+    assert_eq!(log()["coverage"], "messages-partial");
+    let done = log();
+    assert_eq!(done["coverage"], "messages");
+    let transcript = done["transcript"].as_str().unwrap();
+    assert!(transcript.contains("browse the admin page"), "{transcript}");
+    assert!(transcript.contains("final browsing report"), "{transcript}");
+    assert!(!checkpoint(&done).exists());
+    // When the thread changes, the refetch keeps its progress aside: the
+    // complete transcript stays shown until the new one is complete.
+    std::fs::write(&updated, "").unwrap();
+    let refetching = log();
+    assert_eq!(refetching["coverage"], "messages");
+    assert!(
+        refetching["transcript"]
+            .as_str()
+            .unwrap()
+            .contains("final browsing report")
+    );
+    assert!(checkpoint(&refetching).exists());
+    assert_eq!(log()["coverage"], "messages");
+    assert!(!checkpoint(&refetching).exists());
+}
+
+#[test]
+fn codex_app_ids_and_titles_find_cloud_threads() {
+    const THREAD: &str = "44444444-4444-4444-4444-444444444444";
+    const APP_ID: &str = "55555555-5555-5555-5555-555555555555";
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let script = format!(
+        r#"#!/bin/sh
 req=$(cat)
 case "$req" in
   *'"id":null'*)
@@ -508,43 +538,64 @@ case "$req" in
     printf '%s' '{{"id":"{THREAD}","messages":[{{"role":"user","text":"open the DAO settings"}},{{"role":"assistant","text":"settings need a wallet sign-in"}}],"nextCursor":null}}'
     ;;
 esac
-"#)).unwrap();
-    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::write(
-        home.join(".ahrc"),
-        format!("[cloud.codex_conversations]\nenabled = true\nhelper = {helper:?}\n"),
-    )
+"#
+    );
+    let codex = codex_cloud_home(home, &script);
+    // The desktop app lists the thread under its own id, with a title, a
+    // fraction of a second after the Cloud service's creation time. It
+    // also lists another account's thread and a local one at that time.
+    let db = codex.join("sqlite/codex.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode = WAL;
+         CREATE TABLE local_thread_catalog (host_id TEXT, thread_id TEXT, display_title TEXT,
+           source_created_at REAL, source_kind TEXT, missing_candidate INTEGER);
+         INSERT INTO local_thread_catalog VALUES
+           ('chatgpt:first:user-1', '{APP_ID}', 'Tally settings survey', 1700000000.6, 'chatgpt', 0),
+           ('chatgpt:other:user-2', '77777777-7777-7777-7777-777777777777', 'Other account', 1700000000.4, 'chatgpt', 0),
+           ('local', '66666666-6666-6666-6666-666666666666', 'Local', 1700000000.2, 'cli', 0);"
+    ))
     .unwrap();
-    let ah = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_ah"))
-            .env("HOME", home)
-            .env("CODEX_HOME", &codex)
-            .env_remove("AH_NO_CLOUD_SYNC")
-            .current_dir(home)
-            .args(args)
-            .output()
+    // Keep the rows in the write-ahead log, as the running app does.
+    std::mem::forget(conn);
+    let sidecars = || {
+        let mut names: Vec<String> = std::fs::read_dir(codex.join("sqlite"))
             .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     };
-    let out = ah(&["-a", "log", "--refresh", "--json", "-o", "id,title"]);
+    let before = sidecars();
+    let out = ah_in(
+        home,
+        &codex,
+        &["-a", "log", "--refresh", "--json", "-o", "id,title"],
+    );
     let row: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(row["id"], THREAD);
     assert_eq!(row["title"], "[cloud:messages] Tally settings survey");
     // The id the app shows opens the same conversation.
-    let shown = ah(&["show", "--offline", "--json", APP_ID]);
+    let shown = ah_in(home, &codex, &["show", "--offline", "--json", APP_ID]);
     assert!(
         shown.status.success(),
         "{}",
         String::from_utf8_lossy(&shown.stderr)
     );
     assert!(String::from_utf8_lossy(&shown.stdout).contains("settings need a wallet sign-in"));
-    // Other ids still fail.
-    let other = ah(&[
-        "show",
-        "--offline",
-        "--json",
+    // Other ids still fail, including another account's thread.
+    for other in [
         "66666666-6666-6666-6666-666666666666",
-    ]);
-    assert!(!other.status.success());
+        "77777777-7777-7777-7777-777777777777",
+    ] {
+        assert!(
+            !ah_in(home, &codex, &["show", "--offline", "--json", other])
+                .status
+                .success()
+        );
+    }
+    // The app's database is read from a copy: nothing is added beside it.
+    assert_eq!(sidecars(), before);
 }
 
 #[test]

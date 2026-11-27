@@ -79,66 +79,125 @@ const CODEX_PAGES_PER_FETCH: usize = 32;
 struct AppThread {
     id: String,
     title: String,
-    created: i64,
+    created: f64,
 }
 
-/// The app's Cloud conversations, read once; empty without the app.
+/// The app's Cloud conversations of the signed-in account, read once;
+/// empty without the app or a Codex Cloud login.
 fn app_threads() -> &'static [AppThread] {
     static THREADS: std::sync::OnceLock<Vec<AppThread>> = std::sync::OnceLock::new();
     THREADS.get_or_init(|| {
-        let Some(base) = config::resolve_agent_base("codex") else {
+        let (Some(base), Ok(login)) = (config::resolve_agent_base("codex"), super::source()) else {
             return Vec::new();
         };
-        let Some(conn) = crate::agents::open_sqlite_read_only(&base.join("sqlite/codex.db")) else {
-            return Vec::new();
-        };
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT thread_id, display_title, CAST(source_created_at AS INTEGER) \
-             FROM local_thread_catalog WHERE source_kind = 'chatgpt' AND missing_candidate = 0",
-        ) else {
-            return Vec::new();
-        };
-        stmt.query_map([], |row| {
+        read_app_threads(&base.join("sqlite/codex.db"), &login.account).unwrap_or_default()
+    })
+}
+
+/// Rows of the app catalog `db` for `account` (its `host_id` is
+/// `chatgpt:<account>:<user>`). The live database is in WAL mode; it is
+/// copied, with its log, and the copy is read, so nothing is written next
+/// to the app's files.
+fn read_app_threads(db: &Path, account: &str) -> Option<Vec<AppThread>> {
+    if !db.is_file() {
+        return None;
+    }
+    let dir = tempfile::tempdir().ok()?;
+    let copy = dir.path().join("codex.db");
+    fs::copy(db, &copy).ok()?;
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+    if wal.is_file() {
+        fs::copy(&wal, dir.path().join("codex.db-wal")).ok()?;
+    }
+    let conn = rusqlite::Connection::open(&copy).ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT thread_id, display_title, source_created_at FROM local_thread_catalog \
+             WHERE source_kind = 'chatgpt' AND missing_candidate = 0 \
+               AND substr(host_id, 1, length(?1)) = ?1",
+        )
+        .ok()?;
+    let prefix = format!("chatgpt:{account}:");
+    let rows = stmt
+        .query_map([prefix], |row| {
             Ok(AppThread {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 created: row.get(2)?,
             })
         })
-        .map(|rows| rows.flatten().collect())
-        .unwrap_or_default()
+        .ok()?
+        .flatten()
+        .collect();
+    Some(rows)
+}
+
+/// How much later the app records a thread than the Cloud service's
+/// whole-second creation time: measured 0.3 to 1.2 seconds, while the app's
+/// threads are many seconds apart.
+const APP_CREATED_LAG: std::ops::RangeInclusive<f64> = 0.0..=1.5;
+
+fn app_lag_matches(app: f64, cloud: u64) -> bool {
+    APP_CREATED_LAG.contains(&(app - cloud as f64))
+}
+
+/// The app thread created right after `created`, if exactly one was.
+fn app_thread_at(created: Option<u64>) -> Option<&'static AppThread> {
+    let created = created?;
+    let mut near = app_threads()
+        .iter()
+        .filter(|t| app_lag_matches(t.created, created));
+    let found = near.next()?;
+    near.next().is_none().then_some(found)
+}
+
+fn codex_snapshot_paths() -> impl Iterator<Item = PathBuf> {
+    active(Some("codex"))
+        .into_iter()
+        .filter(|s| s.kind == Kind::Codex)
+        .flat_map(|s| fs::read_dir(&s.cache).into_iter().flatten().flatten())
+        .map(|entry| entry.path())
+        .filter(|path| source_for_path(path).is_some())
+}
+
+/// Creation times of the Codex Cloud snapshots, with how many share each.
+fn codex_snapshot_times() -> &'static std::collections::HashMap<u64, usize> {
+    static TIMES: std::sync::OnceLock<std::collections::HashMap<u64, usize>> =
+        std::sync::OnceLock::new();
+    TIMES.get_or_init(|| {
+        let mut times = std::collections::HashMap::new();
+        for path in codex_snapshot_paths() {
+            if let Some(created) = read(&path).and_then(|s| s.created) {
+                *times.entry(created).or_insert(0) += 1;
+            }
+        }
+        times
     })
 }
 
-/// How far apart the app's and the Cloud service's creation times may be.
-const APP_CREATED_SLACK: i64 = 2;
-
-/// The app thread created when `created` was, if exactly one was.
-fn app_thread_at(created: Option<u64>) -> Option<&'static AppThread> {
-    let created = i64::try_from(created?).ok()?;
-    let mut near = app_threads()
+/// The app thread of the snapshot created at `created`, when the two match
+/// one to one: no other app thread, and no other snapshot, at that time.
+fn app_thread_of_snapshot(created: Option<u64>) -> Option<&'static AppThread> {
+    if app_threads().is_empty() {
+        return None;
+    }
+    let thread = app_thread_at(created)?;
+    let snapshots: usize = codex_snapshot_times()
         .iter()
-        .filter(|t| (t.created - created).abs() <= APP_CREATED_SLACK);
-    let found = near.next()?;
-    near.next().is_none().then_some(found)
+        .filter(|(t, _)| app_lag_matches(thread.created, **t))
+        .map(|(_, n)| n)
+        .sum();
+    (snapshots == 1).then_some(thread)
 }
 
 /// The Codex Cloud snapshot of the app thread `id`, so the id the app shows
 /// works with `ah show` and `ah resume`.
 pub(crate) fn app_thread_path(id: &str) -> Option<PathBuf> {
     let thread = app_threads().iter().find(|t| t.id == id)?;
-    let mut found = active(Some("codex"))
-        .into_iter()
-        .filter(|s| s.kind == Kind::Codex)
-        .flat_map(|s| fs::read_dir(&s.cache).into_iter().flatten().flatten())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            source_for_path(path).is_some()
-                && read(path)
-                    .and_then(|s| s.created)
-                    .and_then(|c| app_thread_at(Some(c)))
-                    .is_some_and(|t| t.id == thread.id)
-        });
+    let mut found = codex_snapshot_paths().filter(|path| {
+        app_thread_of_snapshot(read(path).and_then(|s| s.created))
+            .is_some_and(|t| t.id == thread.id)
+    });
     let path = found.next()?;
     found.next().is_none().then_some(path)
 }
@@ -504,6 +563,40 @@ impl Source {
     fn path(&self, id: &str) -> PathBuf {
         self.cache.join(format!("{id}.json"))
     }
+    /// An unfinished transcript fetch, kept apart from the published
+    /// snapshot so a complete one is not replaced by a part of it.
+    fn checkpoint_path(&self, id: &str) -> PathBuf {
+        self.cache.join(format!(".{id}.partial"))
+    }
+    fn drop_checkpoint(&self, id: &str) {
+        let _ = fs::remove_file(self.checkpoint_path(id));
+    }
+    /// Store a fetched transcript. A finished one is published and ends any
+    /// checkpoint. An unfinished one becomes the checkpoint; it is published
+    /// only while nothing more complete is, so it can be found meanwhile.
+    fn publish(&self, id: &str, snapshot: Snapshot) -> Result<PathBuf, &'static str> {
+        if snapshot.cursor.is_none() {
+            let published = self.store(id, snapshot)?;
+            self.drop_checkpoint(id);
+            return Ok(published);
+        }
+        let mut temp =
+            tempfile::NamedTempFile::new_in(&self.cache).map_err(|_| "cannot save progress")?;
+        serde_json::to_writer(&mut temp, &snapshot).map_err(|_| "cannot save progress")?;
+        temp.persist(self.checkpoint_path(id))
+            .map_err(|_| "cannot save progress")?;
+        let path = self.path(id);
+        let complete =
+            read(&path).is_some_and(|s| s.coverage == "messages" && !s.messages.is_empty());
+        if complete || snapshot.messages.is_empty() {
+            return Ok(path);
+        }
+        let mut shown = snapshot;
+        shown.cursor = None;
+        // Fetched again until done (see the checkpoint check in `refresh`).
+        shown.revision = None;
+        self.store(id, shown)
+    }
     fn http(&self) -> ureq::Agent {
         ureq::Agent::config_builder()
             .max_redirects(0)
@@ -655,9 +748,16 @@ impl Source {
                     revision: None,
                 });
                 // Continue an incomplete transcript where the last refresh
-                // stopped.
+                // stopped, unless the thread changed since: then the saved
+                // part may no longer match, so start over.
+                let start_revision = row.revision.clone();
                 let (mut lines, mut cursor, mut first_created, mut last_updated) = match resume {
-                    Some(saved) if saved.cursor.is_some() => {
+                    Some(saved)
+                        if saved.cursor.is_some()
+                            && (saved.revision.is_none()
+                                || start_revision.is_none()
+                                || saved.revision == start_revision) =>
+                    {
                         (saved.messages, saved.cursor, saved.created, saved.modified)
                     }
                     _ => (Vec::new(), None, None, None),
@@ -673,8 +773,15 @@ impl Source {
                     let page = match self.run_bridge(Some(id), cursor.as_deref(), deadline) {
                         Ok(page) => page,
                         // Out of time: keep what was read for the next refresh.
-                        Err(_) if pages > 0 || resumed => break false,
-                        Err(e) => return Err(e),
+                        Err(_) if pages > 0 => break false,
+                        // The saved position no longer works (an expired
+                        // cursor, a deleted thread): start over next time.
+                        Err(e) => {
+                            if resumed {
+                                self.drop_checkpoint(id);
+                            }
+                            return Err(e);
+                        }
                     };
                     pages += 1;
                     if page["id"].as_str() != Some(id) {
@@ -714,8 +821,8 @@ impl Source {
                 if complete {
                     return Ok(snapshot(row, lines));
                 }
-                // Not the upstream revision yet, so the next refresh goes on.
-                row.revision = None;
+                // The checkpoint keeps the revision the fetch started from.
+                row.revision = start_revision;
                 let mut data = snapshot(row, lines);
                 data.coverage = "messages-partial".into();
                 data.cursor = cursor;
@@ -871,9 +978,11 @@ impl Source {
                 // Revalidate periodically even if upstream time has not
                 // changed; --refresh bypasses the refresh TTL, not this
                 // per-record debounce.
+                let unfinished = self.checkpoint_path(&row.id).exists();
                 match cached {
                     Some(current)
                         if current.fetched != 0
+                            && !unfinished
                             && (row.revision.is_none() || current.revision == row.revision) =>
                     {
                         if !revalidation_used
@@ -903,10 +1012,10 @@ impl Source {
                 if !force && super::recent_stamp(&self.cache.join(&retry), cooldown) {
                     continue;
                 }
-                let resume = read(&self.path(&id)).filter(|s| s.cursor.is_some());
+                let resume = read(&self.checkpoint_path(&id));
                 if let Err(e) = self
                     .detail(&http, &id, Some(row), resume, deadline)
-                    .and_then(|s| self.store(&id, s).map(drop))
+                    .and_then(|s| self.publish(&id, s).map(drop))
                 {
                     error.get_or_insert(e);
                     super::write_stamp(&self.cache, &retry)?;
@@ -1367,10 +1476,10 @@ fn fetch_source(
                 modified: s.modified,
                 revision: s.revision.clone(),
             });
-        let resume = read_cached().filter(|s| s.cursor.is_some());
+        let resume = read(&source.checkpoint_path(id));
         match source
             .detail(&http, id, hint, resume, deadline)
-            .and_then(|snapshot| source.store(id, snapshot))
+            .and_then(|snapshot| source.publish(id, snapshot))
         {
             Ok(published) => Ok(Some(published)),
             Err(err) if cached.is_some() && source_for_path(&path).is_some() => {
@@ -1544,7 +1653,7 @@ impl AgentPlugin for SnapshotPlugin {
             // The Codex app may know the title the service left out.
             source_for_path(path)
                 .filter(|s| s.kind == Kind::Codex)
-                .and_then(|_| app_thread_at(snapshot.created))
+                .and_then(|_| app_thread_of_snapshot(snapshot.created))
                 .map(|t| t.title.trim().to_owned())
                 .filter(|t| !t.is_empty())
                 .or_else(|| first_prompt_title(&snapshot.messages))
