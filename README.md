@@ -362,9 +362,10 @@ Download a prebuilt binary from [GitHub Releases](https://github.com/nihen/ah/re
 Available for macOS (arm64, x86_64) and Linux (x86_64, arm64). The Linux binaries are statically linked (musl). Binaries of releases after v0.8.0 carry a build provenance attestation; verify one with GitHub CLI 2.102.0 or later:
 
 ```bash
+TAG=v0.9.0   # the release you downloaded
 gh attestation verify ah-linux-x86_64 --repo nihen/ah \
   --signer-workflow nihen/ah/.github/workflows/release.yml \
-  --source-ref refs/tags/<tag>
+  --source-ref "refs/tags/$TAG"
 ```
 
 See [SECURITY.md](SECURITY.md#verifying-release-binaries).

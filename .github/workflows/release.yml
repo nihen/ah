@@ -136,7 +136,8 @@ jobs:
           # publishes it if an earlier run stopped while it was a draft.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${files[@]}"
-            if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true ]; then
+            draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+            if [ "$draft" = true ]; then
               gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
             fi
           else
@@ -147,7 +148,7 @@ jobs:
   # crates.io trusted publishing: a short-lived token for this workflow and
   # environment, revoked when the job ends; no stored registry token.
   publish:
-    needs: [verify, build]
+    needs: [verify, attest]
     runs-on: ubuntu-latest
     environment: release
     permissions:

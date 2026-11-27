@@ -30,7 +30,10 @@ jobs:
           TAG="v${VERSION}"
           # A re-run finds the tag it made: go on to the dispatch, but never
           # move a tag that points elsewhere.
-          existing=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null || true)
+          refs=$(git ls-remote "https://github.com/${REPO}.git" "refs/tags/${TAG}" "refs/tags/${TAG}^{}")
+          # An annotated tag lists its commit on the ^{} line.
+          existing=$(printf '%s\n' "$refs" | awk '/\^\{\}$/ {print $1; exit}')
+          [ -n "$existing" ] || existing=$(printf '%s\n' "$refs" | awk '{print $1; exit}')
           if [ -z "$existing" ]; then
             gh api -X POST "repos/${REPO}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${SHA}" >/dev/null
           elif [ "$existing" != "$SHA" ]; then
