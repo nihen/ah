@@ -27,7 +27,8 @@ To reuse an existing parser through configuration, use `[agents.<name>]` in `~/.
 
 ## Pull requests
 
-Merge pull requests into `main` with squash (`gh pr merge --squash`), so `main` keeps one commit per pull request, titled `<PR title> (#N)`. This includes release and Dependabot pull requests.
+- Merge a pull request from a feature branch into `main` by squashing (`gh pr merge --squash`), and confirm afterwards that CI on `main` passed.
+- Merge a release pull request (`release/*`), or any pull request that bundles other pull requests, with a merge commit (`gh pr merge --merge`). Never squash it.
 
 ## Release
 
