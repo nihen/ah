@@ -317,9 +317,8 @@ struct ProjectBoundary<'a> {
     root: PathBuf,
     /// Canonical paths of the global memory files.
     global_files: &'a HashSet<PathBuf>,
-    /// Directories a recursive pattern may walk into: `root` and the
-    /// agents' configuration directories.
-    walk: Vec<PathBuf>,
+    /// Where a pattern's walk may go (see `Walk`).
+    walk: Walk,
 }
 
 impl ProjectBoundary<'_> {
@@ -359,7 +358,7 @@ fn expand_sources(
         if crate::cancel::checkpoint() {
             break;
         }
-        let mut paths = glob_files(&source.pattern(), boundary.map(|b| b.walk.as_slice()));
+        let mut paths = glob_files(&source.pattern(), boundary.map(|b| &b.walk));
         paths.sort();
         entries.extend(paths.into_iter().filter_map(|p| {
             if crate::cancel::checkpoint() {
@@ -383,10 +382,9 @@ const RECURSIVE_GLOB_MAX_DEPTH: usize = 16;
 /// Files matching `pattern`. The `glob` crate follows directory symlinks
 /// without cycle detection, so recursive patterns are walked here instead,
 /// skipping directories already visited (by canonical path).
-/// With `walk`, every pattern is walked here and only directories that
-/// resolve under one of those (canonical) directories, or on the way to one,
-/// are entered, so a project's links cannot make it list other trees.
-fn glob_files(pattern: &str, walk: Option<&[PathBuf]>) -> Vec<PathBuf> {
+/// With `walk`, every pattern is walked here and only the directories it
+/// allows are entered, so a project's links cannot make it list other trees.
+fn glob_files(pattern: &str, walk: Option<&Walk>) -> Vec<PathBuf> {
     // `.` components are no-ops; drop them so they do not defeat matching.
     // `..` depends on symlinks and is left to the glob crate.
     let normalized: String = pattern
@@ -440,13 +438,7 @@ fn glob_files(pattern: &str, walk: Option<&[PathBuf]>) -> Vec<PathBuf> {
         let Ok(canonical) = fs::canonicalize(&dir) else {
             continue;
         };
-        if chain.contains(&canonical)
-            || walk.is_some_and(|roots| {
-                !roots
-                    .iter()
-                    .any(|r| canonical.starts_with(r) || r.starts_with(&canonical))
-            })
-        {
+        if chain.contains(&canonical) || walk.is_some_and(|walk| !walk.allows(&canonical)) {
             continue;
         }
         chain.push(canonical);
@@ -468,6 +460,26 @@ fn glob_files(pattern: &str, walk: Option<&[PathBuf]>) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+/// Directories a bounded walk may enter (all canonical).
+struct Walk {
+    /// Directories whose whole tree may be walked: the repository and the
+    /// agents' configuration directories.
+    under: Vec<PathBuf>,
+    /// Directories holding global memory files, which may be anywhere (a
+    /// `rules` link into a dotfiles checkout, `~/CLAUDE.md`): only the way
+    /// down to them is walked, not what else sits beside them.
+    toward: Vec<PathBuf>,
+}
+
+impl Walk {
+    fn allows(&self, dir: &Path) -> bool {
+        self.under
+            .iter()
+            .any(|r| dir.starts_with(r) || r.starts_with(dir))
+            || self.toward.iter().any(|t| t.starts_with(dir))
+    }
 }
 
 /// Byte offset of the first wildcard in `pattern`, skipping characters
@@ -537,19 +549,18 @@ fn collect_project_files(
         .to_path_buf();
     // Walk into the repository, the agents' directories, and wherever the
     // global files are (a linked `rules` directory may live elsewhere).
-    let mut walk = vec![root.clone()];
-    walk.extend(agent_dirs.iter().cloned());
-    walk.extend(
-        global_files
-            .iter()
-            .filter_map(|f| f.parent().map(Path::to_path_buf)),
-    );
-    walk.sort();
-    walk.dedup();
+    let mut under = vec![root.clone()];
+    under.extend(agent_dirs.iter().cloned());
+    let mut toward: Vec<PathBuf> = global_files
+        .iter()
+        .filter_map(|f| f.parent().map(Path::to_path_buf))
+        .collect();
+    toward.sort();
+    toward.dedup();
     let boundary = ProjectBoundary {
         root,
         global_files,
-        walk,
+        walk: Walk { under, toward },
     };
     let mut entries = expand_sources(
         shared_project_sources(dir),
@@ -1023,16 +1034,25 @@ mod tests {
         std::os::unix::fs::symlink(&outside, repo.join("link")).unwrap();
         let pattern =
             |rest: &str| format!("{}/{rest}", glob::Pattern::escape(&repo.to_string_lossy()));
-        let roots = [repo.clone()];
+        // A global file right under `base` (like `~/CLAUDE.md`) lets the
+        // walk reach `base`, not the rest of it.
+        fs::write(base.join("CLAUDE.md"), "g").unwrap();
+        let walk = Walk {
+            under: vec![repo.clone()],
+            toward: vec![base.clone()],
+        };
+        assert!(walk.allows(&base));
+        assert!(!walk.allows(&outside));
+        assert!(!walk.allows(&outside.join("d")));
         for p in ["link/*/*.md", "link/**/*.md", "*/*/*.md"] {
-            let found = glob_files(&pattern(p), Some(&roots));
+            let found = glob_files(&pattern(p), Some(&walk));
             assert!(
                 found.iter().all(|f| !f.starts_with(repo.join("link"))),
                 "{p}: {found:?}"
             );
         }
         assert_eq!(
-            glob_files(&pattern("*/*.md"), Some(&roots)),
+            glob_files(&pattern("*/*.md"), Some(&walk)),
             [repo.join("in/y.md")]
         );
         // Without a boundary the link is followed as before.
