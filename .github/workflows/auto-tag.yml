@@ -28,5 +28,13 @@ jobs:
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           TAG="v${VERSION}"
-          gh api -X POST "repos/${REPO}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${SHA}" >/dev/null
+          # A re-run finds the tag it made: go on to the dispatch, but never
+          # move a tag that points elsewhere.
+          existing=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null || true)
+          if [ -z "$existing" ]; then
+            gh api -X POST "repos/${REPO}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${SHA}" >/dev/null
+          elif [ "$existing" != "$SHA" ]; then
+            echo "::error::${TAG} already points to ${existing}, not ${SHA}"
+            exit 1
+          fi
           gh workflow run release.yml --ref "${TAG}" -f tag="${TAG}"

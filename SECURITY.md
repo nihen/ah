@@ -48,9 +48,11 @@ they say.
 
 ## Verifying release binaries
 
-Every binary on the [Releases](https://github.com/nihen/ah/releases) page
-has a signed build provenance attestation from this repository's release
-workflow. With the [GitHub CLI](https://cli.github.com/):
+Binaries of releases after v0.8.0 on the
+[Releases](https://github.com/nihen/ah/releases) page have a signed build
+provenance attestation from this repository's release workflow. Check one
+with the [GitHub CLI](https://cli.github.com/) 2.102.0 or later (earlier
+versions match `--signer-workflow` and `--source-ref` too loosely):
 
 ```bash
 TAG=v0.9.0   # the release you downloaded
@@ -58,6 +60,9 @@ gh attestation verify ah-linux-x86_64 --repo nihen/ah \
   --signer-workflow nihen/ah/.github/workflows/release.yml \
   --source-ref "refs/tags/$TAG"
 ```
+
+Keep both options: `--repo` alone also accepts an attestation made by
+another workflow or from another ref of this repository.
 
 The Homebrew formula is generated from binaries verified this way, and
 the crate is published to crates.io with trusted publishing.

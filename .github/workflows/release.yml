@@ -35,6 +35,7 @@ jobs:
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "not a vX.Y.Z tag: $TAG"
           [ "$GITHUB_REF" = "refs/tags/$TAG" ] || fail "run from $GITHUB_REF, not refs/tags/$TAG"
           SHA=$(git rev-parse --verify "refs/tags/$TAG^{commit}") || fail "no tag $TAG"
+          [ "$SHA" = "$GITHUB_SHA" ] || fail "$TAG points to $SHA, not the run's commit $GITHUB_SHA"
           git merge-base --is-ancestor "$SHA" origin/main || fail "$TAG is not on main"
           VERSION=$(git show "$SHA:Cargo.toml" | grep -m1 '^version' | sed 's/.*"\(.*\)"/\1/')
           [ "v$VERSION" = "$TAG" ] || fail "Cargo.toml version $VERSION does not match $TAG"
@@ -42,12 +43,6 @@ jobs:
 
   build:
     needs: verify
-    # Each binary gets a signed build provenance attestation; check one with
-    # `gh attestation verify <file> --repo nihen/ah`.
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
     strategy:
       matrix:
         include:
@@ -82,23 +77,53 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - run: cp target/${{ matrix.target }}/release/ah ${{ matrix.artifact }}
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: ${{ matrix.artifact }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
+  # Each binary gets a signed build provenance attestation (see SECURITY.md).
+  # This is its own job so that the build, which runs dependencies' build
+  # scripts, never holds an OIDC token.
+  attest:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ah-linux-x86_64/ah-linux-x86_64
+            ah-linux-arm64/ah-linux-arm64
+            ah-darwin-arm64/ah-darwin-arm64
+            ah-darwin-x86_64/ah-darwin-x86_64
+
   # Publishing jobs run in the `release` environment, where GitHub can
   # require an approval and restrict deployments to v* tags.
   release:
-    needs: build
+    needs: [verify, attest]
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: write
     steps:
+      - name: Check the tag still points to the verified commit
+        env:
+          VERIFIED: ${{ needs.verify.outputs.sha }}
+        run: &tag-check |
+          # The tag may have moved while the run waited for approval.
+          refs=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" \
+            "refs/tags/${TAG}" "refs/tags/${TAG}^{}")
+          now=$(printf '%s\n' "$refs" | awk '/\^\{\}$/ {print $1; exit}')
+          [ -n "$now" ] || now=$(printf '%s\n' "$refs" | awk '{print $1; exit}')
+          if [ "$now" != "$VERIFIED" ]; then
+            echo "::error::${TAG} now points to ${now:-nothing}, not ${VERIFIED}"
+            exit 1
+          fi
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       - run: chmod +x ah-*/ah-*
       - name: Publish the GitHub release
@@ -107,9 +132,13 @@ jobs:
         run: |
           files=(ah-linux-x86_64/ah-linux-x86_64 ah-linux-arm64/ah-linux-arm64
                  ah-darwin-arm64/ah-darwin-arm64 ah-darwin-x86_64/ah-darwin-x86_64)
-          # A re-run replaces the files of the release it already made.
+          # A re-run replaces the files of the release it already made, and
+          # publishes it if an earlier run stopped while it was a draft.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${files[@]}"
+            if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true ]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+            fi
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
               --generate-notes "${files[@]}"
@@ -132,6 +161,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch
         with:
           toolchain: stable
+      - name: Check the tag still points to the verified commit
+        env:
+          VERIFIED: ${{ needs.verify.outputs.sha }}
+        run: *tag-check
       - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
       - run: cargo publish
@@ -152,16 +185,21 @@ jobs:
           persist-credentials: false
       # The formula's digests come from the published binaries, and only
       # after their attestations show this workflow built them from the tag.
+      - name: Check the tag still points to the verified commit
+        env:
+          VERIFIED: ${{ needs.verify.outputs.sha }}
+        run: *tag-check
       - name: Download and verify the release binaries
         env:
           GH_TOKEN: ${{ github.token }}
+          VERIFIED: ${{ needs.verify.outputs.sha }}
         run: |
           BASE_URL="https://github.com/nihen/ah/releases/download/${TAG}"
           for a in darwin-arm64 darwin-x86_64 linux-arm64 linux-x86_64; do
             curl -fsSL --retry 3 "${BASE_URL}/ah-${a}" -o "ah-${a}"
             gh attestation verify "ah-${a}" --repo nihen/ah \
               --signer-workflow nihen/ah/.github/workflows/release.yml \
-              --source-ref "refs/tags/${TAG}"
+              --source-ref "refs/tags/${TAG}" --source-digest "$VERIFIED"
           done
       - name: Generate formula and push to tap
         env:
