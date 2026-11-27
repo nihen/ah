@@ -30,7 +30,10 @@ fn is_compressed(path: &Path) -> bool {
 /// Largest log that is decoded. A log is a few megabytes; the limit keeps a
 /// damaged or hostile file (Zstandard compresses a run of one byte about
 /// 30000:1) from exhausting memory, also when threads decode in parallel.
-const MAX_LOG_BYTES: u64 = 256 << 20;
+const MAX_LOG_BYTES: u64 = 64 << 20;
+/// Largest decoded log kept for the next field of the same session. Larger
+/// ones are freed once read, so idle threads (e.g. of `ah mcp`) hold little.
+const MAX_CACHED_BYTES: usize = 8 << 20;
 /// How much text listing decodes to find the first prompt, which is in the
 /// first batch of events. Listing visits every log, so this stays small.
 const MAX_PROMPT_SCAN_BYTES: u64 = 16 << 20;
@@ -152,7 +155,9 @@ fn read_log(path: &Path) -> Option<Log> {
         return Some(Log::Decoded(bytes));
     }
     let bytes = Rc::new(decode_frames(&mmap_file(path)?, usize::MAX, MAX_LOG_BYTES));
-    LAST_DECODED.with_borrow_mut(|last| *last = Some((source, Rc::clone(&bytes))));
+    LAST_DECODED.with_borrow_mut(|last| {
+        *last = (bytes.len() <= MAX_CACHED_BYTES).then(|| (source, Rc::clone(&bytes)));
+    });
     Some(Log::Decoded(bytes))
 }
 

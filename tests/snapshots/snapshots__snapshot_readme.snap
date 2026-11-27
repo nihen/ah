@@ -228,7 +228,7 @@ Files listed per agent (global paths honor each agent's env var; project paths a
 | DeepSeek Harness (dsh) | `~/.dsh/AGENTS.md`, `~/.agents/AGENTS.md` (or `DSH_AGENTS_HOME`) | `AGENTS.local.md` |
 | shared | — | `AGENTS.md` |
 
-A project file, including one reached through a symlink, is read only when it resolves inside that project or inside an agent's own configuration directory (such as `~/.claude` or `~/.agents`). The `instructions` of a project's `opencode.json(c)` are limited to paths inside the project; absolute, `~/` and `..` entries apply only in the global configuration.
+A project file can be a symlink, and a repository decides where it points, so it is read only when it resolves inside the repository or to one of the global files listed above (such as `~/.claude/rules/*.md`). Through a symlink, a file inside the repository is read only if it is Markdown (`.md`, `.mdc`) or has the link's own name, so a link cannot expose `.env` or credentials next to an agent's memory files. In a project's `opencode.json(c)`, absolute, `~/` and `..` entries of `instructions` must be literal paths (no globs) and follow the same rule.
 
 Types: `instruction` (always-loaded files), `rule`, `memory` (or the type in a memory file's frontmatter, such as `feedback`), and `skill`. Skills (`SKILL.md` under each agent's `skills/*/` directory, anywhere under Pi's `skills/`, and `.agents/skills/*/`) are listed only with `-t skill`.
 

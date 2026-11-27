@@ -817,8 +817,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subagent_logs_name_their_parent_and_are_not_resumable() {
-        // Option-like ids from metadata are not resumed either.
+    fn option_like_ids_are_not_resumed() {
         let tmp = tempfile::tempdir().unwrap();
         let chats = tmp.path().join(".gemini/tmp/proj/chats");
         std::fs::create_dir_all(&chats).unwrap();
@@ -833,8 +832,10 @@ mod tests {
             Some("--yolo")
         );
         assert_eq!(PLUGIN.resume_args(&hostile, tmp.path()), None);
-        drop(tmp);
+    }
 
+    #[test]
+    fn subagent_logs_name_their_parent_and_are_not_resumable() {
         let tmp = tempfile::tempdir().unwrap();
         let chats = tmp.path().join(".gemini/tmp/proj/chats");
         let child = chats.join("parent-uuid/zut36a.jsonl");

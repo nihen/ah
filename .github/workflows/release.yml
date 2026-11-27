@@ -80,9 +80,12 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
+  # Publishing jobs run in the `release` environment, where GitHub can
+  # require an approval and restrict deployments to v* tags.
   release:
     needs: build
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
     steps:
@@ -102,6 +105,7 @@ jobs:
   publish:
     needs: [verify, build]
     runs-on: ubuntu-latest
+    environment: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -117,6 +121,7 @@ jobs:
   homebrew:
     needs: [verify, release]
     runs-on: ubuntu-latest
+    environment: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
