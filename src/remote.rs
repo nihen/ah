@@ -709,33 +709,30 @@ pub fn exec_remote_resume(
     exec_ssh(&remote.host, &ah_args, true)
 }
 
-/// Format a remote resume command for `--print` output.
+/// Format a remote resume command for `--print` output. ssh joins its
+/// arguments into one string for the remote shell, so the remote command is
+/// quoted for that shell first and then passed as a single, quoted argument.
 pub fn format_remote_resume_command(
     remote: &RemoteDef,
     remote_ref: &str,
     extra_args: &[String],
     agent: Option<&str>,
 ) -> String {
-    let mut parts = vec![
-        "ssh".to_string(),
-        "-t".to_string(),
-        "--".to_string(),
-        shell_quote(&remote.host),
-        shell_quote(&remote.ah_path),
-        "resume".to_string(),
-    ];
+    let mut args = vec![remote.ah_path.clone(), "resume".to_string()];
     if let Some(agent) = agent {
-        parts.push("--agent".to_string());
-        parts.push(shell_quote(agent));
+        args.push("--agent".to_string());
+        args.push(agent.to_string());
     }
-    parts.push(shell_quote(remote_ref));
+    args.push(remote_ref.to_string());
     if !extra_args.is_empty() {
-        parts.push("--".to_string());
-        for a in extra_args {
-            parts.push(shell_quote(a));
-        }
+        args.push("--".to_string());
+        args.extend(extra_args.iter().cloned());
     }
-    parts.join(" ")
+    format!(
+        "ssh -t -- {} {}",
+        shell_quote(&remote.host),
+        shell_quote(&quote_remote_command(&args))
+    )
 }
 
 // ---------------------------------------------------------------------------
