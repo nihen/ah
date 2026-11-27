@@ -383,8 +383,9 @@ const RECURSIVE_GLOB_MAX_DEPTH: usize = 16;
 /// Files matching `pattern`. The `glob` crate follows directory symlinks
 /// without cycle detection, so recursive patterns are walked here instead,
 /// skipping directories already visited (by canonical path).
-/// With `walk`, a recursive walk enters only directories that resolve under
-/// one of those (canonical) directories.
+/// With `walk`, every pattern is walked here and only directories that
+/// resolve under one of those (canonical) directories, or on the way to one,
+/// are entered, so a project's links cannot make it list other trees.
 fn glob_files(pattern: &str, walk: Option<&[PathBuf]>) -> Vec<PathBuf> {
     // `.` components are no-ops; drop them so they do not defeat matching.
     // `..` depends on symlinks and is left to the glob crate.
@@ -394,7 +395,8 @@ fn glob_files(pattern: &str, walk: Option<&[PathBuf]>) -> Vec<PathBuf> {
         .collect::<Vec<_>>()
         .join("/");
     let pattern = normalized.as_str();
-    if !pattern.contains("**") || pattern.split('/').any(|c| c == "..") {
+    let recursive = pattern.contains("**");
+    if (!recursive && walk.is_none()) || pattern.split('/').any(|c| c == "..") {
         return glob::glob(pattern)
             .into_iter()
             .flatten()
@@ -416,6 +418,16 @@ fn glob_files(pattern: &str, walk: Option<&[PathBuf]>) -> Vec<PathBuf> {
         Some(i) => PathBuf::from(unescape_glob(&pattern[..i])),
         None => return Vec::new(),
     };
+    // Without `**`, a pattern descends exactly as many levels as it has
+    // directory components below the walk root.
+    let max_depth = if recursive {
+        RECURSIVE_GLOB_MAX_DEPTH
+    } else {
+        let below = unescape_glob(pattern)
+            .strip_prefix(&*root.to_string_lossy())
+            .map_or(0, |rest| rest.split('/').filter(|c| !c.is_empty()).count());
+        below.saturating_sub(1)
+    };
     let mut files = Vec::new();
     // Each entry carries the canonical directories on its own path from the
     // root, so only a symlink back into that chain (a cycle) is cut; the same
@@ -429,7 +441,11 @@ fn glob_files(pattern: &str, walk: Option<&[PathBuf]>) -> Vec<PathBuf> {
             continue;
         };
         if chain.contains(&canonical)
-            || walk.is_some_and(|roots| !roots.iter().any(|r| canonical.starts_with(r)))
+            || walk.is_some_and(|roots| {
+                !roots
+                    .iter()
+                    .any(|r| canonical.starts_with(r) || r.starts_with(&canonical))
+            })
         {
             continue;
         }
@@ -443,7 +459,7 @@ fn glob_files(pattern: &str, walk: Option<&[PathBuf]>) -> Vec<PathBuf> {
             }
             let path = entry.path();
             if path.is_dir() {
-                if chain.len() <= RECURSIVE_GLOB_MAX_DEPTH {
+                if chain.len() <= max_depth {
                     stack.push((path, chain.clone()));
                 }
             } else if path.is_file() && matcher.matches_path_with(&path, options) {
@@ -522,8 +538,17 @@ fn collect_project_files(
         .filter(|top| !home.starts_with(top))
         .unwrap_or(&dir_real)
         .to_path_buf();
+    // Walk into the repository, the agents' directories, and wherever the
+    // global files are (a linked `rules` directory may live elsewhere).
     let mut walk = vec![root.clone()];
     walk.extend(agent_dirs.iter().cloned());
+    walk.extend(
+        global_files
+            .iter()
+            .filter_map(|f| f.parent().map(Path::to_path_buf)),
+    );
+    walk.sort();
+    walk.dedup();
     let boundary = ProjectBoundary {
         root,
         global_files,
@@ -696,8 +721,11 @@ pub fn build_memory_records(
     // 3. Project files (listed before global ones, see dedup below)
     let agent_dirs = agent_config_dirs(&home, &plugins);
     let home_real = fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
+    // Global memory: the global sources and agents' own global records
+    // (e.g. Grok topics), which are listed as `(global)` as well.
     let global_files: HashSet<PathBuf> = global_entries
         .iter()
+        .chain(entries.iter().filter(|e| e.project == GLOBAL_PROJECT))
         .filter_map(|e| fs::canonicalize(&e.path).ok())
         .collect();
     let project_dirs: Vec<PathBuf> = if filter.all {
@@ -959,6 +987,35 @@ pub fn run(args: MemoryResolvedArgs, filter: &FilterArgs) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walk_limits_every_pattern_to_the_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("repo");
+        let outside = base.join("outside");
+        fs::create_dir_all(outside.join("d")).unwrap();
+        fs::write(outside.join("d/x.md"), "x").unwrap();
+        fs::create_dir_all(repo.join("in")).unwrap();
+        fs::write(repo.join("in/y.md"), "y").unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("link")).unwrap();
+        let pattern =
+            |rest: &str| format!("{}/{rest}", glob::Pattern::escape(&repo.to_string_lossy()));
+        let roots = [repo.clone()];
+        for p in ["link/*/*.md", "link/**/*.md", "*/*/*.md"] {
+            let found = glob_files(&pattern(p), Some(&roots));
+            assert!(
+                found.iter().all(|f| !f.starts_with(repo.join("link"))),
+                "{p}: {found:?}"
+            );
+        }
+        assert_eq!(
+            glob_files(&pattern("*/*.md"), Some(&roots)),
+            [repo.join("in/y.md")]
+        );
+        // Without a boundary the link is followed as before.
+        assert_eq!(glob_files(&pattern("link/*/*.md"), None).len(), 1);
+    }
     use crate::agents::claude::encode_path_for_claude;
     use crate::agents::common::decode_claude_project;
 

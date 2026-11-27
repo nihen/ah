@@ -2264,6 +2264,44 @@ fn memory_does_not_follow_project_links_out_of_the_project() {
 }
 
 #[test]
+fn memory_follows_project_links_to_global_rules_kept_elsewhere() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let claude = home.join(".claude");
+    // ~/.claude/rules lives in a dotfiles checkout, and a project links to it.
+    fs::create_dir_all(home.join("dotfiles/rules")).unwrap();
+    fs::write(home.join("dotfiles/rules/style.md"), "style rules\n").unwrap();
+    fs::create_dir_all(&claude).unwrap();
+    std::os::unix::fs::symlink(home.join("dotfiles/rules"), claude.join("rules")).unwrap();
+    let project = home.join("work/app");
+    fs::create_dir_all(project.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(claude.join("rules"), project.join(".claude/rules")).unwrap();
+
+    let assert = ah()
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("CLAUDE_CONFIG_DIR", &claude)
+        .env("CODEX_HOME", "/nonexistent")
+        .env("GEMINI_CLI_HOME", "/nonexistent")
+        .env("COPILOT_HOME", "/nonexistent")
+        .env("CURSOR_CONFIG_DIR", "/nonexistent")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["memory", "--tsv", "-o", "agent,project,name"])
+        .write_stdin("")
+        .assert()
+        .success();
+    let mut rows: Vec<String> = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    rows.sort();
+    // One real file: listed once, under the project that links to it.
+    assert_eq!(rows, ["claude\tapp\tstyle.md"]);
+}
+
+#[test]
 fn memory_project_cwd_skips_sessions_without_cwd() {
     let tmp = TempDir::new().unwrap();
     let home = fs::canonicalize(tmp.path()).unwrap();
