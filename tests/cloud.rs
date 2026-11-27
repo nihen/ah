@@ -380,7 +380,20 @@ esac
     );
 }
 
-/// A home with a Codex Cloud login for account `first` and the bridge
+/// An unsigned ID token with the ChatGPT user id claim, as Codex saves it.
+fn id_token(user: &str) -> String {
+    use base64::Engine;
+    let part = |v: Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string().as_bytes())
+    };
+    format!(
+        "{}.{}.sig",
+        part(json!({"alg":"none"})),
+        part(json!({"https://api.openai.com/auth":{"chatgpt_user_id":user}}))
+    )
+}
+
+/// A home with a Codex Cloud login (account `first`, user `user-1`) and the bridge
 /// `script`, enabled for `codex_conversations`. Returns the Codex home.
 fn codex_cloud_home(home: &std::path::Path, script: &str) -> std::path::PathBuf {
     let codex = home.join(".codex");
@@ -389,7 +402,8 @@ fn codex_cloud_home(home: &std::path::Path, script: &str) -> std::path::PathBuf 
     std::fs::write(
         &auth,
         json!({"auth_mode":"chatgpt","tokens":{
-            "access_token":"fixture-only", "account_id":"first","login_owner_id":"owner"
+            "access_token":"fixture-only", "account_id":"first","login_owner_id":"owner",
+            "id_token": id_token("user-1")
         }})
         .to_string(),
     )
@@ -704,7 +718,7 @@ fn a_long_thread_still_being_written_is_fetched() {
 }
 
 #[test]
-fn codex_app_catalog_with_several_users_of_the_account_is_not_used() {
+fn codex_app_catalog_rows_of_other_users_are_not_used() {
     const THREAD: &str = "aaaaaaaa-0000-0000-0000-000000000000";
     const APP_ID: &str = "bbbbbbbb-0000-0000-0000-000000000000";
     let tmp = tempfile::tempdir().unwrap();
@@ -723,14 +737,14 @@ esac
 "#
     );
     let codex = codex_cloud_home(home, &script);
-    // Two users of the signed-in account; which one is the login is unknown.
+    // Only another user of the account (e.g. an earlier login) has a thread
+    // at that time.
     let conn = rusqlite::Connection::open(codex.join("sqlite/codex.db")).unwrap();
     conn.execute_batch(&format!(
         "CREATE TABLE local_thread_catalog (host_id TEXT, thread_id TEXT, display_title TEXT,
            source_created_at REAL, source_kind TEXT, missing_candidate INTEGER);
          INSERT INTO local_thread_catalog VALUES
-           ('chatgpt:first:user-1', '{APP_ID}', 'Someone else', 1700000000.6, 'chatgpt', 0),
-           ('chatgpt:first:user-2', 'cccccccc-0000-0000-0000-000000000000', 'Mine', 1600000000.0, 'chatgpt', 0);"
+           ('chatgpt:first:user-2', '{APP_ID}', 'Someone else', 1700000000.6, 'chatgpt', 0);"
     ))
     .unwrap();
     drop(conn);
@@ -745,6 +759,65 @@ esac
         !ah_in(home, &codex, &["show", "--offline", "--json", APP_ID])
             .status
             .success()
+    );
+}
+
+#[test]
+fn a_thread_changed_during_a_long_fetch_is_checked_again() {
+    const THREAD: &str = "dddddddd-0000-0000-0000-000000000000";
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    // 80 pages; the thread changes once, after the first refresh.
+    let changed = home.join("changed");
+    let script = format!(
+        r#"#!/bin/sh
+req=$(cat)
+case "$req" in
+  *'"id":null'*)
+    when=1700000100; [ -e '{changed}' ] && when=1700000200
+    printf '{{"data":[{{"id":"{THREAD}","name":"","created":1700000000,"updated":%s}}],"nextCursor":null}}' $when
+    ;;
+  *'"cursor":null'*)
+    printf '%s' '{{"id":"{THREAD}","messages":[{{"role":"user","text":"start"}}],"nextCursor":"1"}}'
+    ;;
+  *)
+    n=$(printf '%s' "$req" | sed 's/.*"cursor":"\([0-9]*\)".*/\1/')
+    if [ "$n" = 79 ]; then
+      printf '%s' '{{"id":"{THREAD}","messages":[{{"role":"assistant","text":"end"}}],"nextCursor":null}}'
+    else
+      printf '{{"id":"{THREAD}","messages":[],"nextCursor":"%s"}}' $((n + 1))
+    fi
+    ;;
+esac
+"#,
+        changed = changed.display()
+    );
+    let codex = codex_cloud_home(home, &script);
+    let refresh = || {
+        let out = ah_in(
+            home,
+            &codex,
+            &["-a", "log", "--refresh", "--json", "-o", "coverage,path"],
+        );
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    let partial = |row: &Value| {
+        std::path::Path::new(row["path"].as_str().unwrap())
+            .with_file_name(format!(".{THREAD}.partial"))
+            .exists()
+    };
+    assert_eq!(refresh()["coverage"], "messages-partial");
+    std::fs::write(&changed, "").unwrap();
+    assert_eq!(refresh()["coverage"], "messages-partial");
+    // Finished, but read across the change: the next refresh starts over.
+    let done = refresh();
+    assert_eq!(done["coverage"], "messages");
+    assert!(!partial(&done));
+    let again = refresh();
+    assert_eq!(again["coverage"], "messages");
+    assert!(
+        partial(&again),
+        "a transcript read across a change is fetched again"
     );
 }
 

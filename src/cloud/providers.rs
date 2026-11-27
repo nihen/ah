@@ -64,6 +64,10 @@ struct Snapshot {
     /// is fetched over several refreshes, keeping what was read so far.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cursor: Option<String>,
+    /// The checkpoint's transcript was read across a change of the thread,
+    /// so the finished one is fetched again from the start.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    across_change: bool,
 }
 
 /// Bridge pages read for one transcript per refresh. Browser runs carry
@@ -90,15 +94,20 @@ fn app_threads() -> &'static [AppThread] {
         let (Some(base), Ok(login)) = (config::resolve_agent_base("codex"), super::source()) else {
             return Vec::new();
         };
-        read_app_threads(&base.join("sqlite/codex.db"), &login.account).unwrap_or_default()
+        // Rows are tied to a login by its user id; without it, none are used.
+        let Some(user) = login.user.as_deref() else {
+            return Vec::new();
+        };
+        let host = format!("chatgpt:{}:{user}", login.account);
+        read_app_threads(&base.join("sqlite/codex.db"), &host).unwrap_or_default()
     })
 }
 
-/// Rows of the app catalog `db` for `account` (its `host_id` is
-/// `chatgpt:<account>:<user>`). The live database is in WAL mode; it is
+/// Rows of the app catalog `db` for the login's `host`
+/// (`chatgpt:<account>:<user>`). The live database is in WAL mode; it is
 /// copied, with its log, and the copy is read, so nothing is written next
 /// to the app's files.
-fn read_app_threads(db: &Path, account: &str) -> Option<Vec<AppThread>> {
+fn read_app_threads(db: &Path, host: &str) -> Option<Vec<AppThread>> {
     if !db.is_file() {
         return None;
     }
@@ -110,29 +119,14 @@ fn read_app_threads(db: &Path, account: &str) -> Option<Vec<AppThread>> {
         fs::copy(&wal, dir.path().join("codex.db-wal")).ok()?;
     }
     let conn = rusqlite::Connection::open(&copy).ok()?;
-    let prefix = format!("chatgpt:{account}:");
-    // The user part of `host_id` cannot be tied to the login, so with more
-    // than one user of the account in the catalog, none is used.
-    let hosts: i64 = conn
-        .query_row(
-            "SELECT count(DISTINCT host_id) FROM local_thread_catalog \
-             WHERE source_kind = 'chatgpt' AND substr(host_id, 1, length(?1)) = ?1",
-            [&prefix],
-            |row| row.get(0),
-        )
-        .ok()?;
-    if hosts > 1 {
-        return None;
-    }
     let mut stmt = conn
         .prepare(
             "SELECT thread_id, display_title, source_created_at FROM local_thread_catalog \
-             WHERE source_kind = 'chatgpt' AND missing_candidate = 0 \
-               AND substr(host_id, 1, length(?1)) = ?1",
+             WHERE source_kind = 'chatgpt' AND missing_candidate = 0 AND host_id = ?1",
         )
         .ok()?;
     let rows = stmt
-        .query_map([prefix], |row| {
+        .query_map([host], |row| {
             Ok(AppThread {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -606,6 +600,7 @@ impl Source {
         }
         let mut shown = snapshot;
         shown.cursor = None;
+        shown.across_change = false;
         // Fetched again until done (see the checkpoint check in `refresh`).
         shown.revision = None;
         self.store(id, shown)
@@ -768,7 +763,7 @@ impl Source {
                 let mut across_change = false;
                 let (mut lines, mut cursor, mut first_created, mut last_updated) = match resume {
                     Some(saved) if saved.cursor.is_some() => {
-                        across_change = saved.revision != start_revision;
+                        across_change = saved.across_change || saved.revision != start_revision;
                         (saved.messages, saved.cursor, saved.created, saved.modified)
                     }
                     _ => (Vec::new(), None, None, None),
@@ -851,6 +846,7 @@ impl Source {
                 let mut data = snapshot(row, lines);
                 data.coverage = "messages-partial".into();
                 data.cursor = cursor;
+                data.across_change = across_change;
                 Ok(data)
             }
             Kind::Copilot => {
@@ -1031,7 +1027,13 @@ impl Source {
             }
             // Threads still being fetched in parts go last, so a long one
             // does not hold back new conversations.
-            changed.sort_by_key(|row| self.checkpoint_path(&row.id).exists());
+            // So does the recheck of a complete one fetched across a change.
+            changed.sort_by_key(|row| {
+                self.checkpoint_path(&row.id).exists()
+                    || read(&self.path(&row.id)).is_some_and(|s| {
+                        s.coverage == "messages" && s.revision.is_none() && !s.messages.is_empty()
+                    })
+            });
             for row in changed {
                 if Instant::now() >= deadline {
                     limited = true;
@@ -1310,6 +1312,7 @@ fn snapshot(row: Row, messages: Vec<Line>) -> Snapshot {
         revision: row.revision,
         messages,
         cursor: None,
+        across_change: false,
     }
 }
 
