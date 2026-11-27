@@ -468,6 +468,86 @@ esac
 }
 
 #[test]
+fn codex_app_ids_and_titles_find_cloud_threads() {
+    const THREAD: &str = "44444444-4444-4444-4444-444444444444";
+    const APP_ID: &str = "55555555-5555-5555-5555-555555555555";
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let codex = home.join(".codex");
+    std::fs::create_dir_all(codex.join("sqlite")).unwrap();
+    let auth = codex.join("auth.json");
+    std::fs::write(
+        &auth,
+        json!({"auth_mode":"chatgpt","tokens":{
+            "access_token":"fixture-only", "account_id":"first","login_owner_id":"owner"
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The desktop app lists the thread under its own id, with a title, and
+    // a creation time a fraction of a second off.
+    let conn = rusqlite::Connection::open(codex.join("sqlite/codex.db")).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TABLE local_thread_catalog (host_id TEXT, thread_id TEXT, display_title TEXT,
+           source_created_at REAL, source_kind TEXT, missing_candidate INTEGER);
+         INSERT INTO local_thread_catalog VALUES
+           ('chatgpt:x', '{APP_ID}', 'Tally settings survey', 1700000000.6, 'chatgpt', 0),
+           ('local', '66666666-6666-6666-6666-666666666666', 'Local', 1700000000.2, 'cli', 0);"
+    ))
+    .unwrap();
+    drop(conn);
+    let helper = home.join("bridge");
+    std::fs::write(&helper, format!(r#"#!/bin/sh
+req=$(cat)
+case "$req" in
+  *'"id":null'*)
+    printf '%s' '{{"data":[{{"id":"{THREAD}","name":"","created":1700000000,"updated":1700000100}}],"nextCursor":null}}'
+    ;;
+  *)
+    printf '%s' '{{"id":"{THREAD}","messages":[{{"role":"user","text":"open the DAO settings"}},{{"role":"assistant","text":"settings need a wallet sign-in"}}],"nextCursor":null}}'
+    ;;
+esac
+"#)).unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        home.join(".ahrc"),
+        format!("[cloud.codex_conversations]\nenabled = true\nhelper = {helper:?}\n"),
+    )
+    .unwrap();
+    let ah = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_ah"))
+            .env("HOME", home)
+            .env("CODEX_HOME", &codex)
+            .env_remove("AH_NO_CLOUD_SYNC")
+            .current_dir(home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = ah(&["-a", "log", "--refresh", "--json", "-o", "id,title"]);
+    let row: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(row["id"], THREAD);
+    assert_eq!(row["title"], "[cloud:messages] Tally settings survey");
+    // The id the app shows opens the same conversation.
+    let shown = ah(&["show", "--offline", "--json", APP_ID]);
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("settings need a wallet sign-in"));
+    // Other ids still fail.
+    let other = ah(&[
+        "show",
+        "--offline",
+        "--json",
+        "66666666-6666-6666-6666-666666666666",
+    ]);
+    assert!(!other.status.success());
+}
+
+#[test]
 fn claude_cloud_resume_prints_only_the_selected_session_link() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join(".ahrc"), "[cloud.claude]\nenabled = true\n").unwrap();

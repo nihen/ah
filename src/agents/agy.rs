@@ -58,7 +58,7 @@ fn pick_cwd_from_uris(uris: &[serde_json::Value]) -> Option<String> {
 
 /// Open `db` read-only without creating `-wal`/`-shm` sidecars next to it.
 /// Resolves symlinks first so a `-wal` file next to the real target is seen.
-fn open_db_read_only(db: &Path) -> Option<Connection> {
+pub(super) fn open_db_read_only(db: &Path) -> Option<Connection> {
     if !db.is_file() {
         return None;
     }

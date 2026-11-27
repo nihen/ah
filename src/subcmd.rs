@@ -340,7 +340,15 @@ pub fn resolve_session_ref_of(
     }
 
     // Try as session ID (use unquoted value)
-    resolve_by_id(unquoted, home, agent)
+    resolve_by_id(unquoted, home, agent).or_else(|err| {
+        // The Codex desktop app shows Cloud conversations under its own id.
+        if agent.is_none_or(|a| a == "codex")
+            && let Some(path) = crate::cloud::providers::app_thread_path(unquoted)
+        {
+            return crate::cloud::validate_cache_ref(path, home);
+        }
+        Err(err)
+    })
 }
 
 /// A session reference exists as a file, or as a virtual session of a plugin

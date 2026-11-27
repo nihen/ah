@@ -495,6 +495,12 @@ pub fn find_plugin_for_path(path: &Path) -> &'static dyn AgentPlugin {
     crate::config::find_plugin_for_path(path)
 }
 
+/// Open a SQLite database read-only without creating `-wal`/`-shm` files
+/// next to it (see the Antigravity reader).
+pub(crate) fn open_sqlite_read_only(db: &Path) -> Option<rusqlite::Connection> {
+    agy::open_db_read_only(db)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

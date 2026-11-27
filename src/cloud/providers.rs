@@ -71,6 +71,78 @@ struct Snapshot {
 /// read on later refreshes.
 const CODEX_PAGES_PER_FETCH: usize = 32;
 
+/// A conversation in the Codex desktop app's own catalog
+/// (`<CODEX_HOME>/sqlite/codex.db`). The app lists Cloud conversations (made
+/// e.g. by the ChatGPT app's browser) under its own thread id and with a
+/// title the Cloud service does not return; they are matched to ah's
+/// snapshots by creation time.
+struct AppThread {
+    id: String,
+    title: String,
+    created: i64,
+}
+
+/// The app's Cloud conversations, read once; empty without the app.
+fn app_threads() -> &'static [AppThread] {
+    static THREADS: std::sync::OnceLock<Vec<AppThread>> = std::sync::OnceLock::new();
+    THREADS.get_or_init(|| {
+        let Some(base) = config::resolve_agent_base("codex") else {
+            return Vec::new();
+        };
+        let Some(conn) = crate::agents::open_sqlite_read_only(&base.join("sqlite/codex.db")) else {
+            return Vec::new();
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT thread_id, display_title, CAST(source_created_at AS INTEGER) \
+             FROM local_thread_catalog WHERE source_kind = 'chatgpt' AND missing_candidate = 0",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map([], |row| {
+            Ok(AppThread {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                created: row.get(2)?,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    })
+}
+
+/// How far apart the app's and the Cloud service's creation times may be.
+const APP_CREATED_SLACK: i64 = 2;
+
+/// The app thread created when `created` was, if exactly one was.
+fn app_thread_at(created: Option<u64>) -> Option<&'static AppThread> {
+    let created = i64::try_from(created?).ok()?;
+    let mut near = app_threads()
+        .iter()
+        .filter(|t| (t.created - created).abs() <= APP_CREATED_SLACK);
+    let found = near.next()?;
+    near.next().is_none().then_some(found)
+}
+
+/// The Codex Cloud snapshot of the app thread `id`, so the id the app shows
+/// works with `ah show` and `ah resume`.
+pub(crate) fn app_thread_path(id: &str) -> Option<PathBuf> {
+    let thread = app_threads().iter().find(|t| t.id == id)?;
+    let mut found = active(Some("codex"))
+        .into_iter()
+        .filter(|s| s.kind == Kind::Codex)
+        .flat_map(|s| fs::read_dir(&s.cache).into_iter().flatten().flatten())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            source_for_path(path).is_some()
+                && read(path)
+                    .and_then(|s| s.created)
+                    .and_then(|c| app_thread_at(Some(c)))
+                    .is_some_and(|t| t.id == thread.id)
+        });
+    let path = found.next()?;
+    found.next().is_none().then_some(path)
+}
+
 /// The first line of the first prompt, as the title of a conversation the
 /// service left untitled.
 fn first_prompt_title(lines: &[Line]) -> Option<String> {
@@ -637,11 +709,8 @@ impl Source {
                 };
                 row.created = row.created.or(first_created);
                 row.modified = row.modified.or(last_updated).or(row.created);
-                if (row.title == row.id || row.title.trim().is_empty())
-                    && let Some(title) = first_prompt_title(&lines)
-                {
-                    row.title = title;
-                }
+                // An untitled thread keeps its empty title (or id): the title
+                // shown is chosen when listing (see `resolve_title`).
                 if complete {
                     return Ok(snapshot(row, lines));
                 }
@@ -1472,7 +1541,14 @@ impl AgentPlugin for SnapshotPlugin {
                 .file_stem()
                 .is_some_and(|id| id == snapshot.title.as_str())
         {
-            first_prompt_title(&snapshot.messages).unwrap_or(snapshot.title)
+            // The Codex app may know the title the service left out.
+            source_for_path(path)
+                .filter(|s| s.kind == Kind::Codex)
+                .and_then(|_| app_thread_at(snapshot.created))
+                .map(|t| t.title.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .or_else(|| first_prompt_title(&snapshot.messages))
+                .unwrap_or(snapshot.title)
         } else {
             snapshot.title
         };
