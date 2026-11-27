@@ -598,6 +598,156 @@ esac
     assert_eq!(sidecars(), before);
 }
 
+/// A bridge for one untitled thread of 40 pages whose messages are on the
+/// last page only; each listing moves its update time when `moving`.
+fn browser_thread_bridge(thread: &str, home: &std::path::Path, moving: bool) -> String {
+    let counter = home.join("listings");
+    let when = if moving {
+        format!(
+            "n=$(cat '{0}' 2>/dev/null || echo 0); n=$((n + 1)); echo $n > '{0}'; when=$((1700000100 + n))",
+            counter.display()
+        )
+    } else {
+        "when=1700000100".to_owned()
+    };
+    format!(
+        r#"#!/bin/sh
+req=$(cat)
+case "$req" in
+  *'"id":null'*)
+    {when}
+    printf '{{"data":[{{"id":"{thread}","name":"","created":1700000000,"updated":%s}}],"nextCursor":null}}' $when
+    ;;
+  *'"cursor":null'*)
+    printf '%s' '{{"id":"{thread}","messages":[],"nextCursor":"1"}}'
+    ;;
+  *)
+    n=$(printf '%s' "$req" | sed 's/.*"cursor":"\([0-9]*\)".*/\1/')
+    if [ "$n" = 39 ]; then
+      printf '%s' '{{"id":"{thread}","messages":[{{"role":"user","text":"inspect the page"}},{{"role":"assistant","text":"page inspected"}}],"nextCursor":null}}'
+    else
+      printf '{{"id":"{thread}","messages":[],"nextCursor":"%s"}}' $((n + 1))
+    fi
+    ;;
+esac
+"#
+    )
+}
+
+#[test]
+fn a_thread_without_messages_in_its_first_pages_opens_by_url() {
+    const THREAD: &str = "88888888-8888-8888-8888-888888888888";
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let codex = codex_cloud_home(home, &browser_thread_bridge(THREAD, home, false));
+    let url = format!("https://chatgpt.com/local/{THREAD}");
+    // Nothing to show yet, but the snapshot exists and the fetch goes on.
+    let first = ah_in(home, &codex, &["show", "--json", &url]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let out = ah_in(
+        home,
+        &codex,
+        &[
+            "-a",
+            "log",
+            "--refresh",
+            "--json",
+            "-o",
+            "coverage,transcript",
+        ],
+    );
+    let row: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(row["coverage"], "messages");
+    assert!(
+        row["transcript"]
+            .as_str()
+            .unwrap()
+            .contains("page inspected")
+    );
+}
+
+#[test]
+fn a_long_thread_still_being_written_is_fetched() {
+    const THREAD: &str = "99999999-9999-9999-9999-999999999999";
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let codex = codex_cloud_home(home, &browser_thread_bridge(THREAD, home, true));
+    let refresh = || {
+        let out = ah_in(
+            home,
+            &codex,
+            &[
+                "-a",
+                "log",
+                "--refresh",
+                "--json",
+                "-o",
+                "coverage,transcript",
+            ],
+        );
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    assert_ne!(refresh()["coverage"], "messages");
+    // The update time moves on every listing, yet the fetch continues.
+    let done = refresh();
+    assert_eq!(done["coverage"], "messages");
+    assert!(
+        done["transcript"]
+            .as_str()
+            .unwrap()
+            .contains("page inspected")
+    );
+}
+
+#[test]
+fn codex_app_catalog_with_several_users_of_the_account_is_not_used() {
+    const THREAD: &str = "aaaaaaaa-0000-0000-0000-000000000000";
+    const APP_ID: &str = "bbbbbbbb-0000-0000-0000-000000000000";
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let script = format!(
+        r#"#!/bin/sh
+req=$(cat)
+case "$req" in
+  *'"id":null'*)
+    printf '%s' '{{"data":[{{"id":"{THREAD}","name":"","created":1700000000,"updated":1700000100}}],"nextCursor":null}}'
+    ;;
+  *)
+    printf '%s' '{{"id":"{THREAD}","messages":[{{"role":"user","text":"first prompt"}}],"nextCursor":null}}'
+    ;;
+esac
+"#
+    );
+    let codex = codex_cloud_home(home, &script);
+    // Two users of the signed-in account; which one is the login is unknown.
+    let conn = rusqlite::Connection::open(codex.join("sqlite/codex.db")).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TABLE local_thread_catalog (host_id TEXT, thread_id TEXT, display_title TEXT,
+           source_created_at REAL, source_kind TEXT, missing_candidate INTEGER);
+         INSERT INTO local_thread_catalog VALUES
+           ('chatgpt:first:user-1', '{APP_ID}', 'Someone else', 1700000000.6, 'chatgpt', 0),
+           ('chatgpt:first:user-2', 'cccccccc-0000-0000-0000-000000000000', 'Mine', 1600000000.0, 'chatgpt', 0);"
+    ))
+    .unwrap();
+    drop(conn);
+    let out = ah_in(
+        home,
+        &codex,
+        &["-a", "log", "--refresh", "--json", "-o", "title"],
+    );
+    let row: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(row["title"], "[cloud:messages] first prompt");
+    assert!(
+        !ah_in(home, &codex, &["show", "--offline", "--json", APP_ID])
+            .status
+            .success()
+    );
+}
+
 #[test]
 fn claude_cloud_resume_prints_only_the_selected_session_link() {
     let tmp = tempfile::tempdir().unwrap();

@@ -110,6 +110,20 @@ fn read_app_threads(db: &Path, account: &str) -> Option<Vec<AppThread>> {
         fs::copy(&wal, dir.path().join("codex.db-wal")).ok()?;
     }
     let conn = rusqlite::Connection::open(&copy).ok()?;
+    let prefix = format!("chatgpt:{account}:");
+    // The user part of `host_id` cannot be tied to the login, so with more
+    // than one user of the account in the catalog, none is used.
+    let hosts: i64 = conn
+        .query_row(
+            "SELECT count(DISTINCT host_id) FROM local_thread_catalog \
+             WHERE source_kind = 'chatgpt' AND substr(host_id, 1, length(?1)) = ?1",
+            [&prefix],
+            |row| row.get(0),
+        )
+        .ok()?;
+    if hosts > 1 {
+        return None;
+    }
     let mut stmt = conn
         .prepare(
             "SELECT thread_id, display_title, source_created_at FROM local_thread_catalog \
@@ -117,7 +131,6 @@ fn read_app_threads(db: &Path, account: &str) -> Option<Vec<AppThread>> {
                AND substr(host_id, 1, length(?1)) = ?1",
         )
         .ok()?;
-    let prefix = format!("chatgpt:{account}:");
     let rows = stmt
         .query_map([prefix], |row| {
             Ok(AppThread {
@@ -588,7 +601,7 @@ impl Source {
         let path = self.path(id);
         let complete =
             read(&path).is_some_and(|s| s.coverage == "messages" && !s.messages.is_empty());
-        if complete || snapshot.messages.is_empty() {
+        if complete || (snapshot.messages.is_empty() && path.exists()) {
             return Ok(path);
         }
         let mut shown = snapshot;
@@ -748,23 +761,29 @@ impl Source {
                     revision: None,
                 });
                 // Continue an incomplete transcript where the last refresh
-                // stopped, unless the thread changed since: then the saved
-                // part may no longer match, so start over.
+                // stopped. A thread still being written to keeps changing, so
+                // the fetch goes on across changes; a transcript put together
+                // across a change is checked once more from the start.
                 let start_revision = row.revision.clone();
+                let mut across_change = false;
                 let (mut lines, mut cursor, mut first_created, mut last_updated) = match resume {
-                    Some(saved)
-                        if saved.cursor.is_some()
-                            && (saved.revision.is_none()
-                                || start_revision.is_none()
-                                || saved.revision == start_revision) =>
-                    {
+                    Some(saved) if saved.cursor.is_some() => {
+                        across_change = saved.revision != start_revision;
                         (saved.messages, saved.cursor, saved.created, saved.modified)
                     }
                     _ => (Vec::new(), None, None, None),
                 };
                 let resumed = cursor.is_some();
+                // A resumed fetch that hits a broken page cannot go on from
+                // its saved position: start over next time.
+                let fail = |e: &'static str| {
+                    if resumed {
+                        self.drop_checkpoint(id);
+                    }
+                    e
+                };
                 let mut length: usize = lines.iter().map(|l| l.text.len()).sum();
-                let mut seen = std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<String> = cursor.iter().cloned().collect();
                 let mut pages = 0;
                 let complete = loop {
                     if pages == CODEX_PAGES_PER_FETCH {
@@ -774,18 +793,15 @@ impl Source {
                         Ok(page) => page,
                         // Out of time: keep what was read for the next refresh.
                         Err(_) if pages > 0 => break false,
+                        // Out of time before the first page: try again later.
+                        Err(e @ ("deadline reached" | "helper timed out")) => return Err(e),
                         // The saved position no longer works (an expired
                         // cursor, a deleted thread): start over next time.
-                        Err(e) => {
-                            if resumed {
-                                self.drop_checkpoint(id);
-                            }
-                            return Err(e);
-                        }
+                        Err(e) => return Err(fail(e)),
                     };
                     pages += 1;
                     if page["id"].as_str() != Some(id) {
-                        return Err("session ID mismatch");
+                        return Err(fail("session ID mismatch"));
                     }
                     if let Some(t) = page["created"].as_u64() {
                         first_created = Some(first_created.map_or(t, |old| old.min(t)));
@@ -795,22 +811,27 @@ impl Source {
                     }
                     let messages = page["messages"]
                         .as_array()
-                        .ok_or("unsupported transcript")?;
+                        .ok_or_else(|| fail("unsupported transcript"))?;
                     for msg in messages {
-                        length += msg["text"].as_str().ok_or("invalid transcript item")?.len();
+                        length += msg["text"]
+                            .as_str()
+                            .ok_or_else(|| fail("invalid transcript item"))?
+                            .len();
                         if length > MAX_BODY as usize {
-                            return Err("transcript exceeds size limit");
+                            return Err(fail("transcript exceeds size limit"));
                         }
                         lines.push(
                             serde_json::from_value(msg.clone())
-                                .map_err(|_| "invalid transcript item")?,
+                                .map_err(|_| fail("invalid transcript item"))?,
                         );
                     }
                     let Some(next) = page["nextCursor"].as_str() else {
                         break true;
                     };
+                    // The saved cursor counts as seen: a page pointing back
+                    // to it loops.
                     if !seen.insert(next.to_owned()) {
-                        return Err("repeated pagination cursor");
+                        return Err(fail("repeated pagination cursor"));
                     }
                     cursor = Some(next.to_owned());
                 };
@@ -819,6 +840,10 @@ impl Source {
                 // An untitled thread keeps its empty title (or id): the title
                 // shown is chosen when listing (see `resolve_title`).
                 if complete {
+                    if across_change {
+                        // Not the revision of any single moment: fetch again.
+                        row.revision = None;
+                    }
                     return Ok(snapshot(row, lines));
                 }
                 // The checkpoint keeps the revision the fetch started from.
@@ -978,7 +1003,10 @@ impl Source {
                 // Revalidate periodically even if upstream time has not
                 // changed; --refresh bypasses the refresh TTL, not this
                 // per-record debounce.
-                let unfinished = self.checkpoint_path(&row.id).exists();
+                let unfinished = self.checkpoint_path(&row.id).exists()
+                    || cached
+                        .as_ref()
+                        .is_some_and(|c| c.coverage == "messages-partial");
                 match cached {
                     Some(current)
                         if current.fetched != 0
@@ -1001,6 +1029,9 @@ impl Source {
                 changed.push(row);
                 revalidation_used = true;
             }
+            // Threads still being fetched in parts go last, so a long one
+            // does not hold back new conversations.
+            changed.sort_by_key(|row| self.checkpoint_path(&row.id).exists());
             for row in changed {
                 if Instant::now() >= deadline {
                     limited = true;
