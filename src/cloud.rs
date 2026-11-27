@@ -24,6 +24,8 @@ struct Source {
     access_token: String,
     account: String,
     owner: String,
+    /// The ChatGPT user id of the login (from its ID token), if known.
+    user: Option<String>,
     root: PathBuf,
     cache: PathBuf,
 }
@@ -39,6 +41,21 @@ struct Tokens {
     access_token: String,
     account_id: String,
     login_owner_id: String,
+    #[serde(default)]
+    id_token: Option<String>,
+}
+
+/// The `chatgpt_user_id` claim of a Codex login's ID token. The token is
+/// only read, not verified: it comes from the user's own login file.
+fn chatgpt_user_id(id_token: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = id_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    let user = claims["https://api.openai.com/auth"]["chatgpt_user_id"].as_str()?;
+    safe_header(user).then(|| user.to_owned())
 }
 
 pub fn enabled() -> bool {
@@ -90,6 +107,7 @@ fn read_source() -> Result<Source, &'static str> {
     let root = home.join(".ah-codex-cloud");
     let cache = root.join(crate::agents::common::hex(&namespace));
     Ok(Source {
+        user: t.id_token.as_deref().and_then(chatgpt_user_id),
         access_token: t.access_token,
         account: t.account_id,
         owner: t.login_owner_id,
@@ -688,6 +706,7 @@ mod tests {
             access_token: "example".into(),
             account: "example".into(),
             owner: "owner".into(),
+            user: None,
             cache: root.join("example"),
             root,
         }

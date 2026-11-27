@@ -60,6 +60,163 @@ struct Snapshot {
     created: Option<u64>,
     revision: Option<String>,
     messages: Vec<Line>,
+    /// Where an incomplete transcript continues: a long Codex Cloud thread
+    /// is fetched over several refreshes, keeping what was read so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+    /// The checkpoint's transcript was read across a change of the thread,
+    /// so the finished one is fetched again from the start.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    across_change: bool,
+}
+
+/// Bridge pages read for one transcript per refresh. Browser runs carry
+/// hundreds of non-message items, so a thread can need more; the rest is
+/// read on later refreshes.
+const CODEX_PAGES_PER_FETCH: usize = 32;
+
+/// A conversation in the Codex desktop app's own catalog
+/// (`<CODEX_HOME>/sqlite/codex.db`). The app lists Cloud conversations (made
+/// e.g. by the ChatGPT app's browser) under its own thread id and with a
+/// title the Cloud service does not return; they are matched to ah's
+/// snapshots by creation time.
+struct AppThread {
+    id: String,
+    title: String,
+    created: f64,
+}
+
+/// The app's Cloud conversations of the signed-in account, read once;
+/// empty without the app or a Codex Cloud login.
+fn app_threads() -> &'static [AppThread] {
+    static THREADS: std::sync::OnceLock<Vec<AppThread>> = std::sync::OnceLock::new();
+    THREADS.get_or_init(|| {
+        let (Some(base), Ok(login)) = (config::resolve_agent_base("codex"), super::source()) else {
+            return Vec::new();
+        };
+        // Rows are tied to a login by its user id; without it, none are used.
+        let Some(user) = login.user.as_deref() else {
+            return Vec::new();
+        };
+        let host = format!("chatgpt:{}:{user}", login.account);
+        read_app_threads(&base.join("sqlite/codex.db"), &host).unwrap_or_default()
+    })
+}
+
+/// Rows of the app catalog `db` for the login's `host`
+/// (`chatgpt:<account>:<user>`). The live database is in WAL mode; it is
+/// copied, with its log, and the copy is read, so nothing is written next
+/// to the app's files.
+fn read_app_threads(db: &Path, host: &str) -> Option<Vec<AppThread>> {
+    if !db.is_file() {
+        return None;
+    }
+    let dir = tempfile::tempdir().ok()?;
+    let copy = dir.path().join("codex.db");
+    fs::copy(db, &copy).ok()?;
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+    if wal.is_file() {
+        fs::copy(&wal, dir.path().join("codex.db-wal")).ok()?;
+    }
+    let conn = rusqlite::Connection::open(&copy).ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT thread_id, display_title, source_created_at FROM local_thread_catalog \
+             WHERE source_kind = 'chatgpt' AND missing_candidate = 0 AND host_id = ?1",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([host], |row| {
+            Ok(AppThread {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                created: row.get(2)?,
+            })
+        })
+        .ok()?
+        .flatten()
+        .collect();
+    Some(rows)
+}
+
+/// How much later the app records a thread than the Cloud service's
+/// whole-second creation time: measured 0.3 to 1.2 seconds, while the app's
+/// threads are many seconds apart.
+const APP_CREATED_LAG: std::ops::RangeInclusive<f64> = 0.0..=1.5;
+
+fn app_lag_matches(app: f64, cloud: u64) -> bool {
+    APP_CREATED_LAG.contains(&(app - cloud as f64))
+}
+
+/// The app thread created right after `created`, if exactly one was.
+fn app_thread_at(created: Option<u64>) -> Option<&'static AppThread> {
+    let created = created?;
+    let mut near = app_threads()
+        .iter()
+        .filter(|t| app_lag_matches(t.created, created));
+    let found = near.next()?;
+    near.next().is_none().then_some(found)
+}
+
+fn codex_snapshot_paths() -> impl Iterator<Item = PathBuf> {
+    active(Some("codex"))
+        .into_iter()
+        .filter(|s| s.kind == Kind::Codex)
+        .flat_map(|s| fs::read_dir(&s.cache).into_iter().flatten().flatten())
+        .map(|entry| entry.path())
+        .filter(|path| source_for_path(path).is_some())
+}
+
+/// Creation times of the Codex Cloud snapshots, with how many share each.
+fn codex_snapshot_times() -> &'static std::collections::HashMap<u64, usize> {
+    static TIMES: std::sync::OnceLock<std::collections::HashMap<u64, usize>> =
+        std::sync::OnceLock::new();
+    TIMES.get_or_init(|| {
+        let mut times = std::collections::HashMap::new();
+        for path in codex_snapshot_paths() {
+            if let Some(created) = read(&path).and_then(|s| s.created) {
+                *times.entry(created).or_insert(0) += 1;
+            }
+        }
+        times
+    })
+}
+
+/// The app thread of the snapshot created at `created`, when the two match
+/// one to one: no other app thread, and no other snapshot, at that time.
+fn app_thread_of_snapshot(created: Option<u64>) -> Option<&'static AppThread> {
+    if app_threads().is_empty() {
+        return None;
+    }
+    let thread = app_thread_at(created)?;
+    let snapshots: usize = codex_snapshot_times()
+        .iter()
+        .filter(|(t, _)| app_lag_matches(thread.created, **t))
+        .map(|(_, n)| n)
+        .sum();
+    (snapshots == 1).then_some(thread)
+}
+
+/// The Codex Cloud snapshot of the app thread `id`, so the id the app shows
+/// works with `ah show` and `ah resume`.
+pub(crate) fn app_thread_path(id: &str) -> Option<PathBuf> {
+    let thread = app_threads().iter().find(|t| t.id == id)?;
+    let mut found = codex_snapshot_paths().filter(|path| {
+        app_thread_of_snapshot(read(path).and_then(|s| s.created))
+            .is_some_and(|t| t.id == thread.id)
+    });
+    let path = found.next()?;
+    found.next().is_none().then_some(path)
+}
+
+/// The first line of the first prompt, as the title of a conversation the
+/// service left untitled.
+fn first_prompt_title(lines: &[Line]) -> Option<String> {
+    lines
+        .iter()
+        .find(|line| line.role == "user")
+        .and_then(|line| line.text.lines().find(|l| !l.trim().is_empty()))
+        .map(|line| line.trim().chars().take(180).collect())
 }
 
 fn open_code_origin(input: &str) -> Option<String> {
@@ -413,6 +570,41 @@ impl Source {
     fn path(&self, id: &str) -> PathBuf {
         self.cache.join(format!("{id}.json"))
     }
+    /// An unfinished transcript fetch, kept apart from the published
+    /// snapshot so a complete one is not replaced by a part of it.
+    fn checkpoint_path(&self, id: &str) -> PathBuf {
+        self.cache.join(format!(".{id}.partial"))
+    }
+    fn drop_checkpoint(&self, id: &str) {
+        let _ = fs::remove_file(self.checkpoint_path(id));
+    }
+    /// Store a fetched transcript. A finished one is published and ends any
+    /// checkpoint. An unfinished one becomes the checkpoint; it is published
+    /// only while nothing more complete is, so it can be found meanwhile.
+    fn publish(&self, id: &str, snapshot: Snapshot) -> Result<PathBuf, &'static str> {
+        if snapshot.cursor.is_none() {
+            let published = self.store(id, snapshot)?;
+            self.drop_checkpoint(id);
+            return Ok(published);
+        }
+        let mut temp =
+            tempfile::NamedTempFile::new_in(&self.cache).map_err(|_| "cannot save progress")?;
+        serde_json::to_writer(&mut temp, &snapshot).map_err(|_| "cannot save progress")?;
+        temp.persist(self.checkpoint_path(id))
+            .map_err(|_| "cannot save progress")?;
+        let path = self.path(id);
+        let complete =
+            read(&path).is_some_and(|s| s.coverage == "messages" && !s.messages.is_empty());
+        if complete || (snapshot.messages.is_empty() && path.exists()) {
+            return Ok(path);
+        }
+        let mut shown = snapshot;
+        shown.cursor = None;
+        shown.across_change = false;
+        // Fetched again until done (see the checkpoint check in `refresh`).
+        shown.revision = None;
+        self.store(id, shown)
+    }
     fn http(&self) -> ureq::Agent {
         ureq::Agent::config_builder()
             .max_redirects(0)
@@ -504,7 +696,7 @@ impl Source {
         Ok(Row {
             modified: modified.or(created),
             id: id.to_owned(),
-            title: title.unwrap_or(id).into(),
+            title: title.filter(|t| !t.trim().is_empty()).unwrap_or(id).into(),
             created,
             revision,
         })
@@ -514,6 +706,7 @@ impl Source {
         http: &ureq::Agent,
         id: &str,
         hint: Option<Row>,
+        resume: Option<Snapshot>,
         deadline: Instant,
     ) -> Result<Snapshot, &'static str> {
         match self.kind {
@@ -555,23 +748,55 @@ impl Source {
                 Ok(data)
             }
             Kind::Codex => {
-                let row = hint.unwrap_or_else(|| Row {
+                let mut row = hint.unwrap_or_else(|| Row {
                     id: id.into(),
                     title: id.into(),
                     modified: None,
                     created: None,
                     revision: None,
                 });
-                let mut lines = Vec::new();
-                let mut length = 0usize;
-                let mut first_created: Option<u64> = None;
-                let mut last_updated: Option<u64> = None;
-                let mut cursor = None;
-                let mut seen = std::collections::HashSet::new();
-                for _ in 0..32 {
-                    let page = self.run_bridge(Some(id), cursor.as_deref(), deadline)?;
+                // Continue an incomplete transcript where the last refresh
+                // stopped. A thread still being written to keeps changing, so
+                // the fetch goes on across changes; a transcript put together
+                // across a change is checked once more from the start.
+                let start_revision = row.revision.clone();
+                let mut across_change = false;
+                let (mut lines, mut cursor, mut first_created, mut last_updated) = match resume {
+                    Some(saved) if saved.cursor.is_some() => {
+                        across_change = saved.across_change || saved.revision != start_revision;
+                        (saved.messages, saved.cursor, saved.created, saved.modified)
+                    }
+                    _ => (Vec::new(), None, None, None),
+                };
+                let resumed = cursor.is_some();
+                // A resumed fetch that hits a broken page cannot go on from
+                // its saved position: start over next time.
+                let fail = |e: &'static str| {
+                    if resumed {
+                        self.drop_checkpoint(id);
+                    }
+                    e
+                };
+                let mut length: usize = lines.iter().map(|l| l.text.len()).sum();
+                let mut seen: std::collections::HashSet<String> = cursor.iter().cloned().collect();
+                let mut pages = 0;
+                let complete = loop {
+                    if pages == CODEX_PAGES_PER_FETCH {
+                        break false;
+                    }
+                    let page = match self.run_bridge(Some(id), cursor.as_deref(), deadline) {
+                        Ok(page) => page,
+                        // Out of time: keep what was read for the next refresh.
+                        Err(_) if pages > 0 => break false,
+                        // Out of time before the first page: try again later.
+                        Err(e @ ("deadline reached" | "helper timed out")) => return Err(e),
+                        // The saved position no longer works (an expired
+                        // cursor, a deleted thread): start over next time.
+                        Err(e) => return Err(fail(e)),
+                    };
+                    pages += 1;
                     if page["id"].as_str() != Some(id) {
-                        return Err("session ID mismatch");
+                        return Err(fail("session ID mismatch"));
                     }
                     if let Some(t) = page["created"].as_u64() {
                         first_created = Some(first_created.map_or(t, |old| old.min(t)));
@@ -581,42 +806,48 @@ impl Source {
                     }
                     let messages = page["messages"]
                         .as_array()
-                        .ok_or("unsupported transcript")?;
+                        .ok_or_else(|| fail("unsupported transcript"))?;
                     for msg in messages {
-                        length += msg["text"].as_str().ok_or("invalid transcript item")?.len();
+                        length += msg["text"]
+                            .as_str()
+                            .ok_or_else(|| fail("invalid transcript item"))?
+                            .len();
                         if length > MAX_BODY as usize {
-                            return Err("transcript exceeds size limit");
+                            return Err(fail("transcript exceeds size limit"));
                         }
                         lines.push(
                             serde_json::from_value(msg.clone())
-                                .map_err(|_| "invalid transcript item")?,
+                                .map_err(|_| fail("invalid transcript item"))?,
                         );
                     }
                     let Some(next) = page["nextCursor"].as_str() else {
-                        let mut row = row;
-                        row.created = row.created.or(first_created);
-                        row.modified = row.modified.or(last_updated).or(row.created);
-                        if row.title == row.id
-                            && let Some(first) =
-                                lines.iter().find(|line: &&Line| line.role == "user")
-                        {
-                            row.title = first
-                                .text
-                                .lines()
-                                .next()
-                                .unwrap_or(id)
-                                .chars()
-                                .take(180)
-                                .collect();
-                        }
-                        return Ok(snapshot(row, lines));
+                        break true;
                     };
+                    // The saved cursor counts as seen: a page pointing back
+                    // to it loops.
                     if !seen.insert(next.to_owned()) {
-                        return Err("repeated pagination cursor");
+                        return Err(fail("repeated pagination cursor"));
                     }
                     cursor = Some(next.to_owned());
+                };
+                row.created = row.created.or(first_created);
+                row.modified = row.modified.or(last_updated).or(row.created);
+                // An untitled thread keeps its empty title (or id): the title
+                // shown is chosen when listing (see `resolve_title`).
+                if complete {
+                    if across_change {
+                        // Not the revision of any single moment: fetch again.
+                        row.revision = None;
+                    }
+                    return Ok(snapshot(row, lines));
                 }
-                Err("transcript paging limit reached")
+                // The checkpoint keeps the revision the fetch started from.
+                row.revision = start_revision;
+                let mut data = snapshot(row, lines);
+                data.coverage = "messages-partial".into();
+                data.cursor = cursor;
+                data.across_change = across_change;
+                Ok(data)
             }
             Kind::Copilot => {
                 let detail = self.get(http, &format!("/agents/tasks/{id}"), deadline)?;
@@ -768,9 +999,14 @@ impl Source {
                 // Revalidate periodically even if upstream time has not
                 // changed; --refresh bypasses the refresh TTL, not this
                 // per-record debounce.
+                let unfinished = self.checkpoint_path(&row.id).exists()
+                    || cached
+                        .as_ref()
+                        .is_some_and(|c| c.coverage == "messages-partial");
                 match cached {
                     Some(current)
                         if current.fetched != 0
+                            && !unfinished
                             && (row.revision.is_none() || current.revision == row.revision) =>
                     {
                         if !revalidation_used
@@ -789,6 +1025,15 @@ impl Source {
                 changed.push(row);
                 revalidation_used = true;
             }
+            // Threads still being fetched in parts go last, so a long one
+            // does not hold back new conversations.
+            // So does the recheck of a complete one fetched across a change.
+            changed.sort_by_key(|row| {
+                self.checkpoint_path(&row.id).exists()
+                    || read(&self.path(&row.id)).is_some_and(|s| {
+                        s.coverage == "messages" && s.revision.is_none() && !s.messages.is_empty()
+                    })
+            });
             for row in changed {
                 if Instant::now() >= deadline {
                     limited = true;
@@ -800,9 +1045,10 @@ impl Source {
                 if !force && super::recent_stamp(&self.cache.join(&retry), cooldown) {
                     continue;
                 }
+                let resume = read(&self.checkpoint_path(&id));
                 if let Err(e) = self
-                    .detail(&http, &id, Some(row), deadline)
-                    .and_then(|s| self.store(&id, s).map(drop))
+                    .detail(&http, &id, Some(row), resume, deadline)
+                    .and_then(|s| self.publish(&id, s).map(drop))
                 {
                     error.get_or_insert(e);
                     super::write_stamp(&self.cache, &retry)?;
@@ -1065,6 +1311,8 @@ fn snapshot(row: Row, messages: Vec<Line>) -> Snapshot {
         created: row.created,
         revision: row.revision,
         messages,
+        cursor: None,
+        across_change: false,
     }
 }
 
@@ -1262,9 +1510,10 @@ fn fetch_source(
                 modified: s.modified,
                 revision: s.revision.clone(),
             });
+        let resume = read(&source.checkpoint_path(id));
         match source
-            .detail(&http, id, hint, deadline)
-            .and_then(|snapshot| source.store(id, snapshot))
+            .detail(&http, id, hint, resume, deadline)
+            .and_then(|snapshot| source.publish(id, snapshot))
         {
             Ok(published) => Ok(Some(published)),
             Err(err) if cached.is_some() && source_for_path(&path).is_some() => {
@@ -1428,7 +1677,25 @@ impl AgentPlugin for SnapshotPlugin {
     }
     fn resolve_title(&self, path: &Path, _home: &Path) -> Option<String> {
         let snapshot = read(path)?;
-        Some(format!("[cloud:{}] {}", snapshot.coverage, snapshot.title))
+        // Some services leave a conversation untitled (an empty title, or
+        // just its id); show its first prompt instead.
+        let title = if snapshot.title.trim().is_empty()
+            || path
+                .file_stem()
+                .is_some_and(|id| id == snapshot.title.as_str())
+        {
+            // The Codex app may know the title the service left out.
+            source_for_path(path)
+                .filter(|s| s.kind == Kind::Codex)
+                .and_then(|_| app_thread_of_snapshot(snapshot.created))
+                .map(|t| t.title.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .or_else(|| first_prompt_title(&snapshot.messages))
+                .unwrap_or(snapshot.title)
+        } else {
+            snapshot.title
+        };
+        Some(format!("[cloud:{}] {}", snapshot.coverage, title))
     }
     fn resume_args(&self, path: &Path, _home: &Path) -> Option<Vec<String>> {
         let url = url_for_path(path)?;
@@ -1588,12 +1855,14 @@ mod tests {
             |source, deadline| {
                 let http = source.http();
                 let full = source
-                    .detail(&http, "bc_example", None, deadline)
+                    .detail(&http, "bc_example", None, None, deadline)
                     .ok()
                     .unwrap();
                 assert_eq!(full.messages[2].text, "second");
                 assert_eq!(
-                    source.detail(&http, "bc_example", None, deadline).err(),
+                    source
+                        .detail(&http, "bc_example", None, None, deadline)
+                        .err(),
                     Some("session ID mismatch")
                 );
             },
@@ -1616,13 +1885,13 @@ mod tests {
             ],
             |source, deadline| {
                 let http = source.http();
-                let p = source.detail(&http, ID, None, deadline).ok().unwrap();
+                let p = source.detail(&http, ID, None, None, deadline).ok().unwrap();
                 assert_eq!(p.coverage, "prompt-only");
                 assert_eq!(p.messages.len(), 1);
                 assert_eq!(p.messages[0].role, "user");
                 assert!(source.url(ID).is_empty());
                 assert_eq!(
-                    source.detail(&http, ID, None, deadline).err(),
+                    source.detail(&http, ID, None, None, deadline).err(),
                     Some("login rejected")
                 );
             },
