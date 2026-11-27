@@ -259,11 +259,15 @@ fn read_entry(
 
 /// Expand memory sources into entries. Skills are listed only on request
 /// (`-t skill`), since installed skills can far outnumber memory files.
+/// Read the files of `sources`. With `within`, a file is read only when its
+/// resolved path lies under one of those (canonical) directories, so a
+/// symlink in a project cannot pull in an arbitrary file of the host.
 fn expand_sources(
     sources: Vec<MemorySource>,
     agent: &'static str,
     project: &str,
     with_skills: bool,
+    within: Option<&[PathBuf]>,
 ) -> Vec<MemoryEntry> {
     let mut entries = Vec::new();
     for source in sources {
@@ -278,6 +282,12 @@ fn expand_sources(
         entries.extend(paths.into_iter().filter_map(|p| {
             if crate::cancel::checkpoint() {
                 return None;
+            }
+            if let Some(roots) = within {
+                let real = fs::canonicalize(&p).ok()?;
+                if !roots.iter().any(|root| real.starts_with(root)) {
+                    return None;
+                }
             }
             read_entry(p, agent, project, source.kind)
         }));
@@ -403,16 +413,22 @@ fn collect_project_files(
     dir: &Path,
     plugins: &[&'static dyn AgentPlugin],
     with_skills: bool,
+    agent_dirs: &[PathBuf],
 ) -> Vec<MemoryEntry> {
     let project = dir
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
+    // Project files may be symlinks; only those that resolve inside the
+    // project or into an agent's own configuration are read.
+    let mut within: Vec<PathBuf> = fs::canonicalize(dir).into_iter().collect();
+    within.extend(agent_dirs.iter().cloned());
     let mut entries = expand_sources(
         shared_project_sources(dir),
         SHARED_AGENT,
         &project,
         with_skills,
+        Some(&within),
     );
     for plugin in plugins {
         entries.extend(expand_sources(
@@ -420,9 +436,28 @@ fn collect_project_files(
             plugin.id(),
             &project,
             with_skills,
+            Some(&within),
         ));
     }
     entries
+}
+
+/// Agents' own configuration directories (`~/.claude`, `~/.agents`, ...),
+/// canonical. The home directory itself and its ancestors are left out.
+fn agent_config_dirs(home: &Path, plugins: &[&'static dyn AgentPlugin]) -> Vec<PathBuf> {
+    let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let mut dirs: Vec<PathBuf> = plugins
+        .iter()
+        .flat_map(|p| p.global_memory_sources(&home))
+        .chain(shared_global_sources(&home))
+        .map(|s| s.base)
+        .filter(|base| !base.as_os_str().is_empty())
+        .filter_map(|base| fs::canonicalize(base).ok())
+        .filter(|base| !home.starts_with(base))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 /// Where a file sits: its canonical parent directory plus its own name.
@@ -531,6 +566,7 @@ pub fn build_memory_records(
             plugin.id(),
             GLOBAL_PROJECT,
             with_skills,
+            None,
         ));
     }
     global_entries.extend(expand_sources(
@@ -538,6 +574,7 @@ pub fn build_memory_records(
         SHARED_AGENT,
         GLOBAL_PROJECT,
         with_skills,
+        None,
     ));
     // A project scan of the home directory itself reaches global files
     // (e.g. `~/.claude/CLAUDE.md` as `<dir>/.claude/CLAUDE.md`); those stay
@@ -551,6 +588,7 @@ pub fn build_memory_records(
         .collect();
 
     // 3. Project files (listed before global ones, see dedup below)
+    let agent_dirs = agent_config_dirs(&home, &plugins);
     let project_dirs: Vec<PathBuf> = if filter.all {
         // Scan known project cwds and their repository roots (sorted so
         // duplicate resolution is stable)
@@ -577,7 +615,7 @@ pub fn build_memory_records(
             // directory inside the project (e.g. `.claude/rules` shared with
             // `~/.claude/rules`) keeps its files attributed to the project.
             let root = fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
-            collect_project_files(dir, &plugins, with_skills)
+            collect_project_files(dir, &plugins, with_skills, &agent_dirs)
                 .into_iter()
                 .filter(|e| {
                     let key = match e.path.strip_prefix(dir) {

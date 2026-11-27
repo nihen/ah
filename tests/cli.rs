@@ -2111,10 +2111,12 @@ fn memory_keeps_project_attribution_for_symlinked_files() {
     // Project CLAUDE.md is a symlink to the global one.
     fs::write(claude.join("CLAUDE.md"), "global rules\n").unwrap();
     std::os::unix::fs::symlink(claude.join("CLAUDE.md"), a.join("CLAUDE.md")).unwrap();
-    // Two projects share one real AGENTS.md.
-    fs::write(home.join("AGENTS.md"), "shared rules\n").unwrap();
-    std::os::unix::fs::symlink(home.join("AGENTS.md"), a.join("AGENTS.md")).unwrap();
-    std::os::unix::fs::symlink(home.join("AGENTS.md"), b.join("AGENTS.md")).unwrap();
+    // Two projects share one real AGENTS.md kept with the agents' files.
+    let shared = claude.join("shared/AGENTS.md");
+    fs::create_dir_all(shared.parent().unwrap()).unwrap();
+    fs::write(&shared, "shared rules\n").unwrap();
+    std::os::unix::fs::symlink(&shared, a.join("AGENTS.md")).unwrap();
+    std::os::unix::fs::symlink(&shared, b.join("AGENTS.md")).unwrap();
     // Sessions so that -a discovers both projects.
     for (i, p) in [&a, &b].into_iter().enumerate() {
         let dir = claude.join(format!("projects/p{i}"));
@@ -2177,6 +2179,62 @@ fn memory_keeps_project_attribution_for_symlinked_files() {
             "AGENTS.md\n"
         );
     }
+}
+
+#[test]
+fn memory_does_not_follow_project_links_out_of_the_project() {
+    let tmp = TempDir::new().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let claude = home.join(".claude");
+    let project = home.join("work/evil");
+    fs::create_dir_all(project.join(".git")).unwrap();
+    fs::create_dir_all(&claude).unwrap();
+    let outside = home.join("secret");
+    fs::create_dir_all(outside.join("skills/s")).unwrap();
+    fs::write(outside.join("env"), "TOKEN=leaked\n").unwrap();
+    fs::write(outside.join("skills/s/SKILL.md"), "TOKEN=leaked-skill\n").unwrap();
+    fs::write(outside.join("o.md"), "TOKEN=leaked-opencode\n").unwrap();
+    // Links and configuration that point out of the repository.
+    std::os::unix::fs::symlink(outside.join("env"), project.join("AGENTS.md")).unwrap();
+    fs::create_dir_all(project.join(".agents")).unwrap();
+    std::os::unix::fs::symlink(outside.join("skills"), project.join(".agents/skills")).unwrap();
+    std::os::unix::fs::symlink(outside.join("env"), project.join("CLAUDE.md")).unwrap();
+    fs::write(
+        project.join("opencode.json"),
+        format!(
+            r#"{{"instructions":["{}","~/secret/o.md","../../secret/o.md","docs/ok.md"]}}"#,
+            outside.join("o.md").display()
+        ),
+    )
+    .unwrap();
+    // In-repository files are still read, also through a link.
+    fs::create_dir_all(project.join("docs")).unwrap();
+    fs::write(project.join("docs/ok.md"), "inside\n").unwrap();
+    fs::write(project.join("GEMINI.md"), "gemini rules\n").unwrap();
+
+    let run = |extra: &[&str]| {
+        let assert = ah()
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("CODEX_HOME", "/nonexistent")
+            .env("GEMINI_CLI_HOME", "/nonexistent")
+            .env("COPILOT_HOME", "/nonexistent")
+            .env("CURSOR_CONFIG_DIR", "/nonexistent")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .args(["memory", "--json", "-o", "agent,name,path,body"])
+            .args(extra)
+            .write_stdin("")
+            .assert();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    };
+    let out = run(&[]);
+    assert!(!out.contains("leaked"), "{out}");
+    assert!(out.contains("inside"), "{out}");
+    assert!(out.contains("gemini rules"), "{out}");
+    let skills = run(&["-t", "skill"]);
+    assert!(!skills.contains("leaked"), "{skills}");
 }
 
 #[test]
