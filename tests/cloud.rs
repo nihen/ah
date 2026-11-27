@@ -381,6 +381,93 @@ esac
 }
 
 #[test]
+fn long_untitled_codex_threads_are_fetched_over_refreshes() {
+    const THREAD: &str = "33333333-3333-3333-3333-333333333333";
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let codex = home.join(".codex");
+    std::fs::create_dir(&codex).unwrap();
+    let auth = codex.join("auth.json");
+    std::fs::write(
+        &auth,
+        json!({"auth_mode":"chatgpt","tokens":{
+            "access_token":"fixture-only", "account_id":"first","login_owner_id":"owner"
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // An untitled thread whose transcript spans 40 pages (a browser run is
+    // mostly non-message items): one message on the first page, and one on
+    // the last. Cursors are page numbers.
+    let helper = home.join("bridge");
+    std::fs::write(&helper, format!(r#"#!/bin/sh
+req=$(cat)
+case "$req" in
+  *'"id":null'*)
+    printf '%s' '{{"data":[{{"id":"{THREAD}","name":"","created":1700000000,"updated":1700000100}}],"nextCursor":null}}'
+    ;;
+  *'"cursor":null'*)
+    printf '%s' '{{"id":"{THREAD}","messages":[{{"role":"user","text":"\nbrowse the admin page"}}],"nextCursor":"1"}}'
+    ;;
+  *'"cursor":"39"'*)
+    printf '%s' '{{"id":"{THREAD}","messages":[{{"role":"assistant","text":"final browsing report"}}],"nextCursor":null}}'
+    ;;
+  *)
+    n=$(printf '%s' "$req" | sed 's/.*"cursor":"\([0-9]*\)".*/\1/')
+    printf '{{"id":"{THREAD}","messages":[],"nextCursor":"%s"}}' $((n + 1))
+    ;;
+esac
+"#)).unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        home.join(".ahrc"),
+        format!("[cloud.codex_conversations]\nenabled = true\nhelper = {helper:?}\n"),
+    )
+    .unwrap();
+    let log = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_ah"))
+            .env("HOME", home)
+            .env("CODEX_HOME", &codex)
+            .env_remove("AH_NO_CLOUD_SYNC")
+            .current_dir(home)
+            .args([
+                "-a",
+                "log",
+                "--refresh",
+                "--json",
+                "-o",
+                "id,coverage,title,transcript",
+            ])
+            .output()
+            .unwrap();
+        let row: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(row["id"], THREAD);
+        row
+    };
+    // The first refresh reads 32 pages and keeps them; the title is the
+    // first prompt, not empty.
+    let first = log();
+    assert_eq!(first["coverage"], "messages-partial");
+    assert_eq!(
+        first["title"],
+        "[cloud:messages-partial] browse the admin page"
+    );
+    assert!(
+        !first["transcript"]
+            .as_str()
+            .unwrap()
+            .contains("final browsing report")
+    );
+    // The next refresh continues where it stopped instead of failing again.
+    let second = log();
+    assert_eq!(second["coverage"], "messages");
+    let transcript = second["transcript"].as_str().unwrap();
+    assert!(transcript.contains("browse the admin page"), "{transcript}");
+    assert!(transcript.contains("final browsing report"), "{transcript}");
+}
+
+#[test]
 fn claude_cloud_resume_prints_only_the_selected_session_link() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join(".ahrc"), "[cloud.claude]\nenabled = true\n").unwrap();

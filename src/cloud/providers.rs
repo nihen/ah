@@ -60,6 +60,25 @@ struct Snapshot {
     created: Option<u64>,
     revision: Option<String>,
     messages: Vec<Line>,
+    /// Where an incomplete transcript continues: a long Codex Cloud thread
+    /// is fetched over several refreshes, keeping what was read so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+}
+
+/// Bridge pages read for one transcript per refresh. Browser runs carry
+/// hundreds of non-message items, so a thread can need more; the rest is
+/// read on later refreshes.
+const CODEX_PAGES_PER_FETCH: usize = 32;
+
+/// The first line of the first prompt, as the title of a conversation the
+/// service left untitled.
+fn first_prompt_title(lines: &[Line]) -> Option<String> {
+    lines
+        .iter()
+        .find(|line| line.role == "user")
+        .and_then(|line| line.text.lines().find(|l| !l.trim().is_empty()))
+        .map(|line| line.trim().chars().take(180).collect())
 }
 
 fn open_code_origin(input: &str) -> Option<String> {
@@ -504,7 +523,7 @@ impl Source {
         Ok(Row {
             modified: modified.or(created),
             id: id.to_owned(),
-            title: title.unwrap_or(id).into(),
+            title: title.filter(|t| !t.trim().is_empty()).unwrap_or(id).into(),
             created,
             revision,
         })
@@ -514,6 +533,7 @@ impl Source {
         http: &ureq::Agent,
         id: &str,
         hint: Option<Row>,
+        resume: Option<Snapshot>,
         deadline: Instant,
     ) -> Result<Snapshot, &'static str> {
         match self.kind {
@@ -555,21 +575,36 @@ impl Source {
                 Ok(data)
             }
             Kind::Codex => {
-                let row = hint.unwrap_or_else(|| Row {
+                let mut row = hint.unwrap_or_else(|| Row {
                     id: id.into(),
                     title: id.into(),
                     modified: None,
                     created: None,
                     revision: None,
                 });
-                let mut lines = Vec::new();
-                let mut length = 0usize;
-                let mut first_created: Option<u64> = None;
-                let mut last_updated: Option<u64> = None;
-                let mut cursor = None;
+                // Continue an incomplete transcript where the last refresh
+                // stopped.
+                let (mut lines, mut cursor, mut first_created, mut last_updated) = match resume {
+                    Some(saved) if saved.cursor.is_some() => {
+                        (saved.messages, saved.cursor, saved.created, saved.modified)
+                    }
+                    _ => (Vec::new(), None, None, None),
+                };
+                let resumed = cursor.is_some();
+                let mut length: usize = lines.iter().map(|l| l.text.len()).sum();
                 let mut seen = std::collections::HashSet::new();
-                for _ in 0..32 {
-                    let page = self.run_bridge(Some(id), cursor.as_deref(), deadline)?;
+                let mut pages = 0;
+                let complete = loop {
+                    if pages == CODEX_PAGES_PER_FETCH {
+                        break false;
+                    }
+                    let page = match self.run_bridge(Some(id), cursor.as_deref(), deadline) {
+                        Ok(page) => page,
+                        // Out of time: keep what was read for the next refresh.
+                        Err(_) if pages > 0 || resumed => break false,
+                        Err(e) => return Err(e),
+                    };
+                    pages += 1;
                     if page["id"].as_str() != Some(id) {
                         return Err("session ID mismatch");
                     }
@@ -593,30 +628,29 @@ impl Source {
                         );
                     }
                     let Some(next) = page["nextCursor"].as_str() else {
-                        let mut row = row;
-                        row.created = row.created.or(first_created);
-                        row.modified = row.modified.or(last_updated).or(row.created);
-                        if row.title == row.id
-                            && let Some(first) =
-                                lines.iter().find(|line: &&Line| line.role == "user")
-                        {
-                            row.title = first
-                                .text
-                                .lines()
-                                .next()
-                                .unwrap_or(id)
-                                .chars()
-                                .take(180)
-                                .collect();
-                        }
-                        return Ok(snapshot(row, lines));
+                        break true;
                     };
                     if !seen.insert(next.to_owned()) {
                         return Err("repeated pagination cursor");
                     }
                     cursor = Some(next.to_owned());
+                };
+                row.created = row.created.or(first_created);
+                row.modified = row.modified.or(last_updated).or(row.created);
+                if (row.title == row.id || row.title.trim().is_empty())
+                    && let Some(title) = first_prompt_title(&lines)
+                {
+                    row.title = title;
                 }
-                Err("transcript paging limit reached")
+                if complete {
+                    return Ok(snapshot(row, lines));
+                }
+                // Not the upstream revision yet, so the next refresh goes on.
+                row.revision = None;
+                let mut data = snapshot(row, lines);
+                data.coverage = "messages-partial".into();
+                data.cursor = cursor;
+                Ok(data)
             }
             Kind::Copilot => {
                 let detail = self.get(http, &format!("/agents/tasks/{id}"), deadline)?;
@@ -800,8 +834,9 @@ impl Source {
                 if !force && super::recent_stamp(&self.cache.join(&retry), cooldown) {
                     continue;
                 }
+                let resume = read(&self.path(&id)).filter(|s| s.cursor.is_some());
                 if let Err(e) = self
-                    .detail(&http, &id, Some(row), deadline)
+                    .detail(&http, &id, Some(row), resume, deadline)
                     .and_then(|s| self.store(&id, s).map(drop))
                 {
                     error.get_or_insert(e);
@@ -1065,6 +1100,7 @@ fn snapshot(row: Row, messages: Vec<Line>) -> Snapshot {
         created: row.created,
         revision: row.revision,
         messages,
+        cursor: None,
     }
 }
 
@@ -1262,8 +1298,9 @@ fn fetch_source(
                 modified: s.modified,
                 revision: s.revision.clone(),
             });
+        let resume = read_cached().filter(|s| s.cursor.is_some());
         match source
-            .detail(&http, id, hint, deadline)
+            .detail(&http, id, hint, resume, deadline)
             .and_then(|snapshot| source.store(id, snapshot))
         {
             Ok(published) => Ok(Some(published)),
@@ -1428,7 +1465,18 @@ impl AgentPlugin for SnapshotPlugin {
     }
     fn resolve_title(&self, path: &Path, _home: &Path) -> Option<String> {
         let snapshot = read(path)?;
-        Some(format!("[cloud:{}] {}", snapshot.coverage, snapshot.title))
+        // Some services leave a conversation untitled (an empty title, or
+        // just its id); show its first prompt instead.
+        let title = if snapshot.title.trim().is_empty()
+            || path
+                .file_stem()
+                .is_some_and(|id| id == snapshot.title.as_str())
+        {
+            first_prompt_title(&snapshot.messages).unwrap_or(snapshot.title)
+        } else {
+            snapshot.title
+        };
+        Some(format!("[cloud:{}] {}", snapshot.coverage, title))
     }
     fn resume_args(&self, path: &Path, _home: &Path) -> Option<Vec<String>> {
         let url = url_for_path(path)?;
@@ -1588,12 +1636,14 @@ mod tests {
             |source, deadline| {
                 let http = source.http();
                 let full = source
-                    .detail(&http, "bc_example", None, deadline)
+                    .detail(&http, "bc_example", None, None, deadline)
                     .ok()
                     .unwrap();
                 assert_eq!(full.messages[2].text, "second");
                 assert_eq!(
-                    source.detail(&http, "bc_example", None, deadline).err(),
+                    source
+                        .detail(&http, "bc_example", None, None, deadline)
+                        .err(),
                     Some("session ID mismatch")
                 );
             },
@@ -1616,13 +1666,13 @@ mod tests {
             ],
             |source, deadline| {
                 let http = source.http();
-                let p = source.detail(&http, ID, None, deadline).ok().unwrap();
+                let p = source.detail(&http, ID, None, None, deadline).ok().unwrap();
                 assert_eq!(p.coverage, "prompt-only");
                 assert_eq!(p.messages.len(), 1);
                 assert_eq!(p.messages[0].role, "user");
                 assert!(source.url(ID).is_empty());
                 assert_eq!(
-                    source.detail(&http, ID, None, deadline).err(),
+                    source.detail(&http, ID, None, None, deadline).err(),
                     Some("login rejected")
                 );
             },
