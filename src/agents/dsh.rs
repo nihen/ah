@@ -28,8 +28,12 @@ fn is_compressed(path: &Path) -> bool {
 }
 
 /// Largest log that is decoded. A log is a few megabytes; the limit keeps a
-/// damaged or hostile file from exhausting memory.
-const MAX_LOG_BYTES: u64 = 1 << 30;
+/// damaged or hostile file (Zstandard compresses a run of one byte about
+/// 30000:1) from exhausting memory, also when threads decode in parallel.
+const MAX_LOG_BYTES: u64 = 256 << 20;
+/// How much text listing decodes to find the first prompt, which is in the
+/// first batch of events. Listing visits every log, so this stays small.
+const MAX_PROMPT_SCAN_BYTES: u64 = 16 << 20;
 /// Largest header line that is decoded; a header is a few hundred bytes.
 const MAX_HEADER_BYTES: u64 = 1 << 20;
 
@@ -183,7 +187,7 @@ fn has_prompt(path: &Path) -> bool {
         return holds_prompt(&data);
     }
     let mut found = false;
-    for_each_frame(&data, MAX_LOG_BYTES, |text| {
+    for_each_frame(&data, MAX_PROMPT_SCAN_BYTES, |text| {
         found = holds_prompt(&text);
         !found
     });
@@ -844,6 +848,25 @@ mod tests {
         // One byte short of the second frame: only the header is kept.
         assert_eq!(lines(header_len + turn_1_len - 1), 1);
         assert_eq!(lines(header_len - 1), 0);
+    }
+
+    #[test]
+    fn listing_decodes_a_bounded_prefix_to_find_the_prompt() {
+        assert!(has_prompt(
+            &write_log("session.v4.jsonl.zstd", &compressed()).1
+        ));
+        // A small file that decodes to more than the prompt budget before the
+        // first prompt is not listed, and is not decoded past the budget.
+        let filler = " ".repeat(MAX_PROMPT_SCAN_BYTES as usize + 1);
+        let padding = format!(r#"{{"type":"assistant/attempt","pad":"{filler}"}}"#);
+        let bytes = [frame(&[HEADER]), frame(&[&padding]), frame(TURN_1)].concat();
+        assert!(
+            bytes.len() < 1 << 16,
+            "the test log should be small: {}",
+            bytes.len()
+        );
+        let (_tmp, path) = write_log("session.v4.jsonl.zstd", &bytes);
+        assert!(!has_prompt(&path));
     }
 
     #[test]
