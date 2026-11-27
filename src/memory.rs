@@ -529,6 +529,7 @@ fn collect_project_files(
     with_skills: bool,
     agent_dirs: &[PathBuf],
     global_files: &HashSet<PathBuf>,
+    global_dirs: &[PathBuf],
     home: &Path,
 ) -> Vec<MemoryEntry> {
     let project = dir
@@ -551,16 +552,13 @@ fn collect_project_files(
     // global files are (a linked `rules` directory may live elsewhere).
     let mut under = vec![root.clone()];
     under.extend(agent_dirs.iter().cloned());
-    let mut toward: Vec<PathBuf> = global_files
-        .iter()
-        .filter_map(|f| f.parent().map(Path::to_path_buf))
-        .collect();
-    toward.sort();
-    toward.dedup();
     let boundary = ProjectBoundary {
         root,
         global_files,
-        walk: Walk { under, toward },
+        walk: Walk {
+            under,
+            toward: global_dirs.to_vec(),
+        },
     };
     let mut entries = expand_sources(
         shared_project_sources(dir),
@@ -738,11 +736,30 @@ pub fn build_memory_records(
     let home_real = fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
     // Global memory: the global sources and agents' own global records
     // (e.g. Grok topics), which are listed as `(global)` as well.
-    let global_files: HashSet<PathBuf> = global_entries
+    let global: Vec<&MemoryEntry> = global_entries
         .iter()
         .chain(entries.iter().filter(|e| e.project == GLOBAL_PROJECT))
+        .collect();
+    let global_files: HashSet<PathBuf> = global
+        .iter()
         .filter_map(|e| fs::canonicalize(&e.path).ok())
         .collect();
+    // Where global files are listed and where they really are: a project
+    // link into them walks only that far. Every directory on a listed path
+    // counts, resolved one by one, since any of them may be a link of its
+    // own; each is only a way through, not a tree to walk.
+    let mut global_dirs: Vec<PathBuf> = global
+        .iter()
+        .flat_map(|e| e.path.ancestors().skip(1))
+        .filter_map(|d| fs::canonicalize(d).ok())
+        .chain(
+            global_files
+                .iter()
+                .filter_map(|f| f.parent().map(Path::to_path_buf)),
+        )
+        .collect();
+    global_dirs.sort();
+    global_dirs.dedup();
     let project_dirs: Vec<PathBuf> = if filter.all {
         // Scan known project cwds and their repository roots (sorted so
         // duplicate resolution is stable)
@@ -775,6 +792,7 @@ pub fn build_memory_records(
                 with_skills,
                 &agent_dirs,
                 &global_files,
+                &global_dirs,
                 &home_real,
             )
             .into_iter()

@@ -2271,6 +2271,18 @@ fn memory_follows_project_links_to_global_rules_kept_elsewhere() {
     // ~/.claude/rules lives in a dotfiles checkout, and a project links to it.
     fs::create_dir_all(home.join("dotfiles/rules")).unwrap();
     fs::write(home.join("dotfiles/rules/style.md"), "style rules\n").unwrap();
+    // A global rule behind a directory link inside the rules.
+    fs::create_dir_all(home.join("shared")).unwrap();
+    fs::write(home.join("shared/linked.md"), "linked rule\n").unwrap();
+    std::os::unix::fs::symlink(home.join("shared"), home.join("dotfiles/rules/dir")).unwrap();
+    // A global rule that is itself a link, in a subdirectory.
+    fs::create_dir_all(home.join("dotfiles/rules/nested")).unwrap();
+    fs::write(home.join("dotfiles/shared.md"), "shared rule\n").unwrap();
+    std::os::unix::fs::symlink(
+        home.join("dotfiles/shared.md"),
+        home.join("dotfiles/rules/nested/alias.md"),
+    )
+    .unwrap();
     fs::create_dir_all(&claude).unwrap();
     std::os::unix::fs::symlink(home.join("dotfiles/rules"), claude.join("rules")).unwrap();
     let project = home.join("work/app");
@@ -2297,8 +2309,15 @@ fn memory_follows_project_links_to_global_rules_kept_elsewhere() {
         .map(String::from)
         .collect();
     rows.sort();
-    // One real file: listed once, under the project that links to it.
-    assert_eq!(rows, ["claude\tapp\tstyle.md"]);
+    // Each real file is listed once, under the project that links to it.
+    assert_eq!(
+        rows,
+        [
+            "claude\tapp\talias.md",
+            "claude\tapp\tlinked.md",
+            "claude\tapp\tstyle.md"
+        ]
+    );
 }
 
 #[test]
