@@ -363,7 +363,7 @@ cargo install ah-cli
 
 Download a prebuilt binary from [GitHub Releases](https://github.com/nihen/ah/releases).
 
-Available for macOS (arm64, x86_64) and Linux (x86_64, arm64). The Linux binaries are statically linked (musl).
+Available for macOS (arm64, x86_64) and Linux (x86_64, arm64). The Linux binaries are statically linked (musl). Each binary carries a build provenance attestation; verify it with `gh attestation verify <file> --repo nihen/ah` (see [SECURITY.md](SECURITY.md#verifying-release-binaries)).
 
 ### From source
 

@@ -14,13 +14,19 @@ jobs:
     if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/')
     runs-on: ubuntu-latest
     steps:
+      # The merged commit, read without keeping credentials: the tag is made
+      # through the API instead of a git push.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Extract version, push tag, and trigger release
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
+      - name: Extract version, create the tag, and trigger release
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           TAG="v${VERSION}"
-          git tag "${TAG}"
-          git push origin "${TAG}"
+          gh api -X POST "repos/${REPO}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${SHA}" >/dev/null
           gh workflow run release.yml --ref "${TAG}" -f tag="${TAG}"

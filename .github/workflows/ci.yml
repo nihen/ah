@@ -51,3 +51,14 @@ jobs:
       # Fails on any RustSec vulnerability or warning (unmaintained, yanked,
       # unsound) in Cargo.lock.
       - run: cargo audit --deny warnings
+
+  # Static analysis of the workflows themselves (template injection, cache
+  # poisoning, unpinned actions, credential persistence, ...).
+  zizmor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: pipx install zizmor==1.33.1
+      - run: zizmor --offline --min-severity low .github/workflows
