@@ -159,6 +159,14 @@ fn resolve_matched_mmap(
     preloaded: Option<&[u8]>,
     literal_needle: Option<&[u8]>,
 ) -> String {
+    if preloaded.is_none() && plugin.streams_raw_lines(path) {
+        let mut matched = String::new();
+        plugin.for_each_raw_line(path, &mut |line| {
+            matched = matched_in_bytes(line, bytes_re, literal_needle);
+            matched.is_empty()
+        });
+        return matched;
+    }
     let mmap_holder;
     let data: &[u8] = if let Some(d) = preloaded {
         d
@@ -169,6 +177,11 @@ fn resolve_matched_mmap(
             None => return String::new(),
         }
     };
+    matched_in_bytes(data, bytes_re, literal_needle)
+}
+
+/// The context of the first match in `data`, or an empty string.
+fn matched_in_bytes(data: &[u8], bytes_re: &BytesRegex, literal_needle: Option<&[u8]>) -> String {
     // Fast literal path: use memchr SIMD instead of regex
     if let Some(needle) = literal_needle {
         return extract_matches_literal_bytes(data, needle);

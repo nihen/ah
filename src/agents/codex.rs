@@ -31,10 +31,18 @@ fn is_compressed(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "zst")
 }
 
-/// Largest compressed rollout that is decoded, as text. Long sessions reach
-/// several hundred megabytes (one of 940 MiB has been seen); the limit
-/// keeps a damaged or hostile file from exhausting memory.
+/// Largest compressed rollout that is decoded whole, as text (`session_bytes`
+/// and `raw_content`, e.g. for a raw search). Long sessions reach several
+/// hundred megabytes (one of 940 MiB has been seen); the limit keeps a
+/// damaged or hostile file from exhausting memory.
 const MAX_ROLLOUT_BYTES: u64 = 2 << 30;
+/// How much text of a compressed rollout is read line by line. Only one
+/// line is held at a time, so this bounds the time a damaged or hostile
+/// file can take, not memory.
+const MAX_STREAMED_BYTES: u64 = 64 << 30;
+/// Longest line read from a compressed rollout; a longer one is skipped.
+/// Tool outputs make lines of ten megabytes or so.
+const MAX_LINE_BYTES: usize = 256 << 20;
 /// Largest `session_meta` line decoded from a compressed rollout. The line
 /// carries the base instructions, a few kilobytes.
 const MAX_META_LINE_BYTES: u64 = 16 << 20;
@@ -42,6 +50,23 @@ const MAX_META_LINE_BYTES: u64 = 16 << 20;
 /// The rollout as JSONL text: the file itself, or its decoded content.
 fn read_rollout(path: &Path) -> Option<Log> {
     zstd_log::read_log(path, is_compressed(path), MAX_ROLLOUT_BYTES)
+}
+
+/// Visit the JSONL lines of a rollout until `visit` returns `false`. A
+/// compressed rollout is decoded one line at a time.
+fn for_each_line(path: &Path, mut visit: impl FnMut(&[u8]) -> bool) {
+    let Some(data) = super::common::mmap_file(path) else {
+        return;
+    };
+    if is_compressed(path) {
+        zstd_log::for_each_line(&data, MAX_STREAMED_BYTES, MAX_LINE_BYTES, visit);
+    } else {
+        for line in super::common::jsonl_lines(&data) {
+            if !visit(line) {
+                return;
+            }
+        }
+    }
 }
 
 /// The nearest `sessions` or `archived_sessions` directory containing a
@@ -142,17 +167,22 @@ fn latest_thread_name_in(
 /// prompt: sessions without a real user prompt are scanned to the end.
 fn for_each_message(data: &[u8], visit: &mut dyn FnMut(Message) -> bool) {
     for line in super::common::jsonl_lines(data) {
-        if RESPONSE_ITEM.find(line).is_none()
-            || (USER.find(line).is_none() && ASSISTANT.find(line).is_none())
-        {
-            continue;
-        }
-        let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) else {
-            continue;
-        };
-        if !visit_message_value(&val, visit) {
+        if !visit_message_line(line, visit) {
             return;
         }
+    }
+}
+
+/// Messages of one rollout line; `false` stops the iteration.
+fn visit_message_line(line: &[u8], visit: &mut dyn FnMut(Message) -> bool) -> bool {
+    if RESPONSE_ITEM.find(line).is_none()
+        || (USER.find(line).is_none() && ASSISTANT.find(line).is_none())
+    {
+        return true;
+    }
+    match serde_json::from_slice::<serde_json::Value>(line) {
+        Ok(val) => visit_message_value(&val, visit),
+        Err(_) => true,
     }
 }
 
@@ -167,15 +197,20 @@ static ASSISTANT: LazyLock<memchr::memmem::Finder<'static>> =
 /// outputs, all of which live in `response_item` lines.
 fn for_each_search_text(data: &[u8], visit: &mut dyn FnMut(&str) -> bool) {
     for line in super::common::jsonl_lines(data) {
-        if !may_hold_search_text(line) {
-            continue;
-        }
-        let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) else {
-            continue;
-        };
-        if !visit_search_value(&val, &mut |_, text| visit(text)) {
+        if !visit_search_line(line, visit) {
             return;
         }
+    }
+}
+
+/// Search texts of one rollout line; `false` stops the iteration.
+fn visit_search_line(line: &[u8], visit: &mut dyn FnMut(&str) -> bool) -> bool {
+    if !may_hold_search_text(line) {
+        return true;
+    }
+    match serde_json::from_slice::<serde_json::Value>(line) {
+        Ok(val) => visit_search_value(&val, &mut |_, text| visit(text)),
+        Err(_) => true,
     }
 }
 
@@ -486,6 +521,14 @@ impl AgentPlugin for CodexPlugin {
         !is_compressed(path)
     }
 
+    fn streams_raw_lines(&self, path: &Path) -> bool {
+        is_compressed(path)
+    }
+
+    fn for_each_raw_line(&self, path: &Path, visit: &mut dyn FnMut(&[u8]) -> bool) {
+        for_each_line(path, visit);
+    }
+
     fn raw_content(&self, path: &Path) -> Option<String> {
         Some(String::from_utf8_lossy(&read_rollout(path)?).into_owned())
     }
@@ -495,9 +538,7 @@ impl AgentPlugin for CodexPlugin {
     }
 
     fn iter_messages(&self, path: &Path, visit: &mut dyn FnMut(Message) -> bool) {
-        if let Some(mmap) = read_rollout(path) {
-            for_each_message(&mmap, visit);
-        }
+        for_each_line(path, |line| visit_message_line(line, visit));
     }
 
     fn iter_messages_from_bytes(
@@ -510,17 +551,19 @@ impl AgentPlugin for CodexPlugin {
     }
 
     fn iter_search_records(&self, path: &Path, visit: &mut RecordVisitor<'_>) {
-        if let Some(data) = read_rollout(path) {
-            super::common::for_each_jsonl_value_bytes(&data, |val| {
-                visit.record(|emit| visit_search_value(val, emit))
-            });
-        }
+        for_each_line(path, |line| {
+            if line.len() < 2 {
+                return true;
+            }
+            match serde_json::from_slice::<serde_json::Value>(line) {
+                Ok(val) => visit.record(|emit| visit_search_value(&val, emit)),
+                Err(_) => true,
+            }
+        });
     }
 
     fn iter_search_texts(&self, path: &Path, visit: &mut dyn FnMut(&str) -> bool) {
-        if let Some(mmap) = read_rollout(path) {
-            for_each_search_text(&mmap, visit);
-        }
+        for_each_line(path, |line| visit_search_line(line, visit));
     }
 
     fn iter_search_texts_from_bytes(
@@ -600,17 +643,27 @@ impl AgentPlugin for CodexPlugin {
     /// `turn_context`. A turn's model counts only once the model produced
     /// output in it, so a turn aborted before any reply adds nothing.
     fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
-        let data = read_rollout(path)?;
+        let mut scan = ModelScan::default();
+        if is_compressed(path) {
+            for_each_line(path, |line| {
+                if TURN_CONTEXT.find(line).is_some()
+                    || (scan.pending.is_some() && RESPONSE_ITEM.find(line).is_some())
+                {
+                    scan.line(line);
+                }
+                true
+            });
+            return scan.models.non_empty();
+        }
+        let data = super::common::mmap_file(path)?;
         let mut turns = super::common::LinesWith::new(&data, b"\"turn_context\"");
         let mut items = super::common::LinesWith::new(&data, b"\"response_item\"");
-        let mut models = super::common::ModelList::default();
-        let mut pending: Option<String> = None;
         let mut from = 0;
         loop {
             // The next line naming a turn, or, while a turn waits for its
             // output, the next line naming a response item if that is first.
             let turn = turns.next_from(from);
-            let item = pending.as_ref().and_then(|_| items.next_from(from));
+            let item = scan.pending.as_ref().and_then(|_| items.next_from(from));
             let range = match (turn, item) {
                 (Some(turn), Some(item)) if item.start < turn.start => item,
                 (Some(turn), _) => turn,
@@ -618,32 +671,9 @@ impl AgentPlugin for CodexPlugin {
                 (None, None) => break,
             };
             from = range.end + 1;
-            let line = &data[range];
-            const PATHS: &[&[&str]] = &[
-                &["type"],
-                &["payload", "model"],
-                &["payload", "type"],
-                &["payload", "role"],
-            ];
-            let Some(val) = super::common::parse_json_paths(line, PATHS) else {
-                continue;
-            };
-            match val.get("type").and_then(|v| v.as_str()) {
-                Some("turn_context") => {
-                    pending = val
-                        .pointer("/payload/model")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-                }
-                Some("response_item") if is_model_output(val.get("payload")) => {
-                    if let Some(model) = pending.take() {
-                        models.push(&model);
-                    }
-                }
-                _ => {}
-            }
+            scan.line(&data[range]);
         }
-        models.non_empty()
+        scan.models.non_empty()
     }
 
     // `codex resume <id>` also finds archived sessions, so they keep their id.
@@ -723,6 +753,46 @@ fn running_in(
             Some((id, Some(pid)))
         })
         .collect()
+}
+
+static TURN_CONTEXT: LazyLock<memchr::memmem::Finder<'static>> =
+    LazyLock::new(|| memchr::memmem::Finder::new(b"\"turn_context\""));
+
+/// The models of a rollout's turns, read from its `turn_context` lines and
+/// the `response_item` lines after them.
+#[derive(Default)]
+struct ModelScan {
+    models: super::common::ModelList,
+    /// The model of the latest turn, until that turn produces output.
+    pending: Option<String>,
+}
+
+impl ModelScan {
+    fn line(&mut self, line: &[u8]) {
+        const PATHS: &[&[&str]] = &[
+            &["type"],
+            &["payload", "model"],
+            &["payload", "type"],
+            &["payload", "role"],
+        ];
+        let Some(val) = super::common::parse_json_paths(line, PATHS) else {
+            return;
+        };
+        match val.get("type").and_then(|v| v.as_str()) {
+            Some("turn_context") => {
+                self.pending = val
+                    .pointer("/payload/model")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+            }
+            Some("response_item") if is_model_output(val.get("payload")) => {
+                if let Some(model) = self.pending.take() {
+                    self.models.push(&model);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Whether a `response_item` payload was produced by the model: an

@@ -198,6 +198,17 @@ pub trait AgentPlugin: Sync {
         true
     }
 
+    /// Whether `for_each_raw_line` reads this session. Sessions whose bytes
+    /// are costly to hold whole (e.g. compressed logs) are then read one
+    /// line at a time for a raw search or `show --raw`.
+    fn streams_raw_lines(&self, _path: &Path) -> bool {
+        false
+    }
+
+    /// Visit the lines of the session's raw content, without newlines,
+    /// until `visit` returns `false`. Only called when `streams_raw_lines`.
+    fn for_each_raw_line(&self, _path: &Path, _visit: &mut dyn FnMut(&[u8]) -> bool) {}
+
     /// Whether `resolve_cwd_from_mmap` reads the cwd from `session_bytes`,
     /// so a cwd filter needs them loaded; otherwise they are loaded only for
     /// the sessions the filter keeps.

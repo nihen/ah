@@ -3499,9 +3499,27 @@ fn compressed_codex_rollouts_are_listed_searched_and_shown() {
         .args(["show", "--raw", path.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::starts_with(
-            r#"{"type":"session.start","payload":{"id":"codex-sess-001""#,
-        ));
+        .stdout(fs::read_to_string(fixture_path("codex_session.jsonl")).unwrap());
+    // A raw search reads the compressed rollout line by line, as does its
+    // `matched` context.
+    ah_in(home)
+        .args([
+            "log",
+            "-a",
+            "--raw-search",
+            "-q",
+            "Users/test/api-server",
+            "-o",
+            "id,matched",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("codex-sess-001\t"))
+        .stdout(predicate::str::contains("api-server"));
+    ah_in(home)
+        .args(["log", "-a", "--raw-search", "-q", "not in the log", "-o", "id"])
+        .assert()
+        .failure();
 }
 
 #[test]

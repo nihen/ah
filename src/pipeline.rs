@@ -223,7 +223,10 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
                 }
             }
 
-            if !load_early && (cheap_bytes || (has_query && raw_search)) {
+            // A raw search of a session that is read line by line does not
+            // load it whole.
+            let stream_raw = has_query && raw_search && plugin.streams_raw_lines(path);
+            if !load_early && (cheap_bytes || (has_query && raw_search && !stream_raw)) {
                 mmap = plugin.session_bytes(path);
             }
 
@@ -239,6 +242,18 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
                             } else {
                                 bytes_pattern.as_ref().is_some_and(|re| re.is_match(m))
                             }
+                        }
+                        None if stream_raw => {
+                            let mut found = false;
+                            plugin.for_each_raw_line(path, &mut |line| {
+                                found = if let Some(needle) = &fast_needle {
+                                    ascii_case_insensitive_contains(line, needle)
+                                } else {
+                                    bytes_pattern.as_ref().is_some_and(|re| re.is_match(line))
+                                };
+                                !found && !crate::cancel::requested()
+                            });
+                            found
                         }
                         None => false,
                     }

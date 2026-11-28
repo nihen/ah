@@ -211,6 +211,16 @@ fn run_inner(args: ShowArgs, filter: &FilterArgs, check_account: bool) -> Result
     }
 
     match format {
+        ShowFormat::Raw if plugin.streams_raw_lines(&path) => {
+            use std::io::Write;
+            let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+            plugin.for_each_raw_line(&path, &mut |line| {
+                out.write_all(line)
+                    .and_then(|()| out.write_all(b"\n"))
+                    .is_ok()
+            });
+            let _ = out.flush();
+        }
         ShowFormat::Raw => {
             if let Some(content) = plugin.raw_content(&path) {
                 print!("{}", content);

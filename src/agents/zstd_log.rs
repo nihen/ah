@@ -108,6 +108,58 @@ pub(super) fn first_line(data: &[u8], max_bytes: u64) -> Option<Vec<u8>> {
     Some(line)
 }
 
+/// Visit the lines of the decoded text (without their newlines) until
+/// `visit` returns `false`, decoding them one at a time: only one line and
+/// the decoder's window are held, however large the log is. Decoding stops
+/// after `max_bytes` of text, and at data that cannot be decoded (the lines
+/// before it are visited). A line longer than `max_line` is skipped.
+pub(super) fn for_each_line(
+    data: &[u8],
+    max_bytes: u64,
+    max_line: usize,
+    mut visit: impl FnMut(&[u8]) -> bool,
+) {
+    let Ok(decoder) = zstd::stream::read::Decoder::with_buffer(data) else {
+        return;
+    };
+    let mut reader = BufReader::with_capacity(1 << 16, decoder.take(max_bytes));
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let mut too_long = false;
+        // Read up to the newline, dropping the bytes of a line past `max_line`.
+        loop {
+            let Ok(buf) = reader.fill_buf() else {
+                return;
+            };
+            if buf.is_empty() {
+                if line.is_empty() && !too_long {
+                    return;
+                }
+                break;
+            }
+            let (chunk, done) = match memchr::memchr(b'\n', buf) {
+                Some(end) => (&buf[..end], Some(end + 1)),
+                None => (buf, None),
+            };
+            if !too_long && line.len() + chunk.len() <= max_line {
+                line.extend_from_slice(chunk);
+            } else {
+                too_long = true;
+                line = Vec::new();
+            }
+            let used = done.unwrap_or(buf.len());
+            reader.consume(used);
+            if done.is_some() {
+                break;
+            }
+        }
+        if !too_long && !visit(&line) {
+            return;
+        }
+    }
+}
+
 /// A log as text: the file itself, or its decoded frames.
 pub(super) enum Log {
     Plain(memmap2::Mmap),
@@ -214,5 +266,36 @@ mod tests {
         assert_eq!(first_line(&data, 7).as_deref(), Some(&b"{\"a\":1}"[..]));
         assert_eq!(first_line(&frame("{\"a\":1}"), 6), None);
         assert_eq!(first_line(b"not zstd", 64), None);
+    }
+
+    fn lines(data: &[u8], max_bytes: u64, max_line: usize) -> Vec<String> {
+        let mut seen = Vec::new();
+        for_each_line(data, max_bytes, max_line, |line| {
+            seen.push(String::from_utf8_lossy(line).into_owned());
+            true
+        });
+        seen
+    }
+
+    #[test]
+    fn lines_are_decoded_one_at_a_time() {
+        // Two frames, the second without a trailing newline.
+        let data = [frame("a\nlong line\n"), frame("\nb")].concat();
+        assert_eq!(lines(&data, 1 << 20, 64), ["a", "long line", "", "b"]);
+        // A line past `max_line` is skipped, not cut.
+        assert_eq!(lines(&data, 1 << 20, 4), ["a", "", "b"]);
+        // Decoding stops after `max_bytes` of text.
+        assert_eq!(lines(&data, 4, 64), ["a", "lo"]);
+        // A torn frame ends the log after the lines before it.
+        let torn = [frame("a\n"), frame("never\n")[..5].to_vec()].concat();
+        assert_eq!(lines(&torn, 1 << 20, 64), ["a"]);
+        assert!(lines(b"not zstd", 1 << 20, 64).is_empty());
+        // `visit` stops the iteration.
+        let mut count = 0;
+        for_each_line(&data, 1 << 20, 64, |_| {
+            count += 1;
+            false
+        });
+        assert_eq!(count, 1);
     }
 }
