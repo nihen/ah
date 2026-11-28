@@ -324,6 +324,38 @@ impl LineCheck {
     }
 }
 
+/// Whether every match of the raw-search `query` lies within one line, so
+/// that searching a session line by line finds what searching its whole
+/// text finds: the query has no anchors or other look-around assertions
+/// (`^` is the start of the text, not of a line), and nothing in it can
+/// match a newline.
+pub fn raw_matches_lie_within_lines(query: &str) -> bool {
+    use regex_syntax::hir::{Class, Hir, HirKind};
+    fn within_line(hir: &Hir) -> bool {
+        match hir.kind() {
+            HirKind::Empty => true,
+            HirKind::Literal(lit) => !lit.0.contains(&b'\n'),
+            HirKind::Class(Class::Unicode(class)) => !class
+                .ranges()
+                .iter()
+                .any(|r| r.start() <= '\n' && '\n' <= r.end()),
+            HirKind::Class(Class::Bytes(class)) => !class
+                .ranges()
+                .iter()
+                .any(|r| r.start() <= b'\n' && b'\n' <= r.end()),
+            HirKind::Look(_) => false,
+            HirKind::Repetition(rep) => within_line(&rep.sub),
+            HirKind::Capture(cap) => within_line(&cap.sub),
+            HirKind::Concat(subs) | HirKind::Alternation(subs) => subs.iter().all(within_line),
+        }
+    }
+    regex_syntax::ParserBuilder::new()
+        .utf8(false)
+        .build()
+        .parse(&format!("(?iu){query}"))
+        .is_ok_and(|hir| within_line(&hir))
+}
+
 /// `raw` with its JSON string escapes decoded into `out`. Malformed escapes
 /// are copied as they are; unpaired surrogates become U+FFFD.
 fn decode_json_escapes(raw: &[u8], out: &mut Vec<u8>) {
@@ -444,6 +476,23 @@ fn is_regex_meta(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::raw_matches_lie_within_lines as within_lines;
+
+    #[test]
+    fn raw_queries_that_stay_within_a_line() {
+        for query in [
+            "deploy", "a.b", r"\{.type", r"[^x\n]y", "foo|bar", "x{2,}", r"\d+",
+        ] {
+            assert!(within_lines(query), "{query}");
+        }
+        // Anchors, boundaries, and anything that can match a newline.
+        for query in [
+            "^x", "x$", r"\bx", r"\n", r"a\s+b", "[^x]", "(?s).", r"\}\n\{", "(",
+        ] {
+            assert!(!within_lines(query), "{query}");
+        }
+    }
+
     use super::*;
     use crate::agents::find_plugin;
     use std::path::PathBuf;

@@ -89,6 +89,12 @@ pub fn decode_claude_project(encoded_dir: &str) -> String {
 pub enum SessionBytes {
     Mmap(Mmap),
     Owned(Vec<u8>),
+    /// Bytes that hold a resource (e.g. a slot limiting the decoded logs
+    /// held at once) until they are dropped.
+    Guarded {
+        bytes: Vec<u8>,
+        _guard: Box<dyn std::any::Any>,
+    },
 }
 
 impl std::ops::Deref for SessionBytes {
@@ -97,7 +103,7 @@ impl std::ops::Deref for SessionBytes {
     fn deref(&self) -> &[u8] {
         match self {
             SessionBytes::Mmap(m) => m,
-            SessionBytes::Owned(v) => v,
+            SessionBytes::Owned(v) | SessionBytes::Guarded { bytes: v, .. } => v,
         }
     }
 }
@@ -216,6 +222,11 @@ impl ModelList {
     /// The model that answered last.
     pub fn last(&self) -> &str {
         self.last.as_deref().unwrap_or_default()
+    }
+
+    /// All models in first-use order.
+    pub fn all(&self) -> &[String] {
+        &self.all
     }
 
     /// All models, comma-separated in first-use order.

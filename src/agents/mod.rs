@@ -1,6 +1,7 @@
 mod agy;
 pub(crate) mod claude;
 mod codex;
+mod codex_models;
 pub(crate) mod common;
 mod copilot;
 mod cursor;
@@ -10,6 +11,7 @@ mod gemini;
 mod grok;
 mod opencode;
 mod pi;
+mod zstd_log;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -193,8 +195,33 @@ pub trait AgentPlugin: Sync {
 
     /// Whether `session_bytes` is cheap enough to load for every listed
     /// session even when no full-text query needs it.
-    fn cheap_session_bytes(&self) -> bool {
+    fn cheap_session_bytes(&self, _path: &Path) -> bool {
         true
+    }
+
+    /// Whether `for_each_raw_line` reads this session. Sessions whose bytes
+    /// are costly to hold whole (e.g. compressed logs) are then read one
+    /// line at a time instead of loading `session_bytes`: by full-text
+    /// search, by a raw search whose matches lie within a line, and by
+    /// `show` when a session has no messages.
+    fn streams_raw_lines(&self, _path: &Path) -> bool {
+        false
+    }
+
+    /// Visit the lines of `session_bytes`, each with its newline when it has
+    /// one, until `visit` returns `false`; together they are the bytes as
+    /// they are, except that a line the plugin skips (e.g. too long to
+    /// hold) is visited empty. Only called when `streams_raw_lines`.
+    fn for_each_raw_line(&self, _path: &Path, _visit: &mut dyn FnMut(&[u8]) -> bool) {}
+
+    /// Write `raw_content` to `out` without holding it whole. `None` when
+    /// the plugin does not, and `raw_content` is printed instead.
+    fn write_raw_content(
+        &self,
+        _path: &Path,
+        _out: &mut dyn std::io::Write,
+    ) -> Option<std::io::Result<()>> {
+        None
     }
 
     /// Whether `resolve_cwd_from_mmap` reads the cwd from `session_bytes`,

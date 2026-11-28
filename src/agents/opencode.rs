@@ -852,7 +852,7 @@ impl AgentPlugin for OpencodePlugin {
             .map(SessionBytes::Owned)
     }
 
-    fn cheap_session_bytes(&self) -> bool {
+    fn cheap_session_bytes(&self, _path: &Path) -> bool {
         false
     }
 

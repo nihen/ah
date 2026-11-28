@@ -163,6 +163,12 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
         None
     };
 
+    // Whether a raw search may read sessions line by line (see
+    // `AgentPlugin::streams_raw_lines`) and find what it finds on their
+    // whole text.
+    let raw_line_local =
+        has_query && raw_search && search::raw_matches_lie_within_lines(&params.query);
+
     let sessions: Vec<(Session, SystemTime)> = files
         .par_iter()
         .filter_map(|(path, mtime)| {
@@ -189,7 +195,7 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
             // and only for full-text search.
             let search_path = plugin.search_path(path);
             let is_session_file = search_path == *path;
-            let cheap_bytes = plugin.cheap_session_bytes();
+            let cheap_bytes = plugin.cheap_session_bytes(path);
             // With early filters, sessions they reject are not mapped at all
             // unless the plugin reads the cwd from these bytes.
             let load_early = cheap_bytes && (!has_early_filters || plugin.cwd_in_session_bytes());
@@ -223,7 +229,11 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
                 }
             }
 
-            if !load_early && (cheap_bytes || (has_query && raw_search)) {
+            // Sessions read line by line are not loaded whole, except for a
+            // raw search whose matches may span lines.
+            let streams = mmap.is_none() && is_session_file && plugin.streams_raw_lines(path);
+            let stream_raw = streams && raw_line_local;
+            if !load_early && (cheap_bytes || (has_query && raw_search && !stream_raw)) {
                 mmap = plugin.session_bytes(path);
             }
 
@@ -240,6 +250,19 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
                                 bytes_pattern.as_ref().is_some_and(|re| re.is_match(m))
                             }
                         }
+                        None if stream_raw => {
+                            // The match context comes with the match, so the
+                            // session is not read again for `matched`.
+                            matched = bytes_pattern.as_ref().and_then(|re| {
+                                resolver::streamed_raw_match(
+                                    path,
+                                    plugin,
+                                    re,
+                                    fast_needle.as_deref(),
+                                )
+                            });
+                            matched.is_some()
+                        }
                         None => false,
                     }
                 } else {
@@ -249,6 +272,39 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
                         } else {
                             None
                         };
+                        // A session read line by line: parse only the lines
+                        // the prefilter lets through, as for loaded bytes.
+                        if let (true, Some(prefilter), None) =
+                            (streams, &query_prefilter, mmap.as_deref())
+                        {
+                            let per_line = if prompt_only {
+                                plugin.prompts_per_jsonl_line()
+                            } else {
+                                plugin.search_texts_per_jsonl_line()
+                            };
+                            if per_line {
+                                let mut found = None;
+                                plugin.for_each_raw_line(path, &mut |line| {
+                                    if crate::cancel::requested() {
+                                        return false;
+                                    }
+                                    if !prefilter.may_match(line) {
+                                        return true;
+                                    }
+                                    found = if prompt_only {
+                                        search::search_prompts(path, plugin, re, Some(line))
+                                    } else if !plugin.line_may_hold_search_texts(line)
+                                        || line_check.as_ref().is_some_and(|c| !c.may_match(line))
+                                    {
+                                        None
+                                    } else {
+                                        search::search_texts(path, plugin, re, Some(line))
+                                    };
+                                    found.is_none()
+                                });
+                                return found;
+                            }
+                        }
                         if prompt_only {
                             if let (Some(prefilter), Some(m)) = (&query_prefilter, mmap.as_deref())
                             {
