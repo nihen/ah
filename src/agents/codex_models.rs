@@ -102,17 +102,30 @@ fn private_cache_dir(_: &Path) -> Option<File> {
 fn open_in(dir: &File, flags: libc::c_int) -> std::io::Result<Option<File>> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let name = std::ffi::CString::new(CACHE_FILE).expect("no NUL in the name");
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            0o600 as libc::c_uint,
-        )
+    let mut attempts = 0;
+    let fd = loop {
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd >= 0 {
+            break fd;
+        }
+        let error = std::io::Error::last_os_error();
+        // macOS can fail to create a file that another run is creating at
+        // the same moment with ENOENT; the file is there on a retry.
+        attempts += 1;
+        if flags & libc::O_CREAT == 0
+            || error.kind() != std::io::ErrorKind::NotFound
+            || attempts >= 5
+        {
+            return Err(error);
+        }
     };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
     let file = unsafe { File::from_raw_fd(fd) };
     Ok(file.metadata()?.is_file().then_some(file))
 }
@@ -125,7 +138,7 @@ fn open_in(_: &File, _: i32) -> std::io::Result<Option<File>> {
 #[cfg(unix)]
 const READ: libc::c_int = libc::O_RDONLY;
 #[cfg(unix)]
-const APPEND: libc::c_int = libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND;
+const APPEND: libc::c_int = libc::O_RDWR | libc::O_CREAT | libc::O_APPEND;
 #[cfg(not(unix))]
 const READ: i32 = 0;
 #[cfg(not(unix))]
@@ -139,12 +152,16 @@ type Entries = HashMap<PathBuf, (Stamp, Vec<String>)>;
 /// The entries of the cache file in `dir`, read up to `MAX_CACHE_BYTES`,
 /// and whether the file is larger than that (it is then written anew).
 fn read_entries(dir: &File) -> Result<(Entries, bool), Unsafe> {
+    match open_in(dir, READ) {
+        Ok(Some(f)) => entries_of(&f),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((HashMap::new(), false)),
+        _ => Err(Unsafe),
+    }
+}
+
+/// The entries of the open cache file `f`, read from its start.
+fn entries_of(f: &File) -> Result<(Entries, bool), Unsafe> {
     let mut entries = HashMap::new();
-    let f = match open_in(dir, READ) {
-        Ok(Some(f)) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((entries, false)),
-        _ => return Err(Unsafe),
-    };
     let too_large = f.metadata().map_err(|_| Unsafe)?.len() > MAX_CACHE_BYTES;
     let mut reader = BufReader::new(f.take(MAX_CACHE_BYTES));
     let mut line = Vec::new();
@@ -173,32 +190,99 @@ fn read_entries(dir: &File) -> Result<(Entries, bool), Unsafe> {
     Ok((entries, too_large))
 }
 
-/// Append `line` to the cache file in `dir`, one write per line so that
-/// runs in parallel do not interleave lines. When `rewrite`, or when the
-/// line would take the file past `MAX_CACHE_BYTES`, the file is written
-/// anew instead with one line per entry of `entries` (the latest of each
-/// path), as many as fit.
-fn append(dir: &File, line: &str, rewrite: bool, entries: &Entries) -> bool {
+/// How an append went.
+#[derive(PartialEq, Debug)]
+enum Appended {
+    Written,
+    /// Another run held the file for too long: this entry is not written.
+    Busy,
+    /// The file cannot be written: the cache is not used further.
+    Failed,
+}
+
+/// Append `line`, the entry of `path`, to the cache file in `dir`, one
+/// write per line. When `rewrite`, or when the line would take the file
+/// past `MAX_CACHE_BYTES`, the file is written anew instead, with one line
+/// per path (those of `entries`, then the others in the file, then `line`)
+/// as many as fit. The file is locked meanwhile, so that runs in parallel
+/// do not rewrite it over each other.
+fn append(dir: &File, path: &Path, line: &str, rewrite: bool, entries: &Entries) -> Appended {
     let Ok(Some(mut f)) = open_in(dir, APPEND) else {
-        return false;
+        return Appended::Failed;
     };
+    match lock(&f) {
+        Some(true) => {}
+        Some(false) => return Appended::Busy,
+        None => return Appended::Failed,
+    }
     let full = f
         .metadata()
         .is_ok_and(|m| m.len() + line.len() as u64 > MAX_CACHE_BYTES);
     if !rewrite && !full {
-        return f.write_all(line.as_bytes()).is_ok();
+        return written(f.write_all(line.as_bytes()));
     }
+    // What other runs wrote since this one read the file is kept too.
+    let in_file = entries_of(&f)
+        .map(|(entries, _)| entries)
+        .unwrap_or_default();
+    let others = in_file.iter().filter(|(p, _)| !entries.contains_key(*p));
     let mut text = String::new();
-    for (path, (stamp, pushes)) in entries {
-        if let Some(entry) = entry_line(path, *stamp, pushes)
+    for (p, (stamp, pushes)) in entries.iter().chain(others) {
+        if p == path {
+            continue;
+        }
+        if let Some(entry) = entry_line(p, *stamp, pushes)
             && (text.len() + entry.len() + line.len()) as u64 <= MAX_CACHE_BYTES
         {
             text.push_str(&entry);
         }
     }
     text.push_str(line);
-    f.set_len(0).is_ok() && f.write_all(text.as_bytes()).is_ok()
+    if f.set_len(0).is_err() {
+        return Appended::Failed;
+    }
+    written(f.write_all(text.as_bytes()))
 }
+
+fn written(result: std::io::Result<()>) -> Appended {
+    if result.is_ok() {
+        Appended::Written
+    } else {
+        Appended::Failed
+    }
+}
+
+/// Lock `f` for this process until it is closed. `Some(false)` when
+/// another run holds it past `LOCK_WAIT`, or the command is cancelled.
+#[cfg(unix)]
+fn lock(f: &File) -> Option<bool> {
+    use std::os::fd::AsRawFd;
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Some(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) {
+            return None;
+        }
+        if crate::cancel::requested() || std::time::Instant::now() >= deadline {
+            return Some(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(unix))]
+fn lock(_: &File) -> Option<bool> {
+    None
+}
+
+/// How long a run waits for another to finish writing the cache.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 fn parse_line(line: &str) -> Option<(PathBuf, (Stamp, Vec<String>))> {
     let line = line.strip_suffix('\n')?;
@@ -267,10 +351,10 @@ pub(super) fn models(path: &Path, scan: impl FnOnce() -> (ModelList, bool)) -> O
     // Rewriting the file writes the new entry, not the one it replaces.
     cache.entries.remove(path);
     if let (Some(line), Some(dir)) = (line, &cache.dir) {
-        if append(dir, &line, cache.truncate, &cache.entries) {
-            cache.truncate = false;
-        } else {
-            cache.dir = None;
+        match append(dir, path, &line, cache.truncate, &cache.entries) {
+            Appended::Written => cache.truncate = false,
+            Appended::Busy => {}
+            Appended::Failed => cache.dir = None,
         }
     }
     cache.entries.insert(path.to_path_buf(), (stamp, pushes));
@@ -320,7 +404,10 @@ mod tests {
         std::fs::write(&target, "x").unwrap();
         std::os::unix::fs::symlink(&target, &file).unwrap();
         assert!(read_entries(&dir).is_err());
-        assert!(!append(&dir, "line\n", false, &HashMap::new()));
+        assert_eq!(
+            append(&dir, Path::new("/r/new"), "line\n", false, &HashMap::new()),
+            Appended::Failed
+        );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "x");
         std::fs::remove_file(&file).unwrap();
         // A file too large is read up to the limit, and written anew with
@@ -332,14 +419,36 @@ mod tests {
         let (entries, too_large) = read_entries(&dir).ok().unwrap();
         assert!(too_large);
         assert_eq!(entries.len(), 1);
-        assert!(append(&dir, "line\n", true, &entries));
+        assert_eq!(
+            append(&dir, Path::new("/r/new"), "line\n", true, &entries),
+            Appended::Written
+        );
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             format!("{kept}line\n")
         );
+        // A rewrite keeps the entries other runs wrote, one per path, and
+        // drops the old entry of the path written.
+        let other = entry_line(Path::new("/r/other"), (3, 4), &["o".to_string()]).unwrap();
+        let old = entry_line(Path::new("/r/new"), (5, 6), &["x".to_string()]).unwrap();
+        std::fs::write(&file, format!("{other}{old}{other}")).unwrap();
+        let new = entry_line(Path::new("/r/new"), (7, 8), &["y".to_string()]).unwrap();
+        assert_eq!(
+            append(&dir, Path::new("/r/new"), &new, true, &entries),
+            Appended::Written
+        );
+        let text = std::fs::read_to_string(&file).unwrap();
+        let mut lines: Vec<_> = text.lines().collect();
+        lines.sort();
+        let mut expected = vec![kept.trim_end(), other.trim_end(), new.trim_end()];
+        expected.sort();
+        assert_eq!(lines, expected);
         // So is a file the line would take past the limit.
         std::fs::write(&file, vec![b'x'; MAX_CACHE_BYTES as usize - 2]).unwrap();
-        assert!(append(&dir, "line\n", false, &entries));
+        assert_eq!(
+            append(&dir, Path::new("/r/new"), "line\n", false, &entries),
+            Appended::Written
+        );
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             format!("{kept}line\n")
@@ -356,6 +465,46 @@ mod tests {
         // A line too long is not written.
         let long = "m".repeat(MAX_LINE_BYTES);
         assert_eq!(entry_line(Path::new("/r/x"), (1, 2), &[long]), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrites_in_parallel_keep_every_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_path = tmp.path().join("ah");
+        private_cache_dir(&dir_path).unwrap();
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let dir_path = dir_path.clone();
+                std::thread::spawn(move || {
+                    // Each run holds the directory open as `CACHE` does.
+                    let dir = private_cache_dir(&dir_path).unwrap();
+                    let path = PathBuf::from(format!("/r/{i}"));
+                    let line = entry_line(&path, (i, 0), &["m".to_string()]).unwrap();
+                    assert_eq!(
+                        append(&dir, &path, &line, true, &HashMap::new()),
+                        Appended::Written
+                    );
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        let dir = private_cache_dir(&dir_path).unwrap();
+        let (entries, too_large) = read_entries(&dir).ok().unwrap();
+        assert!(!too_large);
+        assert_eq!(entries.len(), 16);
+        let text = std::fs::read_to_string(dir_path.join(CACHE_FILE)).unwrap();
+        assert_eq!(text.lines().count(), 16);
+        // A run that holds the file past the wait makes others skip it.
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(dir_path.join(CACHE_FILE)).unwrap();
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let line = entry_line(Path::new("/r/late"), (1, 0), &["m".to_string()]).unwrap();
+        let path = Path::new("/r/late");
+        assert_eq!(
+            append(&dir, path, &line, false, &HashMap::new()),
+            Appended::Busy
+        );
     }
 
     #[test]
