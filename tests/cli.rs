@@ -3449,3 +3449,68 @@ fn invalid_tz_falls_back_to_system_zone() {
     assert_eq!(run(Some("NoSuch/Zone")), system);
     assert_eq!(run(Some(":NoSuch/Zone")), system);
 }
+
+// ─── Compressed Codex rollouts ─────────────────────────────────────
+
+/// A home with the Codex fixture compressed as Codex does it
+/// (`rollout-*.jsonl.zst`, the plain file removed).
+fn compressed_codex_home() -> (TempDir, std::path::PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join(".codex/archived_sessions/2026/03/24");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rollout-2026-03-24T20-43-12-codex-sess-001.jsonl.zst");
+    let plain = fs::read(fixture_path("codex_session.jsonl")).unwrap();
+    fs::write(&path, zstd::stream::encode_all(&plain[..], 3).unwrap()).unwrap();
+    (tmp, path)
+}
+
+fn ah_in(home: &Path) -> Command {
+    let mut cmd = ah();
+    cmd.env("HOME", home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", "/nonexistent")
+        .env("GEMINI_CLI_HOME", "/nonexistent")
+        .env("COPILOT_HOME", "/nonexistent")
+        .env("CURSOR_DATA_DIR", "/nonexistent")
+        .env_remove("XDG_DATA_HOME");
+    cmd
+}
+
+#[test]
+fn compressed_codex_rollouts_are_listed_searched_and_shown() {
+    let (tmp, path) = compressed_codex_home();
+    let home = tmp.path();
+    ah_in(home)
+        .args(["log", "-a", "--agent", "codex", "-o", "id,archived"])
+        .assert()
+        .success()
+        .stdout("codex-sess-001\ttrue\n");
+    ah_in(home)
+        .args(["log", "-a", "-q", "deploy to production", "-o", "id"])
+        .assert()
+        .success()
+        .stdout("codex-sess-001\n");
+    ah_in(home)
+        .args(["show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("add redis caching"));
+    ah_in(home)
+        .args(["show", "--raw", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with(
+            r#"{"type":"session.start","payload":{"id":"codex-sess-001""#,
+        ));
+}
+
+#[test]
+fn a_compressed_rollout_next_to_its_plain_copy_is_listed_once() {
+    let (tmp, path) = compressed_codex_home();
+    fs::copy(fixture_path("codex_session.jsonl"), path.with_extension("")).unwrap();
+    ah_in(tmp.path())
+        .args(["log", "-a", "--agent", "codex", "-o", "path"])
+        .assert()
+        .success()
+        .stdout(format!("{}\n", path.with_extension("").display()));
+}

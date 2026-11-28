@@ -189,7 +189,7 @@ pub fn run_pipeline(params: &PipelineParams) -> Result<PipelineResult, String> {
             // and only for full-text search.
             let search_path = plugin.search_path(path);
             let is_session_file = search_path == *path;
-            let cheap_bytes = plugin.cheap_session_bytes();
+            let cheap_bytes = plugin.cheap_session_bytes(path);
             // With early filters, sessions they reject are not mapped at all
             // unless the plugin reads the cwd from these bytes.
             let load_early = cheap_bytes && (!has_early_filters || plugin.cwd_in_session_bytes());

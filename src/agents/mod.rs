@@ -10,6 +10,7 @@ mod gemini;
 mod grok;
 mod opencode;
 mod pi;
+mod zstd_log;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -193,7 +194,7 @@ pub trait AgentPlugin: Sync {
 
     /// Whether `session_bytes` is cheap enough to load for every listed
     /// session even when no full-text query needs it.
-    fn cheap_session_bytes(&self) -> bool {
+    fn cheap_session_bytes(&self, _path: &Path) -> bool {
         true
     }
 

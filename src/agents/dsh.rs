@@ -1,14 +1,11 @@
 use super::entries::{RecordVisitor, SearchKind as K, TypedVisitor};
-use std::cell::RefCell;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use super::common::{
     SessionBytes, is_safe_cli_id, mmap_file, strip_home, visit_tool_call, visit_tool_output,
 };
+use super::zstd_log::{self, Log, decode_frames, for_each_frame};
 use super::{AgentPlugin, MemoryKind, MemorySource, Message};
 
 pub static PLUGIN: DshPlugin = DshPlugin;
@@ -31,84 +28,14 @@ fn is_compressed(path: &Path) -> bool {
 /// damaged or hostile file (Zstandard compresses a run of one byte about
 /// 30000:1) from exhausting memory, also when threads decode in parallel.
 const MAX_LOG_BYTES: u64 = 64 << 20;
-/// Largest decoded log kept for the next field of the same session. Larger
-/// ones are freed once read, so idle threads (e.g. of `ah mcp`) hold little.
-const MAX_CACHED_BYTES: usize = 8 << 20;
-/// Whole logs decoded at the same time, across threads: with
-/// `MAX_LOG_BYTES` this bounds the text being decoded at once.
-const MAX_PARALLEL_DECODES: usize = 4;
-
-/// Holds one of the `MAX_PARALLEL_DECODES` slots while alive.
-struct DecodeSlot;
-
-static DECODES: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
-static DECODE_FREED: std::sync::Condvar = std::sync::Condvar::new();
-
-impl DecodeSlot {
-    fn acquire() -> Self {
-        let mut busy = DECODES.lock().unwrap_or_else(|e| e.into_inner());
-        while *busy >= MAX_PARALLEL_DECODES {
-            busy = DECODE_FREED.wait(busy).unwrap_or_else(|e| e.into_inner());
-        }
-        *busy += 1;
-        DecodeSlot
-    }
-}
-
-impl Drop for DecodeSlot {
-    fn drop(&mut self) {
-        *DECODES.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
-        DECODE_FREED.notify_one();
-    }
-}
 /// How much text listing decodes to find the first prompt, which is in the
 /// first batch of events. Listing visits every log, so this stays small.
 const MAX_PROMPT_SCAN_BYTES: u64 = 16 << 20;
 /// Largest header line that is decoded; a header is a few hundred bytes.
 const MAX_HEADER_BYTES: u64 = 1 << 20;
 
-/// Decode the Zstandard frames of `data` one at a time, up to `max_bytes`
-/// of text in all, until `visit` returns `false`. A frame that cannot be
-/// decoded ends the log, and only the frames before it are visited: a
-/// write that was cut short, a checksum that does not match, or a frame
-/// that would take the text past `max_bytes`.
-fn for_each_frame(mut data: &[u8], max_bytes: u64, mut visit: impl FnMut(Vec<u8>) -> bool) {
-    let mut room = max_bytes;
-    while !data.is_empty() {
-        let mut text = Vec::new();
-        let decoded = zstd::stream::read::Decoder::with_buffer(&mut data)
-            .ok()
-            .and_then(|frame| {
-                frame
-                    .single_frame()
-                    .take(room + 1)
-                    .read_to_end(&mut text)
-                    .ok()
-            });
-        if decoded.is_none_or(|read| read as u64 > room) {
-            return;
-        }
-        room -= text.len() as u64;
-        if !visit(text) {
-            return;
-        }
-    }
-}
-
-/// The text of the first `max_frames` frames of `data` (see `for_each_frame`).
-fn decode_frames(data: &[u8], max_frames: usize, max_bytes: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut frames = 0;
-    for_each_frame(data, max_bytes, |text| {
-        if out.is_empty() {
-            out = text;
-        } else {
-            out.extend_from_slice(&text);
-        }
-        frames += 1;
-        frames < max_frames
-    });
-    out
+fn read_log(path: &Path) -> Option<Log> {
+    zstd_log::read_log(path, is_compressed(path), MAX_LOG_BYTES)
 }
 
 /// Format generation in a log's file name: `session.jsonl[.zstd]` is 0 and
@@ -125,70 +52,6 @@ fn generation(path: &Path) -> Option<u32> {
     (!digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit()))
         .then(|| digits.parse().ok())
         .flatten()
-}
-
-/// The log as text: the file itself, or its decoded frames.
-enum Log {
-    Plain(memmap2::Mmap),
-    Decoded(Rc<Vec<u8>>),
-}
-
-impl std::ops::Deref for Log {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        match self {
-            Log::Plain(mmap) => mmap,
-            Log::Decoded(bytes) => bytes,
-        }
-    }
-}
-
-/// The file a decoded log was read from, to tell when it has changed.
-#[derive(PartialEq)]
-struct Source {
-    path: PathBuf,
-    len: u64,
-    modified: Option<SystemTime>,
-    epoch: u64,
-}
-
-/// Raised by `clear_caches`; a decoded log from an earlier epoch is stale.
-static EPOCH: AtomicU64 = AtomicU64::new(0);
-
-thread_local! {
-    /// The log decoded last on this thread. The fields of one session are
-    /// resolved one after another, each asking for the same log.
-    static LAST_DECODED: RefCell<Option<(Source, Rc<Vec<u8>>)>> = const { RefCell::new(None) };
-}
-
-fn read_log(path: &Path) -> Option<Log> {
-    if !is_compressed(path) {
-        return mmap_file(path).map(Log::Plain);
-    }
-    let meta = std::fs::metadata(path).ok()?;
-    let source = Source {
-        path: path.to_path_buf(),
-        len: meta.len(),
-        modified: meta.modified().ok(),
-        epoch: EPOCH.load(Ordering::Relaxed),
-    };
-    let cached = LAST_DECODED.with_borrow(|last| {
-        last.as_ref()
-            .filter(|(of, _)| *of == source)
-            .map(|(_, bytes)| Rc::clone(bytes))
-    });
-    if let Some(bytes) = cached {
-        return Some(Log::Decoded(bytes));
-    }
-    let data = mmap_file(path)?;
-    let slot = DecodeSlot::acquire();
-    let bytes = Rc::new(decode_frames(&data, usize::MAX, MAX_LOG_BYTES));
-    drop(slot);
-    LAST_DECODED.with_borrow_mut(|last| {
-        *last = (bytes.len() <= MAX_CACHED_BYTES).then(|| (source, Rc::clone(&bytes)));
-    });
-    Some(Log::Decoded(bytes))
 }
 
 /// The header line. Only the first frame of a compressed log is decoded.
@@ -407,7 +270,7 @@ impl AgentPlugin for DshPlugin {
     }
 
     fn clear_caches(&self) {
-        EPOCH.fetch_add(1, Ordering::Relaxed);
+        zstd_log::clear_cache();
     }
 
     /// A session directory keeps the logs of earlier format generations
@@ -426,21 +289,12 @@ impl AgentPlugin for DshPlugin {
     }
 
     /// The decoded log. Decoding is not free, so it is loaded only for a
-    /// full-text search. The decoded bytes are handed over rather than
-    /// copied when nothing else holds them.
+    /// full-text search.
     fn session_bytes(&self, path: &Path) -> Option<SessionBytes> {
-        match read_log(path)? {
-            Log::Plain(mmap) => Some(SessionBytes::Mmap(mmap)),
-            Log::Decoded(bytes) => {
-                LAST_DECODED.with_borrow_mut(|last| *last = None);
-                Some(SessionBytes::Owned(
-                    Rc::try_unwrap(bytes).unwrap_or_else(|shared| shared.to_vec()),
-                ))
-            }
-        }
+        read_log(path).map(Log::into_session_bytes)
     }
 
-    fn cheap_session_bytes(&self) -> bool {
+    fn cheap_session_bytes(&self, _path: &Path) -> bool {
         false
     }
 

@@ -984,7 +984,7 @@ Each built-in agent respects the environment variable its CLI uses to relocate s
 | Agent   | Session Files | Env Var            | Default     |
 |---------|---------------|--------------------|-------------|
 | Claude  | `projects/*/*.jsonl` | `CLAUDE_CONFIG_DIR`| `~/.claude` |
-| Codex   | `sessions/**/*.jsonl` | `CODEX_HOME`       | `~/.codex`  |
+| Codex   | `sessions/**/*.jsonl` (and compressed `.jsonl.zst`) | `CODEX_HOME`       | `~/.codex`  |
 | Gemini  | `tmp/*/chats/session-*.jsonl` (`.json` before v0.39) | `GEMINI_CLI_HOME`  | `~/.gemini` |
 | Copilot | `session-state/*/workspace.yaml` | `COPILOT_HOME`     | `~/.copilot`|
 | Cursor  | `projects/*/agent-transcripts/**/*.jsonl` | `CURSOR_DATA_DIR`  | `~/.cursor` |
@@ -993,6 +993,8 @@ Each built-in agent respects the environment variable its CLI uses to relocate s
 | opencode | `opencode/opencode*.db` (SQLite) | `XDG_DATA_HOME` | `~/.local/share` |
 | Pi | `sessions/*/*.jsonl`, and `*.jsonl` in `PI_CODING_AGENT_SESSION_DIR` | `PI_CODING_AGENT_DIR` | `~/.pi/agent` |
 | DeepSeek Harness (dsh) | `sessions/*/*/session*.jsonl.zstd` (and uncompressed `.jsonl`) | `DSH_HOME` | `~/.dsh` |
+
+Codex can replace a finished rollout with a Zstandard-compressed copy (`rollout-*.jsonl.zst`). `ah` lists, searches, and shows these like plain rollouts, decoding them in memory; when both copies of a rollout exist, the plain one is listed.
 
 DeepSeek Harness compresses its session logs with Zstandard by default; `ah` decodes them in memory, and `ah show --raw` prints the decoded log. Its shipped profiles have no command that reopens a session interactively, so `ah resume` is not available for it. A session in which nothing was asked (the harness writes one whenever its UI is opened) is not listed.
 
