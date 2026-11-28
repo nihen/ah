@@ -210,7 +210,8 @@ pub trait AgentPlugin: Sync {
 
     /// Visit the lines of `session_bytes`, each with its newline when it has
     /// one, until `visit` returns `false`; together they are the bytes as
-    /// they are. Only called when `streams_raw_lines`.
+    /// they are, except that a line the plugin skips (e.g. too long to
+    /// hold) is visited empty. Only called when `streams_raw_lines`.
     fn for_each_raw_line(&self, _path: &Path, _visit: &mut dyn FnMut(&[u8]) -> bool) {}
 
     /// Write `raw_content` to `out` without holding it whole. `None` when

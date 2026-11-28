@@ -182,11 +182,14 @@ pub(super) fn open(path: &Path) -> std::io::Result<BufReader<std::fs::File>> {
 /// Visit the lines of the decoded text until `visit` returns `false`,
 /// decoding them one at a time: only one line and the decoder's window are
 /// held, however large the log is. Each line is visited with its newline,
-/// when it has one. Decoding stops after `max_bytes` of text, at data that
-/// cannot be decoded (the lines before it are visited), and when the
-/// command is cancelled. A line longer than `max_line` (without its
-/// newline) is skipped. Returns whether the text was read to its end
-/// (or to `max_bytes`) with every line visited.
+/// when it has one. Decoding stops at `max_bytes` of text (a line cut
+/// there is not visited), at data that cannot be decoded (the lines before
+/// it are visited), and when the command is cancelled. A line longer than
+/// `max_line` (without its newline) is skipped, the same way each time,
+/// and visited as an empty line, so that the lines around it are not taken
+/// for neighbours.
+/// Returns whether the text was read to its end, within `max_bytes`, with
+/// every line but the skipped ones visited.
 pub(super) fn for_each_line(
     input: impl BufRead,
     max_bytes: u64,
@@ -196,9 +199,11 @@ pub(super) fn for_each_line(
     let Some(decoder) = decoder(input) else {
         return false;
     };
-    let mut reader = BufReader::with_capacity(1 << 16, decoder.take(max_bytes));
+    // One byte past `max_bytes` tells a text cut at the limit from one
+    // that ends there.
+    let mut reader = BufReader::with_capacity(1 << 16, decoder.take(max_bytes.saturating_add(1)));
+    let mut read = 0u64;
     let mut line = Vec::new();
-    let mut complete = true;
     loop {
         line.clear();
         let mut long_line = None;
@@ -212,7 +217,7 @@ pub(super) fn for_each_line(
             };
             if buf.is_empty() {
                 if line.is_empty() && !skipped {
-                    return complete;
+                    return true;
                 }
                 break;
             }
@@ -232,17 +237,21 @@ pub(super) fn for_each_line(
                 }
             } else {
                 skipped = true;
-                complete = false;
                 line = Vec::new();
                 long_line = None;
             }
             let used = done.unwrap_or(buf.len());
             reader.consume(used);
+            read += used as u64;
+            if read > max_bytes {
+                // The text goes on past the limit: its last line is cut.
+                return false;
+            }
             if done.is_some() {
                 break;
             }
         }
-        if !skipped && !visit(&line) {
+        if !visit(if skipped { &[] } else { &line }) {
             return false;
         }
         drop(long_line);
@@ -264,9 +273,9 @@ impl<R: Read> Read for Cancellable<R> {
     }
 }
 
-/// Write the decoded text to `out` as it is, up to `max_bytes`. Decoding
-/// stops at data that cannot be decoded, and when the command is
-/// cancelled, which are errors.
+/// Write the decoded text to `out` as it is. Data that cannot be decoded,
+/// text longer than `max_bytes` (written up to there), and cancelling the
+/// command are errors.
 pub(super) fn copy_to(
     input: impl BufRead,
     max_bytes: u64,
@@ -275,7 +284,11 @@ pub(super) fn copy_to(
     let decoder = decoder(input).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "not a Zstandard stream")
     })?;
-    std::io::copy(&mut Cancellable(decoder.take(max_bytes)), out)?;
+    let mut text = Cancellable(decoder);
+    std::io::copy(&mut (&mut text).take(max_bytes), out)?;
+    if text.read(&mut [0])? > 0 {
+        return Err(std::io::Error::other("text past the size limit"));
+    }
     Ok(())
 }
 
@@ -457,12 +470,16 @@ mod tests {
         // Two frames, the second without a trailing newline.
         let data = [frame("a\nlong line\n"), frame("\nb")].concat();
         assert_eq!(lines(&data, 1 << 20, 64), ["a\n", "long line\n", "\n", "b"]);
-        // A line past `max_line` is skipped, not cut, and reading goes on.
-        assert_eq!(lines(&data, 1 << 20, 5), ["a\n", "\n", "b"]);
+        // A line past `max_line` is skipped, not cut, and reading goes on;
+        // it is visited empty.
+        assert_eq!(lines(&data, 1 << 20, 5), ["a\n", "", "\n", "b"]);
         let long = frame(&format!("a\n{}\nb\n", "x".repeat(200)));
-        assert_eq!(lines(&long, 1 << 20, 9), ["a\n", "b\n"]);
-        // Decoding stops after `max_bytes` of text.
-        assert_eq!(lines(&data, 4, 64), ["a\n", "lo"]);
+        assert_eq!(lines(&long, 1 << 20, 9), ["a\n", "", "b\n"]);
+        // Decoding stops at `max_bytes` of text; the line cut there is not
+        // visited, and the text was not read to its end.
+        assert_eq!(lines(&data, 4, 64), ["a\n"]);
+        assert!(!for_each_line(&data[..], 4, 64, |_| true));
+        assert!(for_each_line(&data[..], 17, 64, |_| true));
         // A torn frame ends the log after the lines before it.
         let torn = [frame("a\n"), frame("never\n")[..5].to_vec()].concat();
         assert_eq!(lines(&torn, 1 << 20, 64), ["a\n"]);
@@ -470,7 +487,8 @@ mod tests {
         // Whether the text was read to its end with every line visited.
         let read_all = |data: &[u8], max_line| for_each_line(data, 1 << 20, max_line, |_| true);
         assert!(read_all(&data, 64));
-        assert!(!read_all(&data, 5));
+        // Skipping a line is not failing to read.
+        assert!(read_all(&data, 5));
         assert!(!read_all(&torn, 64));
         assert!(!read_all(b"not zstd", 64));
         // `visit` stops the iteration.
@@ -488,6 +506,11 @@ mod tests {
         let mut out = Vec::new();
         copy_to(&data[..], 1 << 20, &mut out).unwrap();
         assert_eq!(out, b"a\nb");
+        // Text past the limit is an error, after what fits.
+        let mut out = Vec::new();
+        assert!(copy_to(&data[..], 2, &mut out).is_err());
+        assert_eq!(out, b"a\n");
+        assert!(copy_to(&data[..], 3, &mut Vec::new()).is_ok());
         assert!(copy_to(&b"not zstd"[..], 1 << 20, &mut Vec::new()).is_err());
     }
 

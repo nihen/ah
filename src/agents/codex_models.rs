@@ -14,7 +14,7 @@
 //! A file past that size is started anew.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -24,18 +24,22 @@ use super::common::ModelList;
 
 /// Separates the models of one line (models are never control characters).
 const MODEL_SEPARATOR: char = '\x1f';
-/// Largest cache file that is read; a larger one is started anew. A line
-/// is about 200 bytes, so this holds tens of thousands of rollouts.
+/// Largest cache file: a larger one is not read, and is started anew when
+/// it would grow past this. A line is about 200 bytes, so this holds tens
+/// of thousands of rollouts.
 const MAX_CACHE_BYTES: u64 = 8 << 20;
-/// Longest line that is read.
+/// Longest line that is read or written.
 const MAX_LINE_BYTES: usize = 16 << 10;
+const CACHE_FILE: &str = "codex-zst-models-v1.tsv";
 
 /// Size and mtime (nanoseconds since the epoch) of a rollout.
 type Stamp = (u64, u128);
 
 struct Cache {
-    /// The cache file; `None` once it cannot be used.
-    file: Option<PathBuf>,
+    /// The cache directory, opened once it was found private; `None` when
+    /// the cache cannot be used. The file is opened relative to it, so
+    /// that the directory cannot be swapped for another afterwards.
+    dir: Option<File>,
     /// Whether the file is started anew at the next write.
     truncate: bool,
     entries: HashMap<PathBuf, (Stamp, Vec<String>)>,
@@ -43,30 +47,32 @@ struct Cache {
 
 static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| {
     // Unit tests do not touch the user's cache.
-    let file = dirs::cache_dir()
+    let dir = dirs::cache_dir()
         .filter(|_| !cfg!(test))
-        .and_then(|dir| private_cache_dir(&dir.join("ah")))
-        .map(|dir| dir.join("codex-zst-models-v1.tsv"));
+        .and_then(|dir| private_cache_dir(&dir.join("ah")));
     let mut cache = Cache {
-        file,
+        dir,
         truncate: false,
         entries: HashMap::new(),
     };
-    if let Some(file) = cache.file.clone() {
-        match read_entries(&file) {
-            Ok(entries) => cache.entries = entries,
-            Err(Unreadable::TooLarge) => cache.truncate = true,
-            Err(Unreadable::Unsafe) => cache.file = None,
+    if let Some(dir) = &cache.dir {
+        match read_entries(dir) {
+            Ok((entries, too_large)) => {
+                cache.entries = entries;
+                cache.truncate = too_large;
+            }
+            Err(Unsafe) => cache.dir = None,
         }
     }
     Mutex::new(cache)
 });
 
-/// `dir`, created only the user can use if missing; `None` unless it is a
-/// directory of the user that others cannot write to.
+/// `dir` opened, created only the user can use if missing; `None` unless
+/// it is a directory (not a link to one) of the user that no one else can
+/// write to.
 #[cfg(unix)]
-fn private_cache_dir(dir: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
+fn private_cache_dir(dir: &Path) -> Option<File> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
@@ -75,48 +81,71 @@ fn private_cache_dir(dir: &Path) -> Option<PathBuf> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(_) => return None,
     }
-    crate::cloud::private_dir(dir).then(|| dir.to_path_buf())
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+        .ok()?;
+    let meta = opened.metadata().ok()?;
+    (meta.is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0)
+        .then_some(opened)
 }
 
 #[cfg(not(unix))]
-fn private_cache_dir(_: &Path) -> Option<PathBuf> {
+fn private_cache_dir(_: &Path) -> Option<File> {
     None
 }
 
-/// The cache file opened without following a symbolic link or blocking on
-/// a FIFO; `None` unless it is a regular file.
+/// The cache file in `dir`, opened with `flags` without following a
+/// symbolic link or blocking on a FIFO; `None` unless it is a regular file.
 #[cfg(unix)]
-fn open(file: &Path, options: &mut OpenOptions) -> std::io::Result<Option<File>> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = options
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(file)?;
-    Ok(f.metadata()?.is_file().then_some(f))
+fn open_in(dir: &File, flags: libc::c_int) -> std::io::Result<Option<File>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let name = std::ffi::CString::new(CACHE_FILE).expect("no NUL in the name");
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    Ok(file.metadata()?.is_file().then_some(file))
 }
 
 #[cfg(not(unix))]
-fn open(_: &Path, _: &mut OpenOptions) -> std::io::Result<Option<File>> {
+fn open_in(_: &File, _: i32) -> std::io::Result<Option<File>> {
     Ok(None)
 }
 
-enum Unreadable {
-    /// Larger than `MAX_CACHE_BYTES`: started anew.
-    TooLarge,
-    /// Not a regular file that can be opened: not used.
-    Unsafe,
-}
+#[cfg(unix)]
+const READ: libc::c_int = libc::O_RDONLY;
+#[cfg(unix)]
+const APPEND: libc::c_int = libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND;
+#[cfg(not(unix))]
+const READ: i32 = 0;
+#[cfg(not(unix))]
+const APPEND: i32 = 0;
 
-fn read_entries(file: &Path) -> Result<HashMap<PathBuf, (Stamp, Vec<String>)>, Unreadable> {
+/// The cache file is not a regular file that can be opened: not used.
+struct Unsafe;
+
+type Entries = HashMap<PathBuf, (Stamp, Vec<String>)>;
+
+/// The entries of the cache file in `dir`, read up to `MAX_CACHE_BYTES`,
+/// and whether the file is larger than that (it is then written anew).
+fn read_entries(dir: &File) -> Result<(Entries, bool), Unsafe> {
     let mut entries = HashMap::new();
-    let f = match open(file, OpenOptions::new().read(true)) {
+    let f = match open_in(dir, READ) {
         Ok(Some(f)) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
-        _ => return Err(Unreadable::Unsafe),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((entries, false)),
+        _ => return Err(Unsafe),
     };
-    if f.metadata().map_err(|_| Unreadable::Unsafe)?.len() > MAX_CACHE_BYTES {
-        return Err(Unreadable::TooLarge);
-    }
+    let too_large = f.metadata().map_err(|_| Unsafe)?.len() > MAX_CACHE_BYTES;
     let mut reader = BufReader::new(f.take(MAX_CACHE_BYTES));
     let mut line = Vec::new();
     loop {
@@ -141,7 +170,34 @@ fn read_entries(file: &Path) -> Result<HashMap<PathBuf, (Stamp, Vec<String>)>, U
             entries.insert(path, entry);
         }
     }
-    Ok(entries)
+    Ok((entries, too_large))
+}
+
+/// Append `line` to the cache file in `dir`, one write per line so that
+/// runs in parallel do not interleave lines. When `rewrite`, or when the
+/// line would take the file past `MAX_CACHE_BYTES`, the file is written
+/// anew instead with one line per entry of `entries` (the latest of each
+/// path), as many as fit.
+fn append(dir: &File, line: &str, rewrite: bool, entries: &Entries) -> bool {
+    let Ok(Some(mut f)) = open_in(dir, APPEND) else {
+        return false;
+    };
+    let full = f
+        .metadata()
+        .is_ok_and(|m| m.len() + line.len() as u64 > MAX_CACHE_BYTES);
+    if !rewrite && !full {
+        return f.write_all(line.as_bytes()).is_ok();
+    }
+    let mut text = String::new();
+    for (path, (stamp, pushes)) in entries {
+        if let Some(entry) = entry_line(path, *stamp, pushes)
+            && (text.len() + entry.len() + line.len()) as u64 <= MAX_CACHE_BYTES
+        {
+            text.push_str(&entry);
+        }
+    }
+    text.push_str(line);
+    f.set_len(0).is_ok() && f.write_all(text.as_bytes()).is_ok()
 }
 
 fn parse_line(line: &str) -> Option<(PathBuf, (Stamp, Vec<String>))> {
@@ -208,23 +264,13 @@ pub(super) fn models(path: &Path, scan: impl FnOnce() -> (ModelList, bool)) -> O
     let pushes = pushes(&models);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let line = entry_line(path, stamp, &pushes);
-    if let (Some(line), Some(file)) = (line, cache.file.clone()) {
-        let mut options = OpenOptions::new();
-        options.create(true);
-        if cache.truncate {
-            options.write(true).truncate(true);
-        } else {
-            options.append(true);
-        }
-        // One write per line, appended: runs in parallel do not interleave.
-        let written = match open(&file, &mut options) {
-            Ok(Some(mut f)) => f.write_all(line.as_bytes()).is_ok(),
-            _ => false,
-        };
-        if written {
+    // Rewriting the file writes the new entry, not the one it replaces.
+    cache.entries.remove(path);
+    if let (Some(line), Some(dir)) = (line, &cache.dir) {
+        if append(dir, &line, cache.truncate, &cache.entries) {
             cache.truncate = false;
         } else {
-            cache.file = None;
+            cache.dir = None;
         }
     }
     cache.entries.insert(path.to_path_buf(), (stamp, pushes));
@@ -235,10 +281,12 @@ pub(super) fn models(path: &Path, scan: impl FnOnce() -> (ModelList, bool)) -> O
 fn entry_line(path: &Path, stamp: Stamp, pushes: &[String]) -> Option<String> {
     let path = path.to_str()?;
     let fine = |s: &str| !s.contains(['\t', '\n', '\r', MODEL_SEPARATOR]);
-    (fine(path) && pushes.iter().all(|m| fine(m))).then(|| {
-        let joined = pushes.join(&MODEL_SEPARATOR.to_string());
-        format!("{}\t{}\t{joined}\t{path}\n", stamp.0, stamp.1)
-    })
+    (fine(path) && pushes.iter().all(|m| fine(m)))
+        .then(|| {
+            let joined = pushes.join(&MODEL_SEPARATOR.to_string());
+            format!("{}\t{}\t{joined}\t{path}\n", stamp.0, stamp.1)
+        })
+        .filter(|line| line.len() <= MAX_LINE_BYTES)
 }
 
 #[cfg(test)]
@@ -261,20 +309,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_cache_file_is_not_followed_through_a_link() {
+    fn the_cache_file_is_opened_safely_and_kept_small() {
         let tmp = tempfile::tempdir().unwrap();
+        let dir_path = tmp.path().join("ah");
+        let dir = private_cache_dir(&dir_path).unwrap();
+        let file = dir_path.join(CACHE_FILE);
+        assert!(read_entries(&dir).is_ok_and(|(e, too_large)| e.is_empty() && !too_large));
+        // A link is not followed, for reading or writing.
         let target = tmp.path().join("target");
         std::fs::write(&target, "x").unwrap();
-        let link = tmp.path().join("cache.tsv");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(open(&link, OpenOptions::new().append(true)).is_err());
-        assert!(matches!(read_entries(&link), Err(Unreadable::Unsafe)));
+        std::os::unix::fs::symlink(&target, &file).unwrap();
+        assert!(read_entries(&dir).is_err());
+        assert!(!append(&dir, "line\n", false, &HashMap::new()));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "x");
-        // A file too large is started anew; a missing one is empty.
-        let big = tmp.path().join("big.tsv");
-        std::fs::write(&big, vec![b'x'; MAX_CACHE_BYTES as usize + 1]).unwrap();
-        assert!(matches!(read_entries(&big), Err(Unreadable::TooLarge)));
-        assert!(read_entries(&tmp.path().join("none")).is_ok_and(|e| e.is_empty()));
+        std::fs::remove_file(&file).unwrap();
+        // A file too large is read up to the limit, and written anew with
+        // the entries known, one per path.
+        let kept = entry_line(Path::new("/r/kept"), (1, 2), &["m".to_string()]).unwrap();
+        let mut big = kept.repeat(2).into_bytes();
+        big.resize(MAX_CACHE_BYTES as usize + 1, b'x');
+        std::fs::write(&file, big).unwrap();
+        let (entries, too_large) = read_entries(&dir).ok().unwrap();
+        assert!(too_large);
+        assert_eq!(entries.len(), 1);
+        assert!(append(&dir, "line\n", true, &entries));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("{kept}line\n")
+        );
+        // So is a file the line would take past the limit.
+        std::fs::write(&file, vec![b'x'; MAX_CACHE_BYTES as usize - 2]).unwrap();
+        assert!(append(&dir, "line\n", false, &entries));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("{kept}line\n")
+        );
+        // A directory others can write to, or a link to one, is not used.
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_cache_dir(&shared).is_none());
+        let linked = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&dir_path, &linked).unwrap();
+        assert!(private_cache_dir(&linked).is_none());
+        // A line too long is not written.
+        let long = "m".repeat(MAX_LINE_BYTES);
+        assert_eq!(entry_line(Path::new("/r/x"), (1, 2), &[long]), None);
     }
 
     #[test]

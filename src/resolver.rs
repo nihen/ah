@@ -223,6 +223,12 @@ pub fn streamed_raw_match(
         if crate::cancel::requested() {
             return false;
         }
+        // A skipped line (visited empty) ends the context: the bytes around
+        // it are not neighbours.
+        if line.is_empty() {
+            before.clear();
+            return found.is_none();
+        }
         if let Some((text, _, _, needed)) = &mut found {
             let take = (*needed).min(line.len());
             text.extend_from_slice(&line[..take]);
