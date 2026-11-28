@@ -133,6 +133,7 @@ fn resolve_matched(
                 bytes_re,
                 preloaded_mmap,
                 opts.literal_needle.as_deref(),
+                opts.raw_line_local,
             )
         }
         SearchMode::Text | SearchMode::Prompt => {
@@ -158,14 +159,10 @@ fn resolve_matched_mmap(
     bytes_re: &BytesRegex,
     preloaded: Option<&[u8]>,
     literal_needle: Option<&[u8]>,
+    line_local: bool,
 ) -> String {
-    if preloaded.is_none() && plugin.streams_raw_lines(path) {
-        let mut matched = String::new();
-        plugin.for_each_raw_line(path, &mut |line| {
-            matched = matched_in_bytes(line, bytes_re, literal_needle);
-            matched.is_empty()
-        });
-        return matched;
+    if preloaded.is_none() && line_local && plugin.streams_raw_lines(path) {
+        return streamed_raw_match(path, plugin, bytes_re, literal_needle).unwrap_or_default();
     }
     let mmap_holder;
     let data: &[u8] = if let Some(d) = preloaded {
@@ -182,23 +179,79 @@ fn resolve_matched_mmap(
 
 /// The context of the first match in `data`, or an empty string.
 fn matched_in_bytes(data: &[u8], bytes_re: &BytesRegex, literal_needle: Option<&[u8]>) -> String {
-    // Fast literal path: use memchr SIMD instead of regex
-    if let Some(needle) = literal_needle {
-        return extract_matches_literal_bytes(data, needle);
-    }
-    // Regex path: find match in raw bytes, then extract context from surrounding slice
-    if let Some(mat) = bytes_re.find(data) {
-        extract_context_from_bytes(data, mat.start(), mat.end(), 30)
-    } else {
-        String::new()
+    match first_raw_match(data, bytes_re, literal_needle) {
+        Some((start, end)) => extract_context_from_bytes(data, start, end, MATCH_CONTEXT),
+        None => String::new(),
     }
 }
 
-/// Extract match context using fast case-insensitive byte search.
-/// Works directly on raw bytes — no full-file UTF-8 conversion needed.
-fn extract_matches_literal_bytes(data: &[u8], needle_lower: &[u8]) -> String {
+/// Characters of context around a raw match.
+const MATCH_CONTEXT: usize = 30;
+
+/// The byte range of the first raw match in `data`: of the lowercase ASCII
+/// `literal_needle` when given (found with memchr), else of `bytes_re`.
+fn first_raw_match(
+    data: &[u8],
+    bytes_re: &BytesRegex,
+    literal_needle: Option<&[u8]>,
+) -> Option<(usize, usize)> {
+    match literal_needle {
+        Some(needle) => find_literal_ci(data, needle).map(|start| (start, start + needle.len())),
+        None => bytes_re.find(data).map(|m| (m.start(), m.end())),
+    }
+}
+
+/// The first raw match in a session read line by line, with its context
+/// as `matched_in_bytes` gives it on the whole text: the context reaches
+/// into the lines around the match. `None` when nothing matches; the
+/// matches of the query must lie within lines
+/// (`search::raw_matches_lie_within_lines`).
+pub fn streamed_raw_match(
+    path: &Path,
+    plugin: &dyn AgentPlugin,
+    bytes_re: &BytesRegex,
+    literal_needle: Option<&[u8]>,
+) -> Option<String> {
+    // The bytes `extract_context_from_bytes` may read on each side.
+    let window = MATCH_CONTEXT * 4;
+    // The text before the current line (at most `window` bytes of it), and
+    // once a match is found, the text around it read so far.
+    let mut before: Vec<u8> = Vec::new();
+    let mut found: Option<(Vec<u8>, usize, usize)> = None;
+    plugin.for_each_raw_line(path, &mut |line| {
+        if crate::cancel::requested() {
+            return false;
+        }
+        if let Some((text, _, end)) = &mut found {
+            text.extend_from_slice(line);
+            text.push(b'\n');
+            return text.len() < *end + window;
+        }
+        if let Some((start, end)) = first_raw_match(line, bytes_re, literal_needle) {
+            let offset = before.len();
+            let mut text = std::mem::take(&mut before);
+            text.extend_from_slice(line);
+            text.push(b'\n');
+            let done = text.len() >= offset + end + window;
+            found = Some((text, offset + start, offset + end));
+            return !done;
+        }
+        before.extend_from_slice(line);
+        before.push(b'\n');
+        if before.len() > window {
+            before.drain(..before.len() - window);
+        }
+        true
+    });
+    let (text, start, end) = found?;
+    Some(extract_context_from_bytes(&text, start, end, MATCH_CONTEXT))
+}
+
+/// Start of the first case-insensitive occurrence of the lowercase ASCII
+/// `needle_lower` in `data`, found with memchr.
+fn find_literal_ci(data: &[u8], needle_lower: &[u8]) -> Option<usize> {
     if needle_lower.is_empty() {
-        return String::new();
+        return None;
     }
     let first_lower = needle_lower[0];
     let first_upper = first_lower.to_ascii_uppercase();
@@ -207,26 +260,24 @@ fn extract_matches_literal_bytes(data: &[u8], needle_lower: &[u8]) -> String {
     let mut start = 0;
     loop {
         if start + needle_lower.len() > data.len() {
-            return String::new();
+            return None;
         }
         let found = if has_case {
             memchr::memchr2(first_lower, first_upper, &data[start..])
         } else {
             memchr::memchr(first_lower, &data[start..])
         };
-        let Some(pos) = found else {
-            return String::new();
-        };
+        let pos = found?;
         let abs = start + pos;
         if abs + needle_lower.len() > data.len() {
-            return String::new();
+            return None;
         }
         if data[abs..abs + needle_lower.len()]
             .iter()
             .zip(needle_lower)
             .all(|(h, n)| h.to_ascii_lowercase() == *n)
         {
-            return extract_context_from_bytes(data, abs, abs + needle_lower.len(), 30);
+            return Some(abs);
         }
         start = abs + 1;
     }
@@ -449,6 +500,9 @@ pub struct ResolveOpts {
     pub search_mode: SearchMode,
     /// Pre-computed lowercase needle for fast literal match context extraction.
     pub literal_needle: Option<Vec<u8>>,
+    /// Whether the raw matches of the query lie within lines, so sessions
+    /// read line by line need not be loaded whole.
+    pub raw_line_local: bool,
 }
 
 impl ResolveOpts {
@@ -481,6 +535,7 @@ impl ResolveOpts {
             bytes_query_re,
             search_mode: SearchMode::Text,
             literal_needle,
+            raw_line_local: crate::search::raw_matches_lie_within_lines(query),
         }
     }
 
@@ -528,6 +583,7 @@ impl Default for ResolveOpts {
             bytes_query_re: None,
             search_mode: SearchMode::Text,
             literal_needle: None,
+            raw_line_local: false,
         }
     }
 }
@@ -1122,7 +1178,14 @@ mod tests {
     fn test_resolve_matched_mmap_basic() {
         let path = fixture_path("claude_session.jsonl");
         let re = BytesRegex::new("(?iu)auth").unwrap();
-        let result = resolve_matched_mmap(&path, find_plugin("claude").unwrap(), &re, None, None);
+        let result = resolve_matched_mmap(
+            &path,
+            find_plugin("claude").unwrap(),
+            &re,
+            None,
+            None,
+            false,
+        );
         assert!(!result.is_empty());
         assert!(result.contains("auth"));
     }
@@ -1131,7 +1194,14 @@ mod tests {
     fn test_resolve_matched_mmap_no_match() {
         let path = fixture_path("claude_session.jsonl");
         let re = BytesRegex::new("ZZZZNOTEXIST").unwrap();
-        let result = resolve_matched_mmap(&path, find_plugin("claude").unwrap(), &re, None, None);
+        let result = resolve_matched_mmap(
+            &path,
+            find_plugin("claude").unwrap(),
+            &re,
+            None,
+            None,
+            false,
+        );
         assert!(result.is_empty());
     }
 
@@ -1144,6 +1214,7 @@ mod tests {
             &re,
             None,
             None,
+            false,
         );
         assert!(result.is_empty());
     }
@@ -1159,7 +1230,14 @@ mod tests {
             .join("\n");
         std::fs::write(&path, content).unwrap();
         let re = BytesRegex::new("hello").unwrap();
-        let result = resolve_matched_mmap(&path, find_plugin("claude").unwrap(), &re, None, None);
+        let result = resolve_matched_mmap(
+            &path,
+            find_plugin("claude").unwrap(),
+            &re,
+            None,
+            None,
+            false,
+        );
         // Returns only the first match context (no " | " separator)
         assert!(result.contains("hello"));
         assert!(

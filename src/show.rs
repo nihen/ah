@@ -211,18 +211,19 @@ fn run_inner(args: ShowArgs, filter: &FilterArgs, check_account: bool) -> Result
     }
 
     match format {
-        ShowFormat::Raw if plugin.streams_raw_lines(&path) => {
-            use std::io::Write;
-            let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-            plugin.for_each_raw_line(&path, &mut |line| {
-                out.write_all(line)
-                    .and_then(|()| out.write_all(b"\n"))
-                    .is_ok()
-            });
-            let _ = out.flush();
-        }
         ShowFormat::Raw => {
-            if let Some(content) = plugin.raw_content(&path) {
+            let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+            let written = plugin
+                .write_raw_content(&path, &mut out)
+                .map(|result| result.and_then(|()| std::io::Write::flush(&mut out)));
+            if let Some(result) = written {
+                result.map_err(|e| {
+                    format!(
+                        "Failed to read: {}: {e}",
+                        crate::output::sanitize_for_display(&path.to_string_lossy())
+                    )
+                })?;
+            } else if let Some(content) = plugin.raw_content(&path) {
                 print!("{}", content);
             } else {
                 return Err(format!(
@@ -415,7 +416,16 @@ fn run_pretty(path: &std::path::Path, head: Option<usize>, hl_re: Option<&regex:
         eprintln!("(only metadata — no conversation messages)");
         eprintln!();
         // Session data is untrusted: only `--raw` prints it verbatim.
-        if let Some(content) = agents::find_plugin_for_path(path).raw_content(path) {
+        let plugin = agents::find_plugin_for_path(path);
+        if plugin.streams_raw_lines(path) {
+            use std::io::Write;
+            let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+            plugin.for_each_raw_line(path, &mut |line| {
+                let line = String::from_utf8_lossy(line);
+                writeln!(out, "{}", sanitize_multiline(&line)).is_ok()
+            });
+            let _ = out.flush();
+        } else if let Some(content) = plugin.raw_content(path) {
             print!("{}", sanitize_multiline(&content));
         }
     }

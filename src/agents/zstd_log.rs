@@ -4,7 +4,7 @@
 //! compressed).
 
 use std::cell::RefCell;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +18,66 @@ const MAX_CACHED_BYTES: usize = 8 << 20;
 /// Whole logs decoded at the same time, across threads: with the decode
 /// limit of each plugin this bounds the text being decoded at once.
 const MAX_PARALLEL_DECODES: usize = 4;
+
+/// Largest window a frame may ask the decoder for, as a power of two
+/// (16 MiB). Codex and dsh write frames with windows of 2 MiB or less; a
+/// frame asking for more is not decoded, so that a hostile header cannot
+/// make each decoder allocate the library's maximum.
+const WINDOW_LOG_MAX: u32 = 24;
+/// A line read line by line that grows past this many bytes takes one of
+/// the `MAX_PARALLEL_LONG_LINES` slots until it has been visited, which
+/// bounds the long lines held at once across threads.
+const LONG_LINE_BYTES: usize = 16 << 20;
+const MAX_PARALLEL_LONG_LINES: usize = 2;
+/// A line freed after it was visited when its buffer grew past this, so a
+/// thread does not keep the capacity of its longest line.
+const KEPT_LINE_CAPACITY: usize = 1 << 20;
+
+/// A decoder of the frames read from `input` whose window is at most
+/// `WINDOW_LOG_MAX`.
+fn decoder<R: BufRead>(input: R) -> Option<zstd::stream::read::Decoder<'static, R>> {
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(input).ok()?;
+    decoder.window_log_max(WINDOW_LOG_MAX).ok()?;
+    Some(decoder)
+}
+
+/// Counted slots: at most `max` holders at once, across threads.
+struct Slots {
+    busy: std::sync::Mutex<usize>,
+    freed: std::sync::Condvar,
+    max: usize,
+}
+
+impl Slots {
+    const fn new(max: usize) -> Self {
+        Slots {
+            busy: std::sync::Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+            max,
+        }
+    }
+
+    fn acquire(&'static self) -> Slot {
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        while *busy >= self.max {
+            busy = self.freed.wait(busy).unwrap_or_else(|e| e.into_inner());
+        }
+        *busy += 1;
+        Slot(self)
+    }
+}
+
+/// One slot of `Slots`, released when dropped.
+struct Slot(&'static Slots);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        *self.0.busy.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        self.0.freed.notify_one();
+    }
+}
+
+static LONG_LINES: Slots = Slots::new(MAX_PARALLEL_LONG_LINES);
 
 /// Holds one of the `MAX_PARALLEL_DECODES` slots while alive.
 struct DecodeSlot;
@@ -58,6 +118,7 @@ pub(super) fn for_each_frame(
         let mut text = Vec::new();
         let decoded = zstd::stream::read::Decoder::with_buffer(&mut data)
             .ok()
+            .and_then(|mut frame| frame.window_log_max(WINDOW_LOG_MAX).ok().map(|()| frame))
             .and_then(|frame| {
                 frame
                     .single_frame()
@@ -94,8 +155,8 @@ pub(super) fn decode_frames(data: &[u8], max_frames: usize, max_bytes: u64) -> V
 /// The first line of the decoded text, without its newline, decoding no
 /// more than that line. `None` when the line is longer than `max_bytes` or
 /// the data cannot be decoded before its end.
-pub(super) fn first_line(data: &[u8], max_bytes: u64) -> Option<Vec<u8>> {
-    let decoder = zstd::stream::read::Decoder::with_buffer(data).ok()?;
+pub(super) fn first_line(input: impl BufRead, max_bytes: u64) -> Option<Vec<u8>> {
+    let decoder = decoder(input)?;
     let mut line = Vec::new();
     BufReader::new(decoder.take(max_bytes + 1))
         .read_until(b'\n', &mut line)
@@ -108,32 +169,48 @@ pub(super) fn first_line(data: &[u8], max_bytes: u64) -> Option<Vec<u8>> {
     Some(line)
 }
 
+/// The compressed file at `path`, for the readers above. Read rather than
+/// mapped: the readers pass over it once, and its pages are then not
+/// counted against the process.
+pub(super) fn open(path: &Path) -> std::io::Result<BufReader<std::fs::File>> {
+    Ok(BufReader::with_capacity(
+        1 << 16,
+        std::fs::File::open(path)?,
+    ))
+}
+
 /// Visit the lines of the decoded text (without their newlines) until
 /// `visit` returns `false`, decoding them one at a time: only one line and
 /// the decoder's window are held, however large the log is. Decoding stops
-/// after `max_bytes` of text, and at data that cannot be decoded (the lines
-/// before it are visited). A line longer than `max_line` is skipped.
+/// after `max_bytes` of text, at data that cannot be decoded (the lines
+/// before it are visited), and when the command is cancelled. A line longer
+/// than `max_line` is skipped, and reading stops at a line longer than
+/// twice `max_line`.
 pub(super) fn for_each_line(
-    data: &[u8],
+    input: impl BufRead,
     max_bytes: u64,
     max_line: usize,
     mut visit: impl FnMut(&[u8]) -> bool,
 ) {
-    let Ok(decoder) = zstd::stream::read::Decoder::with_buffer(data) else {
+    let Some(decoder) = decoder(input) else {
         return;
     };
     let mut reader = BufReader::with_capacity(1 << 16, decoder.take(max_bytes));
     let mut line = Vec::new();
     loop {
         line.clear();
-        let mut too_long = false;
-        // Read up to the newline, dropping the bytes of a line past `max_line`.
+        let mut long_line = None;
+        // Bytes of a line past `max_line` that were dropped.
+        let mut skipped = None::<usize>;
         loop {
+            if crate::cancel::requested() {
+                return;
+            }
             let Ok(buf) = reader.fill_buf() else {
                 return;
             };
             if buf.is_empty() {
-                if line.is_empty() && !too_long {
+                if line.is_empty() && skipped.is_none() {
                     return;
                 }
                 break;
@@ -142,11 +219,22 @@ pub(super) fn for_each_line(
                 Some(end) => (&buf[..end], Some(end + 1)),
                 None => (buf, None),
             };
-            if !too_long && line.len() + chunk.len() <= max_line {
-                line.extend_from_slice(chunk);
-            } else {
-                too_long = true;
-                line = Vec::new();
+            match &mut skipped {
+                Some(dropped) => *dropped += chunk.len(),
+                None if line.len() + chunk.len() <= max_line => {
+                    if long_line.is_none() && line.len() + chunk.len() > LONG_LINE_BYTES {
+                        long_line = Some(LONG_LINES.acquire());
+                    }
+                    line.extend_from_slice(chunk);
+                }
+                None => {
+                    skipped = Some(line.len() + chunk.len());
+                    line = Vec::new();
+                    long_line = None;
+                }
+            }
+            if skipped.is_some_and(|dropped| dropped > max_line.saturating_mul(2)) {
+                return;
             }
             let used = done.unwrap_or(buf.len());
             reader.consume(used);
@@ -154,10 +242,28 @@ pub(super) fn for_each_line(
                 break;
             }
         }
-        if !too_long && !visit(&line) {
+        if skipped.is_none() && !visit(&line) {
             return;
         }
+        drop(long_line);
+        if line.capacity() > KEPT_LINE_CAPACITY {
+            line = Vec::new();
+        }
     }
+}
+
+/// Write the decoded text to `out` as it is, up to `max_bytes`. Decoding
+/// stops at data that cannot be decoded, which is an error.
+pub(super) fn copy_to(
+    input: impl BufRead,
+    max_bytes: u64,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    let decoder = decoder(input).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "not a Zstandard stream")
+    })?;
+    std::io::copy(&mut decoder.take(max_bytes), out)?;
+    Ok(())
 }
 
 /// A log as text: the file itself, or its decoded frames.
@@ -256,16 +362,19 @@ mod tests {
     #[test]
     fn first_line_decodes_only_the_first_line() {
         let data = frame("{\"a\":1}\n{\"b\":2}\n");
-        assert_eq!(first_line(&data, 64).as_deref(), Some(&b"{\"a\":1}"[..]));
+        assert_eq!(
+            first_line(&data[..], 64).as_deref(),
+            Some(&b"{\"a\":1}"[..])
+        );
         // A log of one line without a newline.
         assert_eq!(
-            first_line(&frame("{\"a\":1}"), 64).as_deref(),
+            first_line(&frame("{\"a\":1}")[..], 64).as_deref(),
             Some(&b"{\"a\":1}"[..])
         );
         // Exactly at the limit, and one byte past it.
-        assert_eq!(first_line(&data, 7).as_deref(), Some(&b"{\"a\":1}"[..]));
-        assert_eq!(first_line(&frame("{\"a\":1}"), 6), None);
-        assert_eq!(first_line(b"not zstd", 64), None);
+        assert_eq!(first_line(&data[..], 7).as_deref(), Some(&b"{\"a\":1}"[..]));
+        assert_eq!(first_line(&frame("{\"a\":1}")[..], 6), None);
+        assert_eq!(first_line(&b"not zstd"[..], 64), None);
     }
 
     fn lines(data: &[u8], max_bytes: u64, max_line: usize) -> Vec<String> {
@@ -283,7 +392,11 @@ mod tests {
         let data = [frame("a\nlong line\n"), frame("\nb")].concat();
         assert_eq!(lines(&data, 1 << 20, 64), ["a", "long line", "", "b"]);
         // A line past `max_line` is skipped, not cut.
-        assert_eq!(lines(&data, 1 << 20, 4), ["a", "", "b"]);
+        assert_eq!(lines(&data, 1 << 20, 5), ["a", "", "b"]);
+        // Reading stops when a skipped line runs on past `max_line` again.
+        let endless = frame(&format!("a\n{}\nb\n", "x".repeat(20)));
+        assert_eq!(lines(&endless, 1 << 20, 9), ["a"]);
+        assert_eq!(lines(&endless, 1 << 20, 10), ["a", "b"]);
         // Decoding stops after `max_bytes` of text.
         assert_eq!(lines(&data, 4, 64), ["a", "lo"]);
         // A torn frame ends the log after the lines before it.
@@ -292,10 +405,30 @@ mod tests {
         assert!(lines(b"not zstd", 1 << 20, 64).is_empty());
         // `visit` stops the iteration.
         let mut count = 0;
-        for_each_line(&data, 1 << 20, 64, |_| {
+        for_each_line(&data[..], 1 << 20, 64, |_| {
             count += 1;
             false
         });
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn copy_keeps_the_text_as_it_is() {
+        let data = [frame("a\n"), frame("b")].concat();
+        let mut out = Vec::new();
+        copy_to(&data[..], 1 << 20, &mut out).unwrap();
+        assert_eq!(out, b"a\nb");
+        assert!(copy_to(&b"not zstd"[..], 1 << 20, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn frames_asking_for_a_large_window_are_not_decoded() {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.window_log(WINDOW_LOG_MAX + 1).unwrap();
+        encoder.write_all(&vec![b'x'; 64 << 20]).unwrap();
+        encoder.write_all(b"\n").unwrap();
+        let data = encoder.finish().unwrap();
+        assert!(lines(&data, 1 << 30, 1 << 30).is_empty());
+        assert!(copy_to(&data[..], 1 << 30, &mut Vec::new()).is_err());
     }
 }

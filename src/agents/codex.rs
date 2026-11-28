@@ -31,18 +31,19 @@ fn is_compressed(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "zst")
 }
 
-/// Largest compressed rollout that is decoded whole, as text (`session_bytes`
-/// and `raw_content`, e.g. for a raw search). Long sessions reach several
-/// hundred megabytes (one of 940 MiB has been seen); the limit keeps a
-/// damaged or hostile file from exhausting memory.
+/// Largest compressed rollout that is decoded whole, as text: only for a
+/// raw search whose matches may span lines (`session_bytes`). Long sessions
+/// reach several hundred megabytes (one of 940 MiB has been seen); the
+/// limit keeps a damaged or hostile file from exhausting memory.
 const MAX_ROLLOUT_BYTES: u64 = 2 << 30;
-/// How much text of a compressed rollout is read line by line. Only one
-/// line is held at a time, so this bounds the time a damaged or hostile
-/// file can take, not memory.
+/// How much text of a compressed rollout is read as a stream (line by line,
+/// or copied by `show --raw`). Little is held at a time, so this bounds
+/// the time a damaged or hostile file can take, not memory.
 const MAX_STREAMED_BYTES: u64 = 64 << 30;
-/// Longest line read from a compressed rollout; a longer one is skipped.
-/// Tool outputs make lines of ten megabytes or so.
-const MAX_LINE_BYTES: usize = 256 << 20;
+/// Longest line read line by line from a compressed rollout; a longer one
+/// is skipped by search and listing. Tool outputs make lines of ten
+/// megabytes or so.
+const MAX_LINE_BYTES: usize = 64 << 20;
 /// Largest `session_meta` line decoded from a compressed rollout. The line
 /// carries the base instructions, a few kilobytes.
 const MAX_META_LINE_BYTES: u64 = 16 << 20;
@@ -55,16 +56,18 @@ fn read_rollout(path: &Path) -> Option<Log> {
 /// Visit the JSONL lines of a rollout until `visit` returns `false`. A
 /// compressed rollout is decoded one line at a time.
 fn for_each_line(path: &Path, mut visit: impl FnMut(&[u8]) -> bool) {
+    if is_compressed(path) {
+        if let Ok(input) = zstd_log::open(path) {
+            zstd_log::for_each_line(input, MAX_STREAMED_BYTES, MAX_LINE_BYTES, visit);
+        }
+        return;
+    }
     let Some(data) = super::common::mmap_file(path) else {
         return;
     };
-    if is_compressed(path) {
-        zstd_log::for_each_line(&data, MAX_STREAMED_BYTES, MAX_LINE_BYTES, visit);
-    } else {
-        for line in super::common::jsonl_lines(&data) {
-            if !visit(line) {
-                return;
-            }
+    for line in super::common::jsonl_lines(&data) {
+        if !visit(line) {
+            return;
         }
     }
 }
@@ -397,7 +400,7 @@ fn session_meta(path: &Path) -> Option<SessionMeta> {
 fn read_session_meta(path: &Path) -> Option<SessionMeta> {
     let mut line = Vec::new();
     if is_compressed(path) {
-        line = zstd_log::first_line(&super::common::mmap_file(path)?, MAX_META_LINE_BYTES)?;
+        line = zstd_log::first_line(zstd_log::open(path).ok()?, MAX_META_LINE_BYTES)?;
     } else {
         let file = fs::File::open(path).ok()?;
         BufReader::new(file).read_until(b'\n', &mut line).ok()?;
@@ -511,8 +514,8 @@ impl AgentPlugin for CodexPlugin {
         (is_compressed(file) && file.with_extension("").exists()).then(Vec::new)
     }
 
-    /// A compressed rollout is decoded, so it is loaded only for a
-    /// full-text search.
+    /// A compressed rollout is decoded whole only for a raw search whose
+    /// matches may span lines; other reads go line by line.
     fn session_bytes(&self, path: &Path) -> Option<SessionBytes> {
         read_rollout(path).map(Log::into_session_bytes)
     }
@@ -530,7 +533,27 @@ impl AgentPlugin for CodexPlugin {
     }
 
     fn raw_content(&self, path: &Path) -> Option<String> {
+        if !is_compressed(path) {
+            return fs::read_to_string(path).ok();
+        }
         Some(String::from_utf8_lossy(&read_rollout(path)?).into_owned())
+    }
+
+    fn write_raw_content(
+        &self,
+        path: &Path,
+        out: &mut dyn std::io::Write,
+    ) -> Option<std::io::Result<()>> {
+        if !is_compressed(path) {
+            return None;
+        }
+        Some(zstd_log::open(path).and_then(|input| {
+            // An empty file has no text.
+            if fs::metadata(path)?.len() == 0 {
+                return Ok(());
+            }
+            zstd_log::copy_to(input, MAX_STREAMED_BYTES, out)
+        }))
     }
 
     fn path_markers(&self) -> &'static [&'static str] {
@@ -608,12 +631,12 @@ impl AgentPlugin for CodexPlugin {
         if crate::cloud::is_cache_path(path) {
             return crate::cloud::epoch(session_meta(path)?.cloud_created_at?);
         }
-        // Compressing a rollout writes a new file, whose birth time is when
-        // it was compressed.
-        if is_compressed(path) {
-            return session_meta(path)?.started_at;
-        }
-        path.metadata().ok()?.created().ok()
+        // When the session started. The file's birth time is not: Codex
+        // writes a new file when it compresses a rollout, and again when it
+        // decompresses one to append to it.
+        session_meta(path)
+            .and_then(|meta| meta.started_at)
+            .or_else(|| path.metadata().ok()?.created().ok())
     }
 
     fn resolve_title(&self, path: &Path, _home: &Path) -> Option<String> {
@@ -645,15 +668,18 @@ impl AgentPlugin for CodexPlugin {
     fn resolve_models(&self, path: &Path) -> Option<super::common::ModelList> {
         let mut scan = ModelScan::default();
         if is_compressed(path) {
-            for_each_line(path, |line| {
-                if TURN_CONTEXT.find(line).is_some()
-                    || (scan.pending.is_some() && RESPONSE_ITEM.find(line).is_some())
-                {
-                    scan.line(line);
-                }
-                true
+            // Decoding all of it is costly; the result is kept on disk.
+            return super::codex_models::models(path, || {
+                for_each_line(path, |line| {
+                    if TURN_CONTEXT.find(line).is_some()
+                        || (scan.pending.is_some() && RESPONSE_ITEM.find(line).is_some())
+                    {
+                        scan.line(line);
+                    }
+                    true
+                });
+                scan.models
             });
-            return scan.models.non_empty();
         }
         let data = super::common::mmap_file(path)?;
         let mut turns = super::common::LinesWith::new(&data, b"\"turn_context\"");

@@ -218,6 +218,11 @@ impl ModelList {
         self.last.as_deref().unwrap_or_default()
     }
 
+    /// All models in first-use order.
+    pub fn all(&self) -> &[String] {
+        &self.all
+    }
+
     /// All models, comma-separated in first-use order.
     pub fn joined(&self) -> String {
         self.all.join(",")

@@ -3517,7 +3517,15 @@ fn compressed_codex_rollouts_are_listed_searched_and_shown() {
         .stdout(predicate::str::starts_with("codex-sess-001\t"))
         .stdout(predicate::str::contains("api-server"));
     ah_in(home)
-        .args(["log", "-a", "--raw-search", "-q", "not in the log", "-o", "id"])
+        .args([
+            "log",
+            "-a",
+            "--raw-search",
+            "-q",
+            "not in the log",
+            "-o",
+            "id",
+        ])
         .assert()
         .failure();
 }
@@ -3531,4 +3539,111 @@ fn a_compressed_rollout_next_to_its_plain_copy_is_listed_once() {
         .assert()
         .success()
         .stdout(format!("{}\n", path.with_extension("").display()));
+}
+
+/// The fixture both plain and compressed, in separate homes.
+fn plain_and_compressed_codex_homes() -> [TempDir; 2] {
+    let (compressed, _) = compressed_codex_home();
+    let plain = TempDir::new().unwrap();
+    let dir = plain.path().join(".codex/archived_sessions/2026/03/24");
+    fs::create_dir_all(&dir).unwrap();
+    fs::copy(
+        fixture_path("codex_session.jsonl"),
+        dir.join("rollout-2026-03-24T20-43-12-codex-sess-001.jsonl"),
+    )
+    .unwrap();
+    [plain, compressed]
+}
+
+#[test]
+fn raw_search_finds_the_same_in_plain_and_compressed_rollouts() {
+    let homes = plain_and_compressed_codex_homes();
+    // Line-local queries (read line by line when compressed), and queries
+    // whose matches may span lines or depend on anchors (decoded whole).
+    for query in [
+        "deploy to production",
+        "Users/test/api-.erver",
+        r#"^\{"type":"response_item"#,
+        r#"\}\n\{"type":"response_item"#,
+        r#"Header line"\}\]\}\}\n$"#,
+        "zzq-not-there",
+    ] {
+        let outputs: Vec<_> = homes
+            .iter()
+            .map(|home| {
+                let out = ah_in(home.path())
+                    .args(["log", "-a", "--raw-search", "-q", query, "-o", "id,matched"])
+                    .output()
+                    .unwrap();
+                (out.status.code(), String::from_utf8(out.stdout).unwrap())
+            })
+            .collect();
+        assert_eq!(outputs[0], outputs[1], "query {query}");
+    }
+}
+
+#[test]
+fn show_raw_of_a_compressed_rollout_is_its_text_exactly() {
+    let (tmp, path) = compressed_codex_home();
+    // Without a final newline.
+    let text = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"x\"}}\n{\"a\":1}";
+    fs::write(&path, zstd::stream::encode_all(&text[..], 3).unwrap()).unwrap();
+    ah_in(tmp.path())
+        .args(["show", "--raw", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::eq(&text[..]));
+    // Damaged data is an error, not a short output.
+    fs::write(&path, b"not zstd").unwrap();
+    ah_in(tmp.path())
+        .args(["show", "--raw", path.to_str().unwrap()])
+        .assert()
+        .failure();
+    // An empty plain rollout prints nothing.
+    let plain = path.with_extension("");
+    fs::write(&plain, b"").unwrap();
+    ah_in(tmp.path())
+        .args(["show", "--raw", plain.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn models_of_compressed_rollouts_are_kept_until_the_rollout_changes() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let dir = home.join(".codex/sessions/2026/03/24");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rollout-2026-03-24T20-43-12-codex-sess-001.jsonl.zst");
+    let rollout = |model: &str| {
+        let text = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"session_meta","payload":{"id":"codex-sess-001","cwd":"/tmp/p"}}"#,
+            format_args!(r#"{{"type":"turn_context","payload":{{"model":"{model}"}}}}"#),
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#,
+        );
+        zstd::stream::encode_all(text.as_bytes(), 3).unwrap()
+    };
+    let models = || {
+        let out = ah_in(home)
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .args(["log", "-a", "-o", "model"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    fs::write(&path, rollout("model-a")).unwrap();
+    assert_eq!(models(), "model-a\n");
+    let cache = ["cache/ah", "Library/Caches/ah"]
+        .iter()
+        .map(|dir| home.join(dir).join("codex-zst-models-v1.tsv"))
+        .find(|file| file.exists())
+        .expect("the models are kept on disk");
+    assert!(fs::read_to_string(&cache).unwrap().contains("\tmodel-a\t"));
+    // Read again from the cache.
+    assert_eq!(models(), "model-a\n");
+    // A rollout with another size is read anew.
+    fs::write(&path, rollout("model-bb")).unwrap();
+    assert_eq!(models(), "model-bb\n");
 }
