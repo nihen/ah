@@ -179,39 +179,40 @@ pub(super) fn open(path: &Path) -> std::io::Result<BufReader<std::fs::File>> {
     ))
 }
 
-/// Visit the lines of the decoded text (without their newlines) until
-/// `visit` returns `false`, decoding them one at a time: only one line and
-/// the decoder's window are held, however large the log is. Decoding stops
-/// after `max_bytes` of text, at data that cannot be decoded (the lines
-/// before it are visited), and when the command is cancelled. A line longer
-/// than `max_line` is skipped, and reading stops at a line longer than
-/// twice `max_line`.
+/// Visit the lines of the decoded text until `visit` returns `false`,
+/// decoding them one at a time: only one line and the decoder's window are
+/// held, however large the log is. Each line is visited with its newline,
+/// when it has one. Decoding stops after `max_bytes` of text, at data that
+/// cannot be decoded (the lines before it are visited), and when the
+/// command is cancelled. A line longer than `max_line` (without its
+/// newline) is skipped. Returns whether the text was read to its end
+/// (or to `max_bytes`) with every line visited.
 pub(super) fn for_each_line(
     input: impl BufRead,
     max_bytes: u64,
     max_line: usize,
     mut visit: impl FnMut(&[u8]) -> bool,
-) {
+) -> bool {
     let Some(decoder) = decoder(input) else {
-        return;
+        return false;
     };
     let mut reader = BufReader::with_capacity(1 << 16, decoder.take(max_bytes));
     let mut line = Vec::new();
+    let mut complete = true;
     loop {
         line.clear();
         let mut long_line = None;
-        // Bytes of a line past `max_line` that were dropped.
-        let mut skipped = None::<usize>;
+        let mut skipped = false;
         loop {
             if crate::cancel::requested() {
-                return;
+                return false;
             }
             let Ok(buf) = reader.fill_buf() else {
-                return;
+                return false;
             };
             if buf.is_empty() {
-                if line.is_empty() && skipped.is_none() {
-                    return;
+                if line.is_empty() && !skipped {
+                    return complete;
                 }
                 break;
             }
@@ -219,22 +220,21 @@ pub(super) fn for_each_line(
                 Some(end) => (&buf[..end], Some(end + 1)),
                 None => (buf, None),
             };
-            match &mut skipped {
-                Some(dropped) => *dropped += chunk.len(),
-                None if line.len() + chunk.len() <= max_line => {
-                    if long_line.is_none() && line.len() + chunk.len() > LONG_LINE_BYTES {
-                        long_line = Some(LONG_LINES.acquire());
-                    }
-                    line.extend_from_slice(chunk);
+            if skipped {
+                // Dropping the rest of a line past `max_line`.
+            } else if line.len() + chunk.len() <= max_line {
+                if long_line.is_none() && line.len() + chunk.len() > LONG_LINE_BYTES {
+                    long_line = Some(LONG_LINES.acquire());
                 }
-                None => {
-                    skipped = Some(line.len() + chunk.len());
-                    line = Vec::new();
-                    long_line = None;
+                line.extend_from_slice(chunk);
+                if done.is_some() {
+                    line.push(b'\n');
                 }
-            }
-            if skipped.is_some_and(|dropped| dropped > max_line.saturating_mul(2)) {
-                return;
+            } else {
+                skipped = true;
+                complete = false;
+                line = Vec::new();
+                long_line = None;
             }
             let used = done.unwrap_or(buf.len());
             reader.consume(used);
@@ -242,8 +242,8 @@ pub(super) fn for_each_line(
                 break;
             }
         }
-        if skipped.is_none() && !visit(&line) {
-            return;
+        if !skipped && !visit(&line) {
+            return false;
         }
         drop(long_line);
         if line.capacity() > KEPT_LINE_CAPACITY {
@@ -252,8 +252,21 @@ pub(super) fn for_each_line(
     }
 }
 
+/// A reader that fails once the command is cancelled.
+struct Cancellable<R>(R);
+
+impl<R: Read> Read for Cancellable<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if crate::cancel::requested() {
+            return Err(std::io::Error::other("cancelled"));
+        }
+        self.0.read(buf)
+    }
+}
+
 /// Write the decoded text to `out` as it is, up to `max_bytes`. Decoding
-/// stops at data that cannot be decoded, which is an error.
+/// stops at data that cannot be decoded, and when the command is
+/// cancelled, which are errors.
 pub(super) fn copy_to(
     input: impl BufRead,
     max_bytes: u64,
@@ -262,8 +275,61 @@ pub(super) fn copy_to(
     let decoder = decoder(input).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "not a Zstandard stream")
     })?;
-    std::io::copy(&mut decoder.take(max_bytes), out)?;
+    std::io::copy(&mut Cancellable(decoder.take(max_bytes)), out)?;
     Ok(())
+}
+
+/// Whole logs held decoded at the same time, across threads (see
+/// `decode_whole`).
+static WHOLE_LOGS: Slots = Slots::new(1);
+
+thread_local! {
+    /// Whole logs this thread holds: a thread that holds one takes another
+    /// without waiting, so that it cannot wait for itself.
+    static HELD_WHOLE_LOGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A slot of `WHOLE_LOGS` held with the text decoded in it.
+struct WholeLogSlot {
+    _slot: Option<Slot>,
+}
+
+impl WholeLogSlot {
+    fn acquire() -> Self {
+        let held = HELD_WHOLE_LOGS.get();
+        HELD_WHOLE_LOGS.set(held + 1);
+        WholeLogSlot {
+            _slot: (held == 0).then(|| WHOLE_LOGS.acquire()),
+        }
+    }
+}
+
+impl Drop for WholeLogSlot {
+    fn drop(&mut self) {
+        HELD_WHOLE_LOGS.set(HELD_WHOLE_LOGS.get().saturating_sub(1));
+    }
+}
+
+/// The whole decoded text of the log at `path`, up to `max_bytes`, as
+/// session bytes that hold one of the `WHOLE_LOGS` slots for as long as
+/// they live: only one thread holds a whole log at a time. `None` when the
+/// file cannot be read or decoded to its end, when the text is longer than
+/// `max_bytes`, or when the command is cancelled.
+pub(super) fn decode_whole(path: &Path, max_bytes: u64) -> Option<SessionBytes> {
+    let input = open(path).ok()?;
+    let slot = WholeLogSlot::acquire();
+    let mut text = Vec::new();
+    let read = Cancellable(decoder(input)?)
+        .take(max_bytes + 1)
+        .read_to_end(&mut text)
+        .ok()?;
+    if read as u64 > max_bytes {
+        return None;
+    }
+    Some(SessionBytes::Guarded {
+        bytes: text,
+        _guard: Box::new(slot),
+    })
 }
 
 /// A log as text: the file itself, or its decoded frames.
@@ -390,25 +456,29 @@ mod tests {
     fn lines_are_decoded_one_at_a_time() {
         // Two frames, the second without a trailing newline.
         let data = [frame("a\nlong line\n"), frame("\nb")].concat();
-        assert_eq!(lines(&data, 1 << 20, 64), ["a", "long line", "", "b"]);
-        // A line past `max_line` is skipped, not cut.
-        assert_eq!(lines(&data, 1 << 20, 5), ["a", "", "b"]);
-        // Reading stops when a skipped line runs on past `max_line` again.
-        let endless = frame(&format!("a\n{}\nb\n", "x".repeat(20)));
-        assert_eq!(lines(&endless, 1 << 20, 9), ["a"]);
-        assert_eq!(lines(&endless, 1 << 20, 10), ["a", "b"]);
+        assert_eq!(lines(&data, 1 << 20, 64), ["a\n", "long line\n", "\n", "b"]);
+        // A line past `max_line` is skipped, not cut, and reading goes on.
+        assert_eq!(lines(&data, 1 << 20, 5), ["a\n", "\n", "b"]);
+        let long = frame(&format!("a\n{}\nb\n", "x".repeat(200)));
+        assert_eq!(lines(&long, 1 << 20, 9), ["a\n", "b\n"]);
         // Decoding stops after `max_bytes` of text.
-        assert_eq!(lines(&data, 4, 64), ["a", "lo"]);
+        assert_eq!(lines(&data, 4, 64), ["a\n", "lo"]);
         // A torn frame ends the log after the lines before it.
         let torn = [frame("a\n"), frame("never\n")[..5].to_vec()].concat();
-        assert_eq!(lines(&torn, 1 << 20, 64), ["a"]);
+        assert_eq!(lines(&torn, 1 << 20, 64), ["a\n"]);
         assert!(lines(b"not zstd", 1 << 20, 64).is_empty());
+        // Whether the text was read to its end with every line visited.
+        let read_all = |data: &[u8], max_line| for_each_line(data, 1 << 20, max_line, |_| true);
+        assert!(read_all(&data, 64));
+        assert!(!read_all(&data, 5));
+        assert!(!read_all(&torn, 64));
+        assert!(!read_all(b"not zstd", 64));
         // `visit` stops the iteration.
         let mut count = 0;
-        for_each_line(&data[..], 1 << 20, 64, |_| {
+        assert!(!for_each_line(&data[..], 1 << 20, 64, |_| {
             count += 1;
             false
-        });
+        }));
         assert_eq!(count, 1);
     }
 

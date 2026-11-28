@@ -14,7 +14,7 @@ use super::common::SessionBytes;
 use super::common::format_mtime;
 use super::common::strip_home;
 use super::common::{visit_all_strings, visit_tool_call, visit_tool_output};
-use super::zstd_log::{self, Log};
+use super::zstd_log;
 use super::{MemoryKind, MemorySource};
 
 static RE_CODEX_SESSIONS: LazyLock<Regex> =
@@ -48,28 +48,22 @@ const MAX_LINE_BYTES: usize = 64 << 20;
 /// carries the base instructions, a few kilobytes.
 const MAX_META_LINE_BYTES: u64 = 16 << 20;
 
-/// The rollout as JSONL text: the file itself, or its decoded content.
-fn read_rollout(path: &Path) -> Option<Log> {
-    zstd_log::read_log(path, is_compressed(path), MAX_ROLLOUT_BYTES)
-}
-
 /// Visit the JSONL lines of a rollout until `visit` returns `false`. A
-/// compressed rollout is decoded one line at a time.
-fn for_each_line(path: &Path, mut visit: impl FnMut(&[u8]) -> bool) {
+/// compressed rollout is decoded one line at a time, and its lines keep
+/// their newlines (see `zstd_log::for_each_line`). Returns whether every
+/// line was read and visited.
+fn for_each_line(path: &Path, visit: impl FnMut(&[u8]) -> bool) -> bool {
     if is_compressed(path) {
-        if let Ok(input) = zstd_log::open(path) {
-            zstd_log::for_each_line(input, MAX_STREAMED_BYTES, MAX_LINE_BYTES, visit);
-        }
-        return;
+        return zstd_log::open(path).is_ok_and(|input| {
+            // An empty file has no lines.
+            input.get_ref().metadata().is_ok_and(|m| m.len() == 0)
+                || zstd_log::for_each_line(input, MAX_STREAMED_BYTES, MAX_LINE_BYTES, visit)
+        });
     }
     let Some(data) = super::common::mmap_file(path) else {
-        return;
+        return fs::metadata(path).is_ok_and(|m| m.len() == 0);
     };
-    for line in super::common::jsonl_lines(&data) {
-        if !visit(line) {
-            return;
-        }
-    }
+    super::common::jsonl_lines(&data).all(visit)
 }
 
 /// The nearest `sessions` or `archived_sessions` directory containing a
@@ -517,7 +511,10 @@ impl AgentPlugin for CodexPlugin {
     /// A compressed rollout is decoded whole only for a raw search whose
     /// matches may span lines; other reads go line by line.
     fn session_bytes(&self, path: &Path) -> Option<SessionBytes> {
-        read_rollout(path).map(Log::into_session_bytes)
+        if !is_compressed(path) {
+            return super::common::mmap_file(path).map(SessionBytes::Mmap);
+        }
+        zstd_log::decode_whole(path, MAX_ROLLOUT_BYTES)
     }
 
     fn cheap_session_bytes(&self, path: &Path) -> bool {
@@ -536,7 +533,8 @@ impl AgentPlugin for CodexPlugin {
         if !is_compressed(path) {
             return fs::read_to_string(path).ok();
         }
-        Some(String::from_utf8_lossy(&read_rollout(path)?).into_owned())
+        let text = zstd_log::decode_whole(path, MAX_ROLLOUT_BYTES)?;
+        Some(String::from_utf8_lossy(&text).into_owned())
     }
 
     fn write_raw_content(
@@ -670,7 +668,7 @@ impl AgentPlugin for CodexPlugin {
         if is_compressed(path) {
             // Decoding all of it is costly; the result is kept on disk.
             return super::codex_models::models(path, || {
-                for_each_line(path, |line| {
+                let complete = for_each_line(path, |line| {
                     if TURN_CONTEXT.find(line).is_some()
                         || (scan.pending.is_some() && RESPONSE_ITEM.find(line).is_some())
                     {
@@ -678,7 +676,7 @@ impl AgentPlugin for CodexPlugin {
                     }
                     true
                 });
-                scan.models
+                (scan.models, complete)
             });
         }
         let data = super::common::mmap_file(path)?;
@@ -1006,7 +1004,7 @@ mod tests {
         fs::write(&path, b"not zstd").unwrap();
         PLUGIN.clear_caches();
         assert_eq!(PLUGIN.resolve_resume_id(&path, home), None);
-        assert!(PLUGIN.session_bytes(&path).is_some_and(|b| b.is_empty()));
+        assert!(PLUGIN.session_bytes(&path).is_none());
     }
 
     #[test]

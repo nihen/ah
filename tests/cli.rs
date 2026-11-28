@@ -3541,32 +3541,40 @@ fn a_compressed_rollout_next_to_its_plain_copy_is_listed_once() {
         .stdout(format!("{}\n", path.with_extension("").display()));
 }
 
-/// The fixture both plain and compressed, in separate homes.
-fn plain_and_compressed_codex_homes() -> [TempDir; 2] {
-    let (compressed, _) = compressed_codex_home();
-    let plain = TempDir::new().unwrap();
-    let dir = plain.path().join(".codex/archived_sessions/2026/03/24");
-    fs::create_dir_all(&dir).unwrap();
-    fs::copy(
-        fixture_path("codex_session.jsonl"),
-        dir.join("rollout-2026-03-24T20-43-12-codex-sess-001.jsonl"),
-    )
-    .unwrap();
-    [plain, compressed]
+/// `text` as a rollout both plain and compressed, in separate homes.
+fn plain_and_compressed_codex_homes(text: &[u8]) -> [TempDir; 2] {
+    let homes = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+    for (home, compressed) in homes.iter().zip([false, true]) {
+        let dir = home.path().join(".codex/archived_sessions/2026/03/24");
+        fs::create_dir_all(&dir).unwrap();
+        let name = "rollout-2026-03-24T20-43-12-codex-sess-001.jsonl";
+        if compressed {
+            let packed = zstd::stream::encode_all(text, 3).unwrap();
+            fs::write(dir.join(format!("{name}.zst")), packed).unwrap();
+        } else {
+            fs::write(dir.join(name), text).unwrap();
+        }
+    }
+    homes
 }
 
 #[test]
 fn raw_search_finds_the_same_in_plain_and_compressed_rollouts() {
-    let homes = plain_and_compressed_codex_homes();
+    let fixture = fs::read(fixture_path("codex_session.jsonl")).unwrap();
+    let homes = plain_and_compressed_codex_homes(&fixture);
+    // Without a final newline, matching near the end.
+    let unterminated = plain_and_compressed_codex_homes(fixture.trim_ascii_end());
     // Line-local queries (read line by line when compressed), and queries
     // whose matches may span lines or depend on anchors (decoded whole).
-    for query in [
-        "deploy to production",
-        "Users/test/api-.erver",
-        r#"^\{"type":"response_item"#,
-        r#"\}\n\{"type":"response_item"#,
-        r#"Header line"\}\]\}\}\n$"#,
-        "zzq-not-there",
+    for (homes, query) in [
+        (&homes, "deploy to production"),
+        (&homes, "Users/test/api-.erver"),
+        (&homes, r#"^\{"type":"response_item"#),
+        (&homes, r#"\}\n\{"type":"response_item"#),
+        (&homes, r#"Header line"\}\]\}\}\n$"#),
+        (&homes, "zzq-not-there"),
+        (&unterminated, "Header line"),
+        (&unterminated, "deploy to production"),
     ] {
         let outputs: Vec<_> = homes
             .iter()
@@ -3646,4 +3654,52 @@ fn models_of_compressed_rollouts_are_kept_until_the_rollout_changes() {
     // A rollout with another size is read anew.
     fs::write(&path, rollout("model-bb")).unwrap();
     assert_eq!(models(), "model-bb\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn models_of_a_rollout_that_could_not_be_read_are_not_kept() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let dir = home.join(".codex/sessions/2026/03/24");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rollout-2026-03-24T20-43-12-codex-sess-001.jsonl.zst");
+    let text = concat!(
+        r#"{"type":"session_meta","payload":{"id":"codex-sess-001","cwd":"/tmp/p"}}"#,
+        "\n",
+        r#"{"type":"turn_context","payload":{"model":"model-a"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#,
+        "\n",
+    );
+    fs::write(&path, zstd::stream::encode_all(text.as_bytes(), 3).unwrap()).unwrap();
+    let models = || {
+        let out = ah_in(home)
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .args(["log", "-a", "-o", "id,model"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // Listed (its metadata was read first), but its models cannot be read.
+    assert_eq!(models(), "codex-sess-001\tmodel-a\n");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&path).is_ok() {
+        return; // Running as root: permissions do not apply.
+    }
+    let unreadable = TempDir::new().unwrap();
+    let out = ah_in(home)
+        .env("XDG_CACHE_HOME", unreadable.path())
+        .args(["log", "-a", "-o", "model"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8(out.stdout).unwrap().contains("model-a"));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let out = ah_in(home)
+        .env("XDG_CACHE_HOME", unreadable.path())
+        .args(["log", "-a", "-o", "model"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "model-a\n");
 }

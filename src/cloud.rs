@@ -275,14 +275,14 @@ pub fn url_for_path(path: &Path) -> String {
 }
 
 #[cfg(unix)]
-fn private_dir(path: &Path) -> bool {
+pub(crate) fn private_dir(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     fs::symlink_metadata(path)
         .is_ok_and(|m| m.is_dir() && m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o077 == 0)
 }
 
 #[cfg(not(unix))]
-fn private_dir(_: &Path) -> bool {
+pub(crate) fn private_dir(_: &Path) -> bool {
     false
 }
 

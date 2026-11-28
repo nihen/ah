@@ -214,36 +214,48 @@ pub fn streamed_raw_match(
 ) -> Option<String> {
     // The bytes `extract_context_from_bytes` may read on each side.
     let window = MATCH_CONTEXT * 4;
-    // The text before the current line (at most `window` bytes of it), and
-    // once a match is found, the text around it read so far.
-    let mut before: Vec<u8> = Vec::new();
-    let mut found: Option<(Vec<u8>, usize, usize)> = None;
+    // The last `window` bytes before the current line.
+    let mut before: Vec<u8> = Vec::with_capacity(window);
+    // Once a match is found: the bytes around it read so far, where it is
+    // in them, and how many bytes after them the context still needs.
+    let mut found: Option<(Vec<u8>, usize, usize, usize)> = None;
     plugin.for_each_raw_line(path, &mut |line| {
         if crate::cancel::requested() {
             return false;
         }
-        if let Some((text, _, end)) = &mut found {
-            text.extend_from_slice(line);
-            text.push(b'\n');
-            return text.len() < *end + window;
+        if let Some((text, _, _, needed)) = &mut found {
+            let take = (*needed).min(line.len());
+            text.extend_from_slice(&line[..take]);
+            *needed -= take;
+            return *needed > 0;
         }
         if let Some((start, end)) = first_raw_match(line, bytes_re, literal_needle) {
-            let offset = before.len();
-            let mut text = std::mem::take(&mut before);
-            text.extend_from_slice(line);
-            text.push(b'\n');
-            let done = text.len() >= offset + end + window;
-            found = Some((text, offset + start, offset + end));
-            return !done;
+            // The line from `window` bytes before the match, after the
+            // bytes before the line when the match is near its start.
+            let from = start.saturating_sub(window);
+            let to = (end + window).min(line.len());
+            let mut text = if from == 0 {
+                std::mem::take(&mut before)
+            } else {
+                Vec::new()
+            };
+            let offset = text.len();
+            text.extend_from_slice(&line[from..to]);
+            let needed = (end + window).saturating_sub(line.len());
+            found = Some((text, offset + start - from, offset + end - from, needed));
+            return needed > 0;
         }
-        before.extend_from_slice(line);
-        before.push(b'\n');
-        if before.len() > window {
-            before.drain(..before.len() - window);
+        if line.len() >= window {
+            before.clear();
+            before.extend_from_slice(&line[line.len() - window..]);
+        } else {
+            let excess = (before.len() + line.len()).saturating_sub(window);
+            before.drain(..excess);
+            before.extend_from_slice(line);
         }
         true
     });
-    let (text, start, end) = found?;
+    let (text, start, end, _) = found?;
     Some(extract_context_from_bytes(&text, start, end, MATCH_CONTEXT))
 }
 

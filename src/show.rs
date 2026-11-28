@@ -421,7 +421,7 @@ fn run_pretty(path: &std::path::Path, head: Option<usize>, hl_re: Option<&regex:
             use std::io::Write;
             let mut out = std::io::BufWriter::new(std::io::stdout().lock());
             plugin.for_each_raw_line(path, &mut |line| {
-                let line = String::from_utf8_lossy(line);
+                let line = String::from_utf8_lossy(line.strip_suffix(b"\n").unwrap_or(line));
                 writeln!(out, "{}", sanitize_multiline(&line)).is_ok()
             });
             let _ = out.flush();
