@@ -3688,18 +3688,18 @@ fn models_of_a_rollout_that_could_not_be_read_are_not_kept() {
     if fs::read(&path).is_ok() {
         return; // Running as root: permissions do not apply.
     }
-    let unreadable = TempDir::new().unwrap();
-    let out = ah_in(home)
-        .env("XDG_CACHE_HOME", unreadable.path())
-        .args(["log", "-a", "-o", "model"])
-        .output()
-        .unwrap();
-    assert!(!String::from_utf8(out.stdout).unwrap().contains("model-a"));
+    // A cache of its own (under HOME on macOS, XDG_CACHE_HOME elsewhere).
+    let other = TempDir::new().unwrap();
+    let models_with_other_cache = || {
+        let out = ah_in(home)
+            .env("HOME", other.path())
+            .env("XDG_CACHE_HOME", other.path().join("cache"))
+            .args(["log", "-a", "-o", "model"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert!(!models_with_other_cache().contains("model-a"));
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    let out = ah_in(home)
-        .env("XDG_CACHE_HOME", unreadable.path())
-        .args(["log", "-a", "-o", "model"])
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), "model-a\n");
+    assert_eq!(models_with_other_cache(), "model-a\n");
 }
