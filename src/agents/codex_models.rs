@@ -102,17 +102,30 @@ fn private_cache_dir(_: &Path) -> Option<File> {
 fn open_in(dir: &File, flags: libc::c_int) -> std::io::Result<Option<File>> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let name = std::ffi::CString::new(CACHE_FILE).expect("no NUL in the name");
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            0o600 as libc::c_uint,
-        )
+    let mut attempts = 0;
+    let fd = loop {
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd >= 0 {
+            break fd;
+        }
+        let error = std::io::Error::last_os_error();
+        // macOS can fail to create a file that another run is creating at
+        // the same moment with ENOENT; the file is there on a retry.
+        attempts += 1;
+        if flags & libc::O_CREAT == 0
+            || error.kind() != std::io::ErrorKind::NotFound
+            || attempts >= 5
+        {
+            return Err(error);
+        }
     };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
     let file = unsafe { File::from_raw_fd(fd) };
     Ok(file.metadata()?.is_file().then_some(file))
 }
